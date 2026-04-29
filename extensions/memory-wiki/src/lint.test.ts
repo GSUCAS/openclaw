@@ -8,6 +8,59 @@ import { createMemoryWikiTestHarness } from "./test-helpers.js";
 const { createVault } = createMemoryWikiTestHarness();
 
 describe("lintMemoryWikiVault", () => {
+  it("accepts generated markdown links and ignores OpenClaw directive tags", async () => {
+    const { rootDir, config } = await createVault({
+      prefix: "memory-wiki-lint-links-",
+      config: {
+        vault: { renderMode: "native" },
+      },
+    });
+    await fs.mkdir(path.join(rootDir, "sources"), { recursive: true });
+
+    const updatedAt = new Date().toISOString();
+    await fs.writeFile(
+      path.join(rootDir, "sources", "target-page.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "source",
+          id: "source.target-page",
+          title: "Target Page",
+          updatedAt,
+        },
+        body: "# Target Page\n",
+      }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "sources", "source-page.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "source",
+          id: "source.source-page",
+          title: "Source Page",
+          updatedAt,
+        },
+        body: [
+          "# Source Page",
+          "",
+          "[Target Page](sources/target-page.md)",
+          "[Target By Title](Target Page)",
+          "[Target By Id](source.target-page)",
+          "[Target By Basename](target-page)",
+          "[Target By Relative Path](./sources/target-page.md)",
+          "[[reply_to_current]]",
+          "[[reply_to: 123]]",
+          "[[audio_as_voice]]",
+        ].join("\n"),
+      }),
+      "utf8",
+    );
+
+    const result = await lintMemoryWikiVault(config);
+
+    expect(result.issues.filter((issue) => issue.code === "broken-wikilink")).toEqual([]);
+  });
+
   it("detects duplicate ids, provenance gaps, contradictions, and open questions", async () => {
     const { rootDir, config } = await createVault({
       prefix: "memory-wiki-lint-",

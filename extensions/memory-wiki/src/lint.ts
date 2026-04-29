@@ -4,6 +4,7 @@ import {
   replaceManagedMarkdownBlock,
   withTrailingNewline,
 } from "openclaw/plugin-sdk/memory-host-markdown";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
 import {
   assessPageFreshness,
   buildClaimContradictionClusters,
@@ -52,27 +53,64 @@ function toExpectedPageType(page: WikiPageSummary): string {
 
 function collectBrokenLinkIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
   const validTargets = new Set<string>();
+  const addValidTarget = (value: string): void => {
+    const normalized = normalizeComparableTarget(value);
+    if (normalized) {
+      validTargets.add(normalized);
+    }
+  };
+
   for (const page of pages) {
     const withoutExtension = page.relativePath.replace(/\.md$/i, "");
-    validTargets.add(withoutExtension);
-    validTargets.add(path.basename(withoutExtension));
+    addValidTarget(page.relativePath);
+    addValidTarget(withoutExtension);
+    addValidTarget(path.basename(withoutExtension));
+    addValidTarget(page.title);
+    if (page.id) {
+      addValidTarget(page.id);
+    }
   }
 
   const issues: MemoryWikiLintIssue[] = [];
   for (const page of pages) {
     for (const linkTarget of page.linkTargets) {
-      if (!validTargets.has(linkTarget)) {
-        issues.push({
-          severity: "warning",
-          category: "links",
-          code: "broken-wikilink",
-          path: page.relativePath,
-          message: `Broken wikilink target \`${linkTarget}\`.`,
-        });
+      if (isOpenClawDirectiveLinkTarget(linkTarget)) {
+        continue;
       }
+      const normalizedTarget = normalizeComparableTarget(linkTarget);
+      if (!normalizedTarget || validTargets.has(normalizedTarget)) {
+        continue;
+      }
+      issues.push({
+        severity: "warning",
+        category: "links",
+        code: "broken-wikilink",
+        path: page.relativePath,
+        message: `Broken wikilink target \`${linkTarget}\`.`,
+      });
     }
   }
   return issues;
+}
+
+function normalizeComparableTarget(value: string): string {
+  return normalizeLowercaseStringOrEmpty(
+    value
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/\.md$/i, "")
+      .replace(/^\.\/+/, "")
+      .replace(/\/+$/, ""),
+  );
+}
+
+function isOpenClawDirectiveLinkTarget(target: string): boolean {
+  const trimmed = target.trim();
+  return (
+    /^reply_to_current$/i.test(trimmed) ||
+    /^reply_to\s*:\s*[^\]\n]+$/i.test(trimmed) ||
+    /^audio_as_voice$/i.test(trimmed)
+  );
 }
 
 function collectPageIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
