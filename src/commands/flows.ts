@@ -10,6 +10,7 @@ import {
   listTaskFlowRecords,
   resolveTaskFlowForLookupToken,
 } from "../tasks/task-flow-runtime-internal.js";
+import { countTaskIssueRecords } from "../tasks/task-registry.summary.js";
 import { sanitizeTerminalText } from "../terminal/safe-text.js";
 import { isRich, theme } from "../terminal/theme.js";
 
@@ -226,7 +227,7 @@ export async function flowsShowCommand(
     `createdAt: ${new Date(flow.createdAt).toISOString()}`,
     `updatedAt: ${new Date(flow.updatedAt).toISOString()}`,
     `endedAt: ${flow.endedAt ? new Date(flow.endedAt).toISOString() : "n/a"}`,
-    `tasks: ${taskSummary.total} total · ${taskSummary.active} active · ${taskSummary.failures} issues`,
+    `tasks: ${taskSummary.total} total · ${taskSummary.active} active · ${countTaskIssueRecords(tasks)} issues`,
   ];
   for (const line of lines) {
     runtime.log(line);

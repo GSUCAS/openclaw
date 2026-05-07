@@ -34,7 +34,7 @@ import {
   reconcileInspectableTasks,
   reconcileTaskLookupToken,
 } from "../tasks/task-registry.reconcile.js";
-import { summarizeTaskRecords } from "../tasks/task-registry.summary.js";
+import { countTaskIssueRecords, summarizeTaskRecords } from "../tasks/task-registry.summary.js";
 import type { TaskNotifyPolicy, TaskRecord } from "../tasks/task-registry.types.js";
 import { isRich, theme } from "../terminal/theme.js";
 
@@ -127,7 +127,8 @@ function formatTaskRows(tasks: TaskRecord[], rich: boolean) {
 
 function formatTaskListSummary(tasks: TaskRecord[]) {
   const summary = summarizeTaskRecords(tasks);
-  return `${summary.byStatus.queued} queued · ${summary.byStatus.running} running · ${summary.failures} issues`;
+  const issueCount = countTaskIssueRecords(tasks);
+  return `${summary.byStatus.queued} queued · ${summary.byStatus.running} running · ${issueCount} issues`;
 }
 
 function formatAgeMs(ageMs: number | undefined): string {

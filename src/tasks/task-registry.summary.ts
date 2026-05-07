@@ -1,3 +1,4 @@
+import { listTaskAuditFindings } from "./task-registry.audit.js";
 import type {
   TaskRecord,
   TaskRegistrySummary,
@@ -53,4 +54,15 @@ export function summarizeTaskRecords(records: Iterable<TaskRecord>): TaskRegistr
     }
   }
   return summary;
+}
+
+export function countTaskIssueRecords(records: Iterable<TaskRecord>, now = Date.now()): number {
+  const tasks = Array.from(records);
+  const taskIds = new Set(
+    listTaskAuditFindings({
+      now,
+      tasks,
+    }).map((finding) => finding.task.taskId),
+  );
+  return taskIds.size;
 }

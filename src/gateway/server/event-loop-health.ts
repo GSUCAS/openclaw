@@ -4,6 +4,9 @@ const EVENT_LOOP_MONITOR_RESOLUTION_MS = 20;
 const EVENT_LOOP_DELAY_WARN_MS = 1_000;
 const EVENT_LOOP_UTILIZATION_WARN = 0.95;
 const CPU_CORE_RATIO_WARN = 0.9;
+const EVENT_LOOP_PRESSURE_DELAY_P99_WARN_MS = 50;
+const EVENT_LOOP_PRESSURE_DELAY_MAX_WARN_MS = 250;
+const EVENT_LOOP_PRESSURE_CONSECUTIVE_SAMPLES_WARN = 3;
 
 type EventLoopDelayMonitor = ReturnType<typeof monitorEventLoopDelay>;
 type EventLoopUtilization = ReturnType<typeof performance.eventLoopUtilization>;
@@ -19,6 +22,11 @@ export type GatewayEventLoopHealth = {
   delayMaxMs: number;
   utilization: number;
   cpuCoreRatio: number;
+};
+
+export type GatewayEventLoopPressureState = {
+  utilizationConsecutiveSamples: number;
+  cpuConsecutiveSamples: number;
 };
 
 export type GatewayEventLoopHealthMonitor = {
@@ -38,11 +46,74 @@ function nanosecondsToMilliseconds(value: number): number {
   return roundMetric(value / 1_000_000, 1);
 }
 
+function createGatewayEventLoopPressureState(): GatewayEventLoopPressureState {
+  return {
+    utilizationConsecutiveSamples: 0,
+    cpuConsecutiveSamples: 0,
+  };
+}
+
+function hasEventLoopPressureDelayEvidence(delayP99Ms: number, delayMaxMs: number): boolean {
+  return (
+    delayP99Ms >= EVENT_LOOP_PRESSURE_DELAY_P99_WARN_MS ||
+    delayMaxMs >= EVENT_LOOP_PRESSURE_DELAY_MAX_WARN_MS
+  );
+}
+
+export function classifyGatewayEventLoopHealthSample(params: {
+  delayP99Ms: number;
+  delayMaxMs: number;
+  utilization: number;
+  cpuCoreRatio: number;
+  pressureState?: GatewayEventLoopPressureState;
+}): {
+  reasons: GatewayEventLoopHealthReason[];
+  pressureState: GatewayEventLoopPressureState;
+} {
+  const pressureState = params.pressureState ?? createGatewayEventLoopPressureState();
+  const nextPressureState: GatewayEventLoopPressureState = {
+    utilizationConsecutiveSamples:
+      params.utilization >= EVENT_LOOP_UTILIZATION_WARN
+        ? pressureState.utilizationConsecutiveSamples + 1
+        : 0,
+    cpuConsecutiveSamples:
+      params.cpuCoreRatio >= CPU_CORE_RATIO_WARN ? pressureState.cpuConsecutiveSamples + 1 : 0,
+  };
+  const reasons: GatewayEventLoopHealthReason[] = [];
+  const hasSevereDelay =
+    params.delayP99Ms >= EVENT_LOOP_DELAY_WARN_MS || params.delayMaxMs >= EVENT_LOOP_DELAY_WARN_MS;
+
+  if (hasSevereDelay) {
+    reasons.push("event_loop_delay");
+  }
+
+  const hasSustainedPressure =
+    hasEventLoopPressureDelayEvidence(params.delayP99Ms, params.delayMaxMs) &&
+    (nextPressureState.utilizationConsecutiveSamples >=
+      EVENT_LOOP_PRESSURE_CONSECUTIVE_SAMPLES_WARN ||
+      nextPressureState.cpuConsecutiveSamples >= EVENT_LOOP_PRESSURE_CONSECUTIVE_SAMPLES_WARN);
+
+  if (hasSustainedPressure) {
+    if (params.utilization >= EVENT_LOOP_UTILIZATION_WARN) {
+      reasons.push("event_loop_utilization");
+    }
+    if (params.cpuCoreRatio >= CPU_CORE_RATIO_WARN) {
+      reasons.push("cpu");
+    }
+  }
+
+  return {
+    reasons,
+    pressureState: nextPressureState,
+  };
+}
+
 export function createGatewayEventLoopHealthMonitor(): GatewayEventLoopHealthMonitor {
   let monitor: EventLoopDelayMonitor | null = null;
   let lastWallAt = Date.now();
   let lastCpuUsage: CpuUsage | null = process.cpuUsage();
   let lastEventLoopUtilization: EventLoopUtilization | null = performance.eventLoopUtilization();
+  let pressureState = createGatewayEventLoopPressureState();
 
   try {
     monitor = monitorEventLoopDelay({ resolution: EVENT_LOOP_MONITOR_RESOLUTION_MS });
@@ -70,17 +141,15 @@ export function createGatewayEventLoopHealthMonitor(): GatewayEventLoopHealthMon
       const delayMaxMs = nanosecondsToMilliseconds(monitor.max);
       const cpuTotalMs = roundMetric((cpuUsage.user + cpuUsage.system) / 1_000, 1);
       const cpuCoreRatio = roundMetric(cpuTotalMs / intervalMs);
-      const reasons: GatewayEventLoopHealthReason[] = [];
-
-      if (delayP99Ms >= EVENT_LOOP_DELAY_WARN_MS || delayMaxMs >= EVENT_LOOP_DELAY_WARN_MS) {
-        reasons.push("event_loop_delay");
-      }
-      if (utilization >= EVENT_LOOP_UTILIZATION_WARN) {
-        reasons.push("event_loop_utilization");
-      }
-      if (cpuCoreRatio >= CPU_CORE_RATIO_WARN) {
-        reasons.push("cpu");
-      }
+      const classification = classifyGatewayEventLoopHealthSample({
+        delayP99Ms,
+        delayMaxMs,
+        utilization,
+        cpuCoreRatio,
+        pressureState,
+      });
+      const { reasons } = classification;
+      pressureState = classification.pressureState;
 
       monitor.reset();
       lastWallAt = now;
@@ -103,6 +172,7 @@ export function createGatewayEventLoopHealthMonitor(): GatewayEventLoopHealthMon
       lastWallAt = 0;
       lastCpuUsage = null;
       lastEventLoopUtilization = null;
+      pressureState = createGatewayEventLoopPressureState();
     },
   };
 }
