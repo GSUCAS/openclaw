@@ -95,6 +95,18 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
     });
   });
 
+  it("suppresses bash search no-match warnings before mutating fallback logic", () => {
+    expectNoPayloads({
+      lastToolError: {
+        toolName: "bash",
+        meta: 'search "record_api_call(|get_service_stats(" in ~/.openclaw/workspace/skills/m365-token-access',
+        error: "Command exited with code 1",
+        mutatingAction: true,
+      },
+      verboseLevel: "off",
+    });
+  });
+
   it("surfaces exec tool errors for cron sessions even when verbose mode is off", () => {
     const payloads = buildPayloads({
       lastToolError: {
