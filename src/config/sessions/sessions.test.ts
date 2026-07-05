@@ -16,7 +16,12 @@ import {
 } from "./paths.js";
 import { evaluateSessionFreshness, resolveSessionResetPolicy } from "./reset.js";
 import { resolveAndPersistSessionFile } from "./session-file.js";
-import { clearSessionStoreCacheForTest, loadSessionStore, updateSessionStore } from "./store.js";
+import {
+  acquireSessionStoreMutationLane,
+  clearSessionStoreCacheForTest,
+  loadSessionStore,
+  updateSessionStore,
+} from "./store.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
 import { mergeSessionEntry, mergeSessionEntryWithPolicy, type SessionEntry } from "./types.js";
 
@@ -320,6 +325,35 @@ describe("session store lock (Promise chain mutex)", () => {
 
     const store = loadSessionStore(storePath);
     expect((store[key] as Record<string, unknown>).counter).toBe(N);
+  });
+
+  it("queues active-session updates behind the same session mutation lane", async () => {
+    const key = "agent:main:lane";
+    const { storePath } = await makeTmpStore({
+      [key]: { sessionId: "s1", updatedAt: Date.now() },
+    });
+
+    const releaseLane = await acquireSessionStoreMutationLane(storePath, key);
+    let updateRan = false;
+    const updatePromise = updateSessionStore(
+      storePath,
+      (store) => {
+        updateRan = true;
+        store[key] = { ...store[key], status: "running" } as SessionEntry;
+      },
+      { activeSessionKey: key },
+    );
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(updateRan).toBe(false);
+    } finally {
+      releaseLane();
+    }
+    await updatePromise;
+
+    const store = loadSessionStore(storePath);
+    expect(store[key]?.status).toBe("running");
   });
 
   it("skips session store disk writes when payload is unchanged", async () => {

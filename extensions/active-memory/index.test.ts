@@ -19,7 +19,11 @@ const hoisted = vi.hoisted(() => {
   return {
     sessionStore,
     updateSessionStore: vi.fn(
-      async (_storePath: string, updater: (store: Record<string, unknown>) => void) => {
+      async (
+        _storePath: string,
+        updater: (store: Record<string, unknown>) => void,
+        _opts?: unknown,
+      ) => {
         updater(sessionStore);
       },
     ),
@@ -185,9 +189,9 @@ describe("active-memory plugin", () => {
 
   it("registers a before_prompt_build hook", () => {
     expect(api.on).toHaveBeenCalledWith("before_prompt_build", expect.any(Function), {
-      timeoutMs: 45_000,
+      timeoutMs: 60_000,
     });
-    expect(hookOptions.before_prompt_build?.timeoutMs).toBe(45_000);
+    expect(hookOptions.before_prompt_build?.timeoutMs).toBe(60_000);
   });
 
   it("registers before_prompt_build with the configured recall timeout plus setup grace", () => {
@@ -2379,6 +2383,9 @@ describe("active-memory plugin", () => {
         lines: expect.arrayContaining([expect.stringContaining("🧩 Active Memory: status=ok")]),
       },
     ]);
+    expect(hoisted.updateSessionStore.mock.calls.at(-1)?.[2]).toEqual({
+      activeSessionKey: "agent:main:telegram:direct:12345",
+    });
   });
 
   it("uses the resolved canonical session key for non-webchat chat-type checks", async () => {

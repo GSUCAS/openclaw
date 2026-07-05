@@ -299,6 +299,87 @@ afterEach(async () => {
   resetSystemEventsForTest();
   await sessionMcpTesting.resetSessionMcpRuntimeManager();
 });
+
+describe("initSessionState concurrency", () => {
+  it("serializes rapid same-session webchat initialization onto one session identity", async () => {
+    const storePath = await makeStorePath("rapid-webchat-init-");
+    await writeSessionStoreFast(storePath, {});
+    const cfg = { session: { store: storePath } } as OpenClawConfig;
+    const sessionKey = "agent:main:webchat:direct:rapid";
+
+    const [first, second] = await Promise.all([
+      initSessionState({
+        ctx: {
+          Provider: "webchat",
+          Surface: "webchat",
+          Body: "first",
+          SessionKey: sessionKey,
+        },
+        cfg,
+        commandAuthorized: true,
+      }),
+      initSessionState({
+        ctx: {
+          Provider: "webchat",
+          Surface: "webchat",
+          Body: "second",
+          SessionKey: sessionKey,
+        },
+        cfg,
+        commandAuthorized: true,
+      }),
+    ]);
+
+    expect(second.sessionEntry.sessionId).toBe(first.sessionEntry.sessionId);
+    const persisted = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+      string,
+      SessionEntry
+    >;
+    expect(Object.keys(persisted)).toEqual([sessionKey]);
+    expect(persisted[sessionKey]?.sessionId).toBe(first.sessionEntry.sessionId);
+    expect(persisted[sessionKey]?.compactionCount).toBe(0);
+  });
+
+  it("preserves active-memory timeout status and compaction metadata on normal turns", async () => {
+    const storePath = await makeStorePath("active-memory-compaction-init-");
+    const sessionKey = "agent:main:webchat:direct:memory";
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: {
+        sessionId: "existing-session",
+        updatedAt: Date.now(),
+        compactionCount: 2,
+        pluginDebugEntries: [
+          {
+            pluginId: "active-memory",
+            lines: ["🧩 Active Memory: status=timeout"],
+          },
+        ],
+      },
+    });
+    const cfg = { session: { store: storePath } } as OpenClawConfig;
+
+    const result = await initSessionState({
+      ctx: {
+        Provider: "webchat",
+        Surface: "webchat",
+        Body: "continue",
+        SessionKey: sessionKey,
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.sessionEntry.sessionId).toBe("existing-session");
+    expect(result.sessionEntry.compactionCount).toBe(2);
+    expect(result.sessionEntry.pluginDebugEntries).toEqual([
+      {
+        pluginId: "active-memory",
+        lines: ["🧩 Active Memory: status=timeout"],
+      },
+    ]);
+  });
+});
+
 describe("initSessionState thread forking", () => {
   it("forks a new session from the parent session file", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

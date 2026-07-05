@@ -14,6 +14,7 @@ export async function resolveAndPersistSessionFile(params: {
   fallbackSessionFile?: string;
   activeSessionKey?: string;
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
+  skipSessionMutationLane?: boolean;
 }): Promise<{ sessionFile: string; sessionEntry: SessionEntry }> {
   const { sessionId, sessionKey, sessionStore, storePath } = params;
   const now = Date.now();
@@ -53,6 +54,7 @@ export async function resolveAndPersistSessionFile(params: {
         ? {
             ...(params.activeSessionKey ? { activeSessionKey: params.activeSessionKey } : {}),
             ...(params.maintenanceConfig ? { maintenanceConfig: params.maintenanceConfig } : {}),
+            ...(params.skipSessionMutationLane ? { skipSessionMutationLane: true } : {}),
           }
         : undefined,
     );

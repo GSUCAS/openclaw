@@ -26,6 +26,7 @@ import { createInternalHookEventPayload } from "../../test-utils/internal-hook-e
 import type { MsgContext } from "../templating.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import type { ReplyDispatcher } from "./reply-dispatcher.js";
+import { ReplySessionInitializationConflictError } from "./session-init-conflict.js";
 import { buildTestCtx } from "./test-ctx.js";
 
 type AbortResult = { handled: boolean; aborted: boolean; stoppedSubagents?: number };
@@ -3493,6 +3494,67 @@ describe("dispatchReplyFromConfig", () => {
         error: "Error: dispatch failed",
       }),
     );
+  });
+
+  it("treats reply session initialization conflicts as retryable session-busy skips", async () => {
+    setNoAbort();
+    const cfg = { diagnostics: { enabled: true } } as OpenClawConfig;
+    const sessionKey = "agent:main:whatsapp:direct:+15555550127";
+    const ctx = buildTestCtx({
+      Provider: "whatsapp",
+      OriginatingChannel: "whatsapp",
+      OriginatingTo: "whatsapp:+15555550127",
+      To: "whatsapp:+15555550127",
+      AccountId: "default",
+      MessageSid: "msg-session-busy",
+      SessionKey: sessionKey,
+      CommandBody: "hello",
+      RawBody: "hello",
+      Body: "hello",
+    });
+    const replyResolver = vi
+      .fn<
+        (_ctx: MsgContext, _opts?: GetReplyOptions, _cfg?: OpenClawConfig) => Promise<ReplyPayload>
+      >()
+      .mockRejectedValueOnce(
+        new ReplySessionInitializationConflictError({
+          sessionKey,
+          changedFields: ["pluginDebugEntries"],
+        }),
+      )
+      .mockResolvedValueOnce({ text: "retry succeeds" });
+
+    const firstDispatcher = createDispatcher();
+    const firstResult = await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher: firstDispatcher,
+      replyResolver,
+    });
+
+    expect(firstResult).toEqual({ queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } });
+    expect(firstDispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(diagnosticMocks.logMessageProcessed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "whatsapp",
+        outcome: "skipped",
+        reason: "session_busy",
+      }),
+    );
+    expect(diagnosticMocks.logSessionStateChange).toHaveBeenCalledWith({
+      sessionKey,
+      state: "idle",
+      reason: "session_busy",
+    });
+
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher: createDispatcher(),
+      replyResolver,
+    });
+
+    expect(replyResolver).toHaveBeenCalledTimes(2);
   });
 
   it("poisons inbound dedupe when dispatch fails after a block reply", async () => {

@@ -64,6 +64,7 @@ let sessionArchiveRuntimePromise: Promise<
 let trajectoryCleanupRuntimePromise: Promise<typeof import("../../trajectory/cleanup.js")> | null =
   null;
 let sessionWriteLockAcquirerForTests: typeof acquireSessionWriteLock | null = null;
+const SESSION_STORE_MUTATION_LANES = new Map<string, Promise<void>>();
 
 function loadSessionArchiveRuntime() {
   sessionArchiveRuntimePromise ??= import("../../gateway/session-archive.runtime.js");
@@ -92,6 +93,63 @@ export function setSessionWriteLockAcquirerForTests(
 
 export function resetSessionStoreLockRuntimeForTests(): void {
   sessionWriteLockAcquirerForTests = null;
+  SESSION_STORE_MUTATION_LANES.clear();
+}
+
+function resolveSessionStoreMutationLaneKey(
+  storePath: string,
+  sessionKey: string | undefined,
+): string | undefined {
+  const normalizedSessionKey = sessionKey ? normalizeStoreSessionKey(sessionKey) : "";
+  if (!storePath || !normalizedSessionKey) {
+    return undefined;
+  }
+  return `${path.resolve(storePath)}\0${normalizedSessionKey}`;
+}
+
+export async function acquireSessionStoreMutationLane(
+  storePath: string,
+  sessionKey: string | undefined,
+): Promise<() => void> {
+  const laneKey = resolveSessionStoreMutationLaneKey(storePath, sessionKey);
+  if (!laneKey) {
+    return () => {};
+  }
+
+  const previous = SESSION_STORE_MUTATION_LANES.get(laneKey) ?? Promise.resolve();
+  let releaseCurrent: () => void = () => {};
+  let released = false;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const ready = previous.catch(() => undefined);
+  const tail = ready.then(() => current);
+  SESSION_STORE_MUTATION_LANES.set(laneKey, tail);
+
+  await ready;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    releaseCurrent();
+    if (SESSION_STORE_MUTATION_LANES.get(laneKey) === tail) {
+      SESSION_STORE_MUTATION_LANES.delete(laneKey);
+    }
+  };
+}
+
+export async function withSessionStoreMutationLane<T>(
+  storePath: string,
+  sessionKey: string | undefined,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  const releaseLane = await acquireSessionStoreMutationLane(storePath, sessionKey);
+  try {
+    return await fn();
+  } finally {
+    releaseLane();
+  }
 }
 
 export async function withSessionStoreLockForTest<T>(
@@ -155,6 +213,8 @@ type SaveSessionStoreOptions = {
   maintenanceOverride?: Partial<ResolvedSessionMaintenanceConfig>;
   /** Fully resolved maintenance settings when the caller already has config loaded. */
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
+  /** Internal: caller already holds the per-session mutation lane. */
+  skipSessionMutationLane?: boolean;
 };
 
 function updateSessionStoreWriteCaches(params: {
@@ -440,9 +500,16 @@ export async function saveSessionStore(
   store: Record<string, SessionEntry>,
   opts?: SaveSessionStoreOptions,
 ): Promise<void> {
-  await withSessionStoreLock(storePath, async () => {
-    await saveSessionStoreUnlocked(storePath, store, opts);
-  });
+  const runSave = async () => {
+    await withSessionStoreLock(storePath, async () => {
+      await saveSessionStoreUnlocked(storePath, store, opts);
+    });
+  };
+  if (opts?.skipSessionMutationLane) {
+    await runSave();
+    return;
+  }
+  await withSessionStoreMutationLane(storePath, opts?.activeSessionKey, runSave);
 }
 
 export async function updateSessionStore<T>(
@@ -450,19 +517,24 @@ export async function updateSessionStore<T>(
   mutator: (store: Record<string, SessionEntry>) => Promise<T> | T,
   opts?: SaveSessionStoreOptions,
 ): Promise<T> {
-  return await withSessionStoreLock(storePath, async () => {
-    // Always re-read inside the lock to avoid clobbering concurrent writers.
-    const store = loadSessionStore(storePath, { skipCache: true, clone: false });
-    const previousAcpByKey = collectAcpMetadataSnapshot(store);
-    const result = await mutator(store);
-    preserveExistingAcpMetadata({
-      previousAcpByKey,
-      nextStore: store,
-      allowDropSessionKeys: opts?.allowDropAcpMetaSessionKeys,
+  const runUpdate = async () =>
+    await withSessionStoreLock(storePath, async () => {
+      // Always re-read inside the lock to avoid clobbering concurrent writers.
+      const store = loadSessionStore(storePath, { skipCache: true, clone: false });
+      const previousAcpByKey = collectAcpMetadataSnapshot(store);
+      const result = await mutator(store);
+      preserveExistingAcpMetadata({
+        previousAcpByKey,
+        nextStore: store,
+        allowDropSessionKeys: opts?.allowDropAcpMetaSessionKeys,
+      });
+      await saveSessionStoreUnlocked(storePath, store, opts);
+      return result;
     });
-    await saveSessionStoreUnlocked(storePath, store, opts);
-    return result;
-  });
+  if (opts?.skipSessionMutationLane) {
+    return await runUpdate();
+  }
+  return await withSessionStoreMutationLane(storePath, opts?.activeSessionKey, runUpdate);
 }
 
 type SessionStoreLockOptions = {

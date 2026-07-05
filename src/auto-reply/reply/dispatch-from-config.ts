@@ -78,6 +78,7 @@ import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import { withFullRuntimeReplyConfig } from "./get-reply-fast-path.js";
 import { claimInboundDedupe, commitInboundDedupe, releaseInboundDedupe } from "./inbound-dedupe.js";
 import { resolveReplyRoutingDecision } from "./routing-policy.js";
+import { isReplySessionInitializationConflictError } from "./session-init-conflict.js";
 import { resolveSourceReplyVisibilityPolicy } from "./source-reply-delivery-mode.js";
 import { resolveRunTypingPolicy } from "./typing-policy.js";
 
@@ -1395,6 +1396,11 @@ export async function dispatchReplyFromConfig(
       } else {
         releaseInboundDedupe(inboundDedupeClaim.key);
       }
+    }
+    if (isReplySessionInitializationConflictError(err)) {
+      recordProcessed("skipped", { reason: "session_busy" });
+      markIdle("session_busy");
+      return { queuedFinal: false, counts: dispatcher.getQueuedCounts() };
     }
     recordProcessed("error", { error: String(err) });
     markIdle("message_error");
