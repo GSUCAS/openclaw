@@ -1,9 +1,11 @@
+// Builds npm environment overrides for safe project-local installs.
 import { execFileSync } from "node:child_process";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { uniqueStrings } from "../shared/string-normalization.js";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 
+/** Options that scope npm config and cache paths for project-local installs. */
 export type NpmProjectInstallEnvOptions = {
   cacheDir?: string;
   npmConfigCwd?: string;
@@ -107,6 +109,22 @@ function readNpmGlobalConfigPath(
   env: NodeJS.ProcessEnv,
   scope: NpmFreshnessConfigScope,
 ): string | null {
+  const scopedGlobalConfig = resolveScopedGlobalNpmrc(scope);
+  if (scopedGlobalConfig) {
+    return scopedGlobalConfig;
+  }
+  const configuredGlobalConfig = resolveEnvPath(
+    env,
+    "NPM_CONFIG_GLOBALCONFIG",
+    "npm_config_globalconfig",
+  );
+  if (configuredGlobalConfig) {
+    return configuredGlobalConfig;
+  }
+  const configuredPrefix = resolveEnvPath(env, "NPM_CONFIG_PREFIX", "npm_config_prefix");
+  if (configuredPrefix) {
+    return path.join(configuredPrefix, "etc", "npmrc");
+  }
   const cacheKey = buildNpmGlobalConfigPathCacheKey(env, scope);
   if (NPM_GLOBAL_CONFIG_PATH_CACHE.has(cacheKey)) {
     return NPM_GLOBAL_CONFIG_PATH_CACHE.get(cacheKey) ?? null;
@@ -237,6 +255,10 @@ function resolveNpmFreshnessBypassMode(
   return hasRawNpmConfigKey(env, "before", scope) ? "before" : "min-release-age";
 }
 
+/**
+ * Builds npm args that bypass host freshness policies for OpenClaw-managed installs.
+ * Existing npmrc policy decides whether `before` or `min-release-age` is safer.
+ */
 export function createNpmFreshnessBypassArgs(
   env: NodeJS.ProcessEnv = process.env,
   now = new Date(),
@@ -248,6 +270,7 @@ export function createNpmFreshnessBypassArgs(
   return [`--before=${now.toISOString()}`];
 }
 
+/** Applies the same npm freshness bypass policy through environment variables. */
 export function applyNpmFreshnessBypassEnv(
   env: NodeJS.ProcessEnv,
   now = new Date(),
@@ -268,6 +291,10 @@ export function applyNpmFreshnessBypassEnv(
   }
 }
 
+/**
+ * Creates npm env for project-local installs, clearing global/workspace config
+ * and adding fetch, freshness, cache, and POSIX script-shell defaults.
+ */
 export function createNpmProjectInstallEnv(
   env: NodeJS.ProcessEnv,
   options: NpmProjectInstallEnvOptions = {},
@@ -297,11 +324,13 @@ export function createNpmProjectInstallEnv(
   return installEnv;
 }
 
-export function hasNpmScriptShellSetting(env: NodeJS.ProcessEnv): boolean {
+/** Returns true when caller env already pins npm's lifecycle script shell. */
+function hasNpmScriptShellSetting(env: NodeJS.ProcessEnv): boolean {
   return NPM_CONFIG_SCRIPT_SHELL_KEYS.some((key) => Boolean(env[key]?.trim()));
 }
 
-export function resolvePosixNpmScriptShell(env: NodeJS.ProcessEnv): string | null {
+/** Resolves an absolute POSIX shell for npm lifecycle scripts when one is available. */
+function resolvePosixNpmScriptShell(env: NodeJS.ProcessEnv): string | null {
   if (process.platform === "win32") {
     return null;
   }
@@ -312,6 +341,7 @@ export function resolvePosixNpmScriptShell(env: NodeJS.ProcessEnv): string | nul
   return shell && path.isAbsolute(shell) && fsSync.existsSync(shell) ? shell : null;
 }
 
+/** Sets npm's script-shell env only when the caller has not configured one. */
 export function applyPosixNpmScriptShellEnv(env: NodeJS.ProcessEnv): void {
   if (hasNpmScriptShellSetting(env)) {
     return;

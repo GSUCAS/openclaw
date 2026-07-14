@@ -1,8 +1,9 @@
+// Resolves git commit metadata for build/runtime diagnostics.
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { resolveGitHeadPath } from "./git-root.js";
 import { resolveOpenClawPackageRootSync } from "./openclaw-root.js";
 
@@ -23,7 +24,7 @@ const formatCommit = (value?: string | null) => {
 
 const cachedGitCommitBySearchDir = new Map<string, string | null>();
 
-export type CommitMetadataReaders = {
+type CommitMetadataReaders = {
   readGitCommit?: (searchDir: string, packageRoot: string | null) => string | null | undefined;
   readBuildInfoCommit?: () => string | null;
   readPackageJsonCommit?: () => string | null;
@@ -67,11 +68,6 @@ const cacheGitCommit = (searchDir: string, commit: string | null) => {
   cachedGitCommitBySearchDir.set(searchDir, commit);
   return commit;
 };
-
-const clearCachedGitCommits = () => {
-  cachedGitCommitBySearchDir.clear();
-};
-
 const resolveGitLookupDepth = (searchDir: string, packageRoot: string | null) => {
   if (!packageRoot) {
     return undefined;
@@ -256,8 +252,3 @@ export const resolveCommitHash = (
     return cacheGitCommit(searchDir, null);
   }
 };
-
-export const testing = {
-  clearCachedGitCommits,
-};
-export { testing as __testing };

@@ -1,3 +1,5 @@
+// Doctor session state provider tests cover route-state repair and configured provider resolution.
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
 import {
   applySessionRouteStateRepair,
@@ -75,6 +77,80 @@ describe("doctor session state provider routes", () => {
     ).toBe(true);
   });
 
+  it("skips valid locked agent-harness rows during scan and repair", async () => {
+    const sessionKey = "agent:main:ordinary-locked";
+    const entry: Record<string, unknown> = {
+      sessionId: "sess-supervised-codex",
+      updatedAt: 1,
+      modelSelectionLocked: true,
+      agentHarnessId: "codex",
+      modelProvider: "openai-codex",
+      model: "gpt-5.5",
+      providerOverride: "openai-codex",
+      modelOverride: "gpt-5.5",
+      modelOverrideSource: "auto",
+      cliSessionBindings: {
+        "codex-cli": { sessionId: "native-codex-session" },
+      },
+    };
+    const original = structuredClone(entry);
+    const store = { [sessionKey]: entry };
+    const route = {
+      defaultProvider: "github-copilot",
+      configuredModelRefs: ["github-copilot/gpt-5-mini"],
+      runtime: "openclaw",
+    };
+
+    expect(
+      storeMayContainPluginSessionRouteState(
+        store as unknown as Parameters<typeof storeMayContainPluginSessionRouteState>[0],
+      ),
+    ).toBe(false);
+    expect(
+      scanSessionRouteStateOwners({
+        owners: [codexOwner],
+        store,
+        routes: { [sessionKey]: route },
+      }),
+    ).toEqual({ repairs: [], manualReview: [] });
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: {
+          key: sessionKey,
+          ownerId: "codex",
+          ownerLabel: "Codex",
+          reasons: ["auto model override", "pinned runtime", "runtime model state"],
+          pinnedRuntimeKeys: ["agentHarnessId"],
+          cliSessionKeys: ["codex-cli"],
+        },
+        now: 123,
+      }),
+    ).toBe(false);
+
+    const warnings: string[] = [];
+    const changes: string[] = [];
+    const prompter: Parameters<typeof runPluginSessionStateDoctorRepairs>[0]["prompter"] = {
+      confirmRuntimeRepair: vi.fn(async () => true),
+      note: vi.fn(),
+    };
+    await runPluginSessionStateDoctorRepairs({
+      cfg: {},
+      store: store as unknown as Parameters<typeof runPluginSessionStateDoctorRepairs>[0]["store"],
+      absoluteStorePath: "/tmp/nonexistent-supervised-store.json",
+      prompter,
+      env: {},
+      warnings,
+      changes,
+    });
+
+    expect(entry).toEqual(original);
+    expect(warnings).toStrictEqual([]);
+    expect(changes).toStrictEqual([]);
+    expect(prompter.confirmRuntimeRepair).not.toHaveBeenCalled();
+  });
+
   it("preserves configured provider CLI runtimes before harness policy normalization", () => {
     const route = resolveConfiguredDoctorSessionStateRoute({
       cfg: {
@@ -107,7 +183,7 @@ describe("doctor session state provider routes", () => {
         agents: {
           defaults: {
             model: { primary: "openai/gpt-5.5" },
-            agentRuntime: { id: "pi" },
+            agentRuntime: { id: "openclaw" },
           },
         },
       },
@@ -153,7 +229,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "github-copilot",
           configuredModelRefs: ["github-copilot/gpt-5-mini"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -176,7 +252,14 @@ describe("doctor session state provider routes", () => {
       },
     ]);
 
-    expect(applySessionRouteStateRepair({ entry, repair: scan.repairs[0], now: 123 })).toBe(true);
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: expectDefined(scan.repairs[0], "scan.repairs[0] test invariant"),
+        now: 123,
+      }),
+    ).toBe(true);
     expect(entry.sessionId).toBe("sess-stale-codex");
     expect(entry.updatedAt).toBe(123);
     expect(entry.cliSessionBindings).toStrictEqual({
@@ -222,7 +305,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "github-copilot",
           configuredModelRefs: ["github-copilot/gpt-5-mini"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -260,7 +343,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "github-copilot",
           configuredModelRefs: ["github-copilot/gpt-5-mini", "openai-codex/gpt-5.4"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -277,7 +360,14 @@ describe("doctor session state provider routes", () => {
       },
     ]);
 
-    expect(applySessionRouteStateRepair({ entry, repair: scan.repairs[0], now: 123 })).toBe(true);
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: expectDefined(scan.repairs[0], "scan.repairs[0] test invariant"),
+        now: 123,
+      }),
+    ).toBe(true);
     expect(entry.updatedAt).toBe(123);
     expect(entry.providerOverride).toBe("openai-codex");
     expect(entry.modelOverride).toBe("gpt-5.4");
@@ -340,7 +430,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "openai",
           configuredModelRefs: ["openai/gpt-5.5"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -357,7 +447,14 @@ describe("doctor session state provider routes", () => {
       },
     ]);
 
-    expect(applySessionRouteStateRepair({ entry, repair: scan.repairs[0], now: 123 })).toBe(true);
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: expectDefined(scan.repairs[0], "scan.repairs[0] test invariant"),
+        now: 123,
+      }),
+    ).toBe(true);
     expect(entry.sessionId).toBe("sess-stale-claude-cli");
     expect(entry.updatedAt).toBe(123);
     expect(entry.agentRuntimeOverride).toBeUndefined();
@@ -419,7 +516,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "anthropic",
           configuredModelRefs: ["anthropic/claude-opus-4.7"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -436,7 +533,14 @@ describe("doctor session state provider routes", () => {
       },
     ]);
 
-    expect(applySessionRouteStateRepair({ entry, repair: scan.repairs[0], now: 123 })).toBe(true);
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: expectDefined(scan.repairs[0], "scan.repairs[0] test invariant"),
+        now: 123,
+      }),
+    ).toBe(true);
     expect(entry.updatedAt).toBe(123);
     expect(entry.agentRuntimeOverride).toBeUndefined();
   });
@@ -457,7 +561,7 @@ describe("doctor session state provider routes", () => {
         [sessionKey]: {
           defaultProvider: "openai",
           configuredModelRefs: ["openai/gpt-5.5"],
-          runtime: "pi",
+          runtime: "openclaw",
         },
       },
     });
@@ -474,7 +578,14 @@ describe("doctor session state provider routes", () => {
       },
     ]);
 
-    expect(applySessionRouteStateRepair({ entry, repair: scan.repairs[0], now: 123 })).toBe(true);
+    expect(
+      applySessionRouteStateRepair({
+        sessionKey,
+        entry,
+        repair: expectDefined(scan.repairs[0], "scan.repairs[0] test invariant"),
+        now: 123,
+      }),
+    ).toBe(true);
     expect(entry.updatedAt).toBe(123);
     expect(entry.agentHarnessId).toBeUndefined();
     expect(entry.agentRuntimeOverride).toBe("claude-cli");

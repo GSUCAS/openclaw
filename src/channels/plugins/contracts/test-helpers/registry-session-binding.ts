@@ -1,3 +1,8 @@
+/**
+ * Session binding contract registry fixtures.
+ *
+ * Builds bundled channel binding contract entries and hermetic plugin-state stores.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { expect } from "vitest";
@@ -8,10 +13,15 @@ import {
   type SessionBindingRecord,
 } from "../../../../infra/outbound/session-binding-service.js";
 import { resolvePreferredOpenClawTmpDir } from "../../../../infra/tmp-openclaw-dir.js";
+import type { OpenKeyedStoreOptions } from "../../../../plugin-sdk/plugin-state-runtime.js";
+import {
+  createPluginStateKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "../../../../plugin-sdk/plugin-state-test-runtime.js";
 import { setActivePluginRegistry } from "../../../../plugins/runtime.js";
 import { createTestRegistry } from "../../../../test-utils/channel-plugins.js";
-import { createChannelConversationBindingManager } from "../../conversation-bindings.js";
-import type { ChannelPlugin } from "../../types.js";
+import { getChannelPlugin } from "../../registry.js";
+import type { ChannelPlugin } from "../../types.public.js";
 import {
   sessionBindingContractChannelIds,
   type SessionBindingContractChannelId,
@@ -31,6 +41,17 @@ type SessionBindingContractEntry = {
 };
 const contractApiPromises = new Map<string, Promise<Record<string, unknown>>>();
 
+async function createContractChannelConversationBindingManager(params: {
+  channelId: Parameters<typeof getChannelPlugin>[0];
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+}): Promise<{ stop: () => void | Promise<void> } | null> {
+  const createManager = getChannelPlugin(params.channelId)?.conversationBindings?.createManager;
+  return createManager
+    ? await createManager({ cfg: params.cfg, accountId: params.accountId })
+    : null;
+}
+
 const matrixSessionBindingStateDir = fs.mkdtempSync(
   path.join(resolvePreferredOpenClawTmpDir(), "openclaw-matrix-session-binding-contract-"),
 );
@@ -46,7 +67,7 @@ async function getContractApi<T extends Record<string, unknown>>(pluginId: strin
   if (existing) {
     return (await existing) as T;
   }
-  const next = importBundledChannelContractArtifact<T>(pluginId, "contract-api");
+  const next = importBundledChannelContractArtifact<T>(pluginId, "session-binding-contract-api");
   contractApiPromises.set(pluginId, next);
   return await next;
 }
@@ -95,6 +116,7 @@ function expectClearedSessionBinding(params: {
 }
 
 function resetMatrixSessionBindingStateDir() {
+  resetPluginStateStoreForTests();
   fs.rmSync(matrixSessionBindingStateDir, { recursive: true, force: true });
   fs.mkdirSync(matrixSessionBindingStateDir, { recursive: true });
 }
@@ -105,6 +127,8 @@ async function createContractMatrixThreadBindingManager() {
     await getContractApi<MatrixContractApi>("matrix");
   setMatrixRuntime({
     state: {
+      openKeyedStore: (options: OpenKeyedStoreOptions) =>
+        createPluginStateKeyedStoreForTests("matrix", options),
       resolveStateDir: () => matrixSessionBindingStateDir,
     },
   } as never);
@@ -383,7 +407,7 @@ const sessionBindingContractEntries: Record<
       placements: ["current"],
     },
     getCapabilities: () => {
-      void createChannelConversationBindingManager({
+      void createContractChannelConversationBindingManager({
         channelId: "imessage",
         cfg: baseSessionBindingCfg,
         accountId: "default",
@@ -394,7 +418,7 @@ const sessionBindingContractEntries: Record<
       });
     },
     bindAndResolve: async () => {
-      await createChannelConversationBindingManager({
+      await createContractChannelConversationBindingManager({
         channelId: "imessage",
         cfg: baseSessionBindingCfg,
         accountId: "default",
@@ -424,7 +448,7 @@ const sessionBindingContractEntries: Record<
     },
     unbindAndVerify: unbindAndExpectClearedSessionBinding,
     cleanup: async () => {
-      const manager = await createChannelConversationBindingManager({
+      const manager = await createContractChannelConversationBindingManager({
         channelId: "imessage",
         cfg: baseSessionBindingCfg,
         accountId: "default",

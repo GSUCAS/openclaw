@@ -1,11 +1,14 @@
+// Cron service test harness builds isolated stores, timers, and delivery fixtures.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, vi } from "vitest";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
-import type { CronEvent, CronServiceDeps } from "./service.js";
+import type { CronEvent } from "./service.js";
 import { CronService } from "./service.js";
 import { createCronServiceState, type CronServiceState } from "./service/state.js";
+import type { CronServiceDeps } from "./service/state.js";
+import { saveCronStore } from "./store.js";
 import type { CronJob } from "./types.js";
 
 type NoopLogger = {
@@ -52,19 +55,10 @@ export function createCronStoreHarness(options?: { prefix?: string }) {
 }
 
 export async function writeCronStoreSnapshot(params: { storePath: string; jobs: CronJob[] }) {
-  await fs.mkdir(path.dirname(params.storePath), { recursive: true });
-  await fs.writeFile(
-    params.storePath,
-    JSON.stringify(
-      {
-        version: 1,
-        jobs: params.jobs,
-      },
-      null,
-      2,
-    ),
-    "utf-8",
-  );
+  await saveCronStore(params.storePath, {
+    version: 1,
+    jobs: params.jobs,
+  });
 }
 
 export function installCronTestHooks(options: {
@@ -183,7 +177,7 @@ export async function withCronServiceForTest(
 
 export function createRunningCronServiceState(params: {
   storePath: string;
-  log: ReturnType<typeof createNoopLogger>;
+  log: CronServiceDeps["log"];
   nowMs: () => number;
   jobs: CronJob[];
 }) {
@@ -239,15 +233,22 @@ export function createMockCronStateForJobs(params: {
   const nowMs = params.nowMs ?? Date.now();
   return {
     store: { version: 1, jobs: params.jobs },
+    durableNextRunAtMsByJobId: new Map<string, number | undefined>(),
     running: false,
+    stopped: false,
+    schedulingPaused: false,
+    schedulerStarted: false,
+    restartRecoveryPending: false,
+    pendingCatchupDeferralJobIds: new Set<string>(),
+    activeManualRunJobIds: new Set<string>(),
+    manualSetupTimeoutNotified: false,
     timer: null,
     storeLoadedAtMs: nowMs,
-    storeFileMtimeMs: null,
     op: Promise.resolve(),
     warnedDisabled: false,
-    warnedMissingSessionTargetJobIds: new Set<string>(),
     warnedInvalidPersistedJobKeys: new Set<string>(),
-    preservedInvalidPersistedJobs: [],
+    pendingQuarantineConfigJobs: [],
+    lastQuarantineFailureWarnKey: null,
     deps: {
       storePath: "/mock/path",
       cronEnabled: true,

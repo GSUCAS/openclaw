@@ -1,3 +1,4 @@
+// Covers gateway exposure audit classification.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { collectGatewayConfigFindings } from "./audit-gateway-config.js";
@@ -37,6 +38,15 @@ function requireFinding(
 }
 
 describe("security audit gateway exposure findings", () => {
+  it("warns when the MCP Apps bridge is enabled", () => {
+    const cfg: OpenClawConfig = { mcp: { apps: { enabled: true } } };
+    expect(collectGatewayConfigFindings(cfg, cfg, {})).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ checkId: "mcp.apps.enabled", severity: "warn" }),
+      ]),
+    );
+  });
+
   it("warns on insecure or dangerous flags", () => {
     const cases = [
       {
@@ -156,7 +166,7 @@ describe("security audit gateway exposure findings", () => {
     const finding = requireFinding(findings, expectedFinding.checkId, expectedFinding.checkId);
     expect(finding.severity).toBe(expectedFinding.severity);
     if (expectedNoFinding) {
-      expect(findings.map((finding) => finding.checkId)).not.toContain(expectedNoFinding);
+      expect(findings.map((findingLocal) => findingLocal.checkId)).not.toContain(expectedNoFinding);
     }
   });
 
@@ -275,6 +285,23 @@ describe("security audit gateway exposure findings", () => {
           bind: "loopback",
           allowRealIpFallback: true,
           trustedProxies: ["127.0.0.0/8"],
+          auth: {
+            mode: "trusted-proxy",
+            trustedProxy: {
+              userHeader: "x-forwarded-user",
+            },
+          },
+        },
+      } satisfies OpenClawConfig,
+      expectedSeverity: "critical" as const,
+    },
+    {
+      name: "loopback trusted-proxy with partial loopback CIDR prefix",
+      cfg: {
+        gateway: {
+          bind: "loopback",
+          allowRealIpFallback: true,
+          trustedProxies: ["127.0.0.1/32abc"],
           auth: {
             mode: "trusted-proxy",
             trustedProxy: {

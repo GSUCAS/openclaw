@@ -1,6 +1,6 @@
+// Feishu tests cover send plugin behavior.
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
-import { buildMarkdownCard } from "./send.js";
 
 const {
   mockConvertMarkdownTables,
@@ -56,22 +56,24 @@ vi.mock("./runtime.js", () => ({
   }),
 }));
 
-let buildStructuredCard: typeof import("./send.js").buildStructuredCard;
 let editMessageFeishu: typeof import("./send.js").editMessageFeishu;
 let getMessageFeishu: typeof import("./send.js").getMessageFeishu;
 let listFeishuThreadMessages: typeof import("./send.js").listFeishuThreadMessages;
 let resolveFeishuCardTemplate: typeof import("./send.js").resolveFeishuCardTemplate;
+let sendMarkdownCardFeishu: typeof import("./send.js").sendMarkdownCardFeishu;
 let sendMessageFeishu: typeof import("./send.js").sendMessageFeishu;
+let sendStructuredCardFeishu: typeof import("./send.js").sendStructuredCardFeishu;
 
 describe("getMessageFeishu", () => {
   beforeAll(async () => {
     ({
-      buildStructuredCard,
       editMessageFeishu,
       getMessageFeishu,
       listFeishuThreadMessages,
       resolveFeishuCardTemplate,
+      sendMarkdownCardFeishu,
       sendMessageFeishu,
+      sendStructuredCardFeishu,
     } = await import("./send.js"));
   });
 
@@ -172,6 +174,129 @@ describe("getMessageFeishu", () => {
     });
   });
 
+  it("sends automatic mentions as native post elements without rewriting body text", async () => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_mentions" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+
+    const result = await sendMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      to: "oc_send",
+      text: 'body <at user_id="ou_body">Body User</at>',
+      mentions: [{ openId: "ou_target", name: "Target User", key: "@_user_1" }],
+    });
+
+    expect(mockConvertMarkdownTables).toHaveBeenCalledWith(
+      'body <at user_id="ou_body">Body User</at>',
+      "preserve",
+    );
+    expect(create).toHaveBeenCalledWith({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: "oc_send",
+        msg_type: "post",
+        content: JSON.stringify({
+          zh_cn: {
+            content: [
+              [
+                { tag: "at", user_id: "ou_target", user_name: "Target User" },
+                { tag: "md", text: 'body <at user_id="ou_body">Body User</at>' },
+              ],
+            ],
+          },
+        }),
+      },
+    });
+    expect(typeof result.receipt.sentAt).toBe("number");
+    expect(result).toEqual({
+      messageId: "om_mentions",
+      chatId: "oc_send",
+      receipt: {
+        primaryPlatformMessageId: "om_mentions",
+        platformMessageIds: ["om_mentions"],
+        parts: [
+          {
+            platformMessageId: "om_mentions",
+            kind: "text",
+            index: 0,
+            raw: {
+              channel: "feishu",
+              messageId: "om_mentions",
+              chatId: "oc_send",
+              conversationId: "oc_send",
+            },
+            threadId: "oc_send",
+          },
+        ],
+        threadId: "oc_send",
+        sentAt: result.receipt.sentAt,
+        raw: [
+          {
+            channel: "feishu",
+            messageId: "om_mentions",
+            chatId: "oc_send",
+            conversationId: "oc_send",
+          },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    {
+      name: "structured",
+      send: () =>
+        sendStructuredCardFeishu({
+          cfg: {} as ClawdbotConfig,
+          to: "oc_card",
+          text: "hello",
+          header: { title: "Agent", template: "space lobster" },
+        }),
+      expectedHeader: {
+        title: { tag: "plain_text", content: "Agent" },
+        template: "blue",
+      },
+    },
+    {
+      name: "markdown",
+      send: () =>
+        sendMarkdownCardFeishu({ cfg: {} as ClawdbotConfig, to: "oc_card", text: "hello" }),
+      expectedHeader: undefined,
+    },
+  ])("sends $name cards with schema-2.0 width config", async ({ send, expectedHeader }) => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_card" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+
+    await send();
+
+    const request = create.mock.calls[0]?.[0] as { data?: { content?: string } } | undefined;
+    expect(JSON.parse(request?.data?.content ?? "null")).toEqual({
+      schema: "2.0",
+      config: { width_mode: "fill" },
+      body: { elements: [{ tag: "markdown", content: "hello" }] },
+      ...(expectedHeader ? { header: expectedHeader } : {}),
+    });
+  });
+
   it("extracts text content from interactive card elements", async () => {
     mockClientGet.mockResolvedValueOnce({
       code: 0,
@@ -199,6 +324,10 @@ describe("getMessageFeishu", () => {
       messageId: "om_1",
     });
 
+    expect(mockClientGet).toHaveBeenCalledWith({
+      params: { card_msg_content_type: "user_card_content" },
+      path: { message_id: "om_1" },
+    });
     expect(result).toEqual({
       messageId: "om_1",
       chatId: "oc_1",
@@ -469,6 +598,15 @@ describe("getMessageFeishu", () => {
       rootMessageId: "om_root",
     });
 
+    expect(mockClientList).toHaveBeenCalledWith({
+      params: {
+        container_id_type: "thread",
+        container_id: "omt_1",
+        sort_type: "ByCreateTimeDesc",
+        page_size: 21,
+        card_msg_content_type: "user_card_content",
+      },
+    });
     expect(result).toEqual([
       {
         messageId: "om_file",
@@ -485,6 +623,45 @@ describe("getMessageFeishu", () => {
         contentType: "interactive",
         content: "hello from card 2.0",
         createTime: 1710000000000,
+      },
+    ]);
+  });
+
+  it("does not partially parse malformed thread history create_time values", async () => {
+    mockClientList.mockResolvedValueOnce({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_text",
+            msg_type: "text",
+            body: {
+              content: JSON.stringify({ text: "partial time" }),
+            },
+            sender: {
+              id: "ou_1",
+              sender_type: "user",
+            },
+            create_time: "1710000000000ms",
+          },
+        ],
+      },
+    });
+
+    const result = await listFeishuThreadMessages({
+      cfg: {} as ClawdbotConfig,
+      threadId: "omt_1",
+      rootMessageId: "om_root",
+    });
+
+    expect(result).toEqual([
+      {
+        messageId: "om_text",
+        senderId: "ou_1",
+        senderType: "user",
+        contentType: "text",
+        content: "partial time",
+        createTime: undefined,
       },
     ]);
   });
@@ -567,55 +744,5 @@ describe("resolveFeishuCardTemplate", () => {
 
   it("drops unsupported free-form identity themes", () => {
     expect(resolveFeishuCardTemplate("space lobster")).toBeUndefined();
-  });
-});
-
-function expectSchema2WidthConfig(card: unknown) {
-  const typedCard = card as {
-    config: {
-      width_mode?: string;
-      enable_forward?: boolean;
-      wide_screen_mode?: boolean;
-    };
-  };
-
-  expect(typedCard.config.width_mode).toBe("fill");
-  expect(typedCard.config.enable_forward).toBeUndefined();
-  expect(typedCard.config.wide_screen_mode).toBeUndefined();
-}
-
-describe("Feishu card schema config", () => {
-  it.each([
-    {
-      name: "structured card",
-      build: () => buildStructuredCard("hello"),
-    },
-    {
-      name: "markdown card",
-      build: () => buildMarkdownCard("hello"),
-    },
-  ])("$name uses schema-2.0 width config instead of legacy wide screen mode", ({ build }) => {
-    expectSchema2WidthConfig(build());
-  });
-});
-
-describe("buildStructuredCard", () => {
-  it("falls back to blue when the header template is unsupported", () => {
-    const card = buildStructuredCard("hello", {
-      header: {
-        title: "Agent",
-        template: "space lobster",
-      },
-    });
-
-    expect(card).toEqual({
-      schema: "2.0",
-      config: { width_mode: "fill" },
-      body: { elements: [{ tag: "markdown", content: "hello" }] },
-      header: {
-        title: { tag: "plain_text", content: "Agent" },
-        template: "blue",
-      },
-    });
   });
 });

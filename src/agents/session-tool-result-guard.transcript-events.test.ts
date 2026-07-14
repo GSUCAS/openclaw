@@ -1,15 +1,17 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+// Verifies guarded session managers emit transcript update events with stable sequence ids.
+import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
+import { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  onSessionTranscriptUpdate,
-  type SessionTranscriptUpdate,
+  onInternalSessionTranscriptUpdate,
+  type InternalSessionTranscriptUpdate,
 } from "../sessions/transcript-events.js";
 import { guardSessionManager } from "./session-tool-result-guard-wrapper.js";
 
 const listeners: Array<() => void> = [];
 
 afterEach(() => {
+  // Remove all transcript listeners between tests to avoid duplicate broadcasts.
   while (listeners.length > 0) {
     listeners.pop()?.();
   }
@@ -17,8 +19,8 @@ afterEach(() => {
 
 describe("guardSessionManager transcript updates", () => {
   it("includes the session key when broadcasting appended non-tool-result messages", () => {
-    const updates: SessionTranscriptUpdate[] = [];
-    listeners.push(onSessionTranscriptUpdate((update) => updates.push(update)));
+    const updates: InternalSessionTranscriptUpdate[] = [];
+    listeners.push(onInternalSessionTranscriptUpdate((update) => updates.push(update)));
 
     const sm = SessionManager.inMemory();
     const sessionFile = "/tmp/openclaw-session-message-events.jsonl";
@@ -43,6 +45,7 @@ describe("guardSessionManager transcript updates", () => {
 
     expect(updates).toStrictEqual([
       {
+        agentId: "main",
         message: {
           content: [{ text: "hello from subagent", type: "text" }],
           role: "assistant",
@@ -83,8 +86,8 @@ describe("guardSessionManager transcript updates", () => {
   });
 
   it("reuses cached transcript sequence for consecutive appended messages", () => {
-    const updates: SessionTranscriptUpdate[] = [];
-    listeners.push(onSessionTranscriptUpdate((update) => updates.push(update)));
+    const updates: InternalSessionTranscriptUpdate[] = [];
+    listeners.push(onInternalSessionTranscriptUpdate((update) => updates.push(update)));
 
     const sm = SessionManager.inMemory();
     sm.appendMessage({
@@ -123,8 +126,9 @@ describe("guardSessionManager transcript updates", () => {
   });
 
   it("caches real tool result sequence before final assistant messages", () => {
-    const updates: SessionTranscriptUpdate[] = [];
-    listeners.push(onSessionTranscriptUpdate((update) => updates.push(update)));
+    // Tool results are persisted but not broadcast, so later visible messages must skip their seq.
+    const updates: InternalSessionTranscriptUpdate[] = [];
+    listeners.push(onInternalSessionTranscriptUpdate((update) => updates.push(update)));
 
     const sm = SessionManager.inMemory();
     sm.appendMessage({

@@ -1,14 +1,18 @@
+// Usage format tests cover display formatting for token and cost usage.
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import {
-  resetGatewayModelPricingCacheForTest,
-  setGatewayModelPricingForTest,
+  clearGatewayModelPricingFailures,
+  replaceGatewayModelPricingCache,
+  type CachedModelPricing,
 } from "../gateway/model-pricing-cache-state.js";
 import * as manifestModelIdNormalization from "../plugins/manifest-model-id-normalization.js";
+import { captureEnv } from "../test-utils/env.js";
 import {
   resetUsageFormatCachesForTest,
   estimateUsageCost,
@@ -16,10 +20,27 @@ import {
   formatUsd,
   resolveModelCostConfig,
   resolveModelCostConfigFingerprint,
-  type PricingTier,
 } from "./usage-format.js";
 
 type ModelCostConfig = NonNullable<ReturnType<typeof resolveModelCostConfig>>;
+type PricingTier = NonNullable<ModelCostConfig["tieredPricing"]>[number];
+
+function setGatewayModelPricing(
+  entries: Array<{
+    provider: string;
+    model: string;
+    pricing: CachedModelPricing;
+  }>,
+): void {
+  replaceGatewayModelPricingCache(
+    new Map(entries.map((entry) => [`${entry.provider}/${entry.model}`, entry.pricing])),
+  );
+}
+
+function clearGatewayModelPricingState(): void {
+  replaceGatewayModelPricingCache(new Map(), 0);
+  clearGatewayModelPricingFailures();
+}
 
 function requireCostConfig(
   cost: ReturnType<typeof resolveModelCostConfig>,
@@ -42,34 +63,26 @@ function requireTieredPricing(
 }
 
 describe("usage-format", () => {
-  const originalAgentDir = process.env.OPENCLAW_AGENT_DIR;
-  const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+  let envSnapshot: ReturnType<typeof captureEnv> | undefined;
   let agentDir: string;
   let stateDir: string;
 
   beforeEach(async () => {
+    envSnapshot = captureEnv(["OPENCLAW_AGENT_DIR", "OPENCLAW_STATE_DIR"]);
     stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-usage-format-"));
     agentDir = path.join(stateDir, "agents", "main", "agent");
     process.env.OPENCLAW_STATE_DIR = stateDir;
     delete process.env.OPENCLAW_AGENT_DIR;
     await fs.mkdir(agentDir, { recursive: true });
     resetUsageFormatCachesForTest();
-    resetGatewayModelPricingCacheForTest();
+    clearGatewayModelPricingState();
   });
 
   afterEach(async () => {
-    if (originalAgentDir === undefined) {
-      delete process.env.OPENCLAW_AGENT_DIR;
-    } else {
-      process.env.OPENCLAW_AGENT_DIR = originalAgentDir;
-    }
-    if (originalStateDir === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR;
-    } else {
-      process.env.OPENCLAW_STATE_DIR = originalStateDir;
-    }
+    envSnapshot?.restore();
+    envSnapshot = undefined;
     resetUsageFormatCachesForTest();
-    resetGatewayModelPricingCacheForTest();
+    clearGatewayModelPricingState();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
@@ -178,7 +191,7 @@ describe("usage-format", () => {
       "utf8",
     );
 
-    setGatewayModelPricingForTest([
+    setGatewayModelPricing([
       {
         provider: "demo-preferred",
         model: "demo-model",
@@ -216,7 +229,7 @@ describe("usage-format", () => {
       },
     } as unknown as OpenClawConfig;
 
-    setGatewayModelPricingForTest([
+    setGatewayModelPricing([
       {
         provider: "demo-config-provider",
         model: "demo-model",
@@ -239,7 +252,7 @@ describe("usage-format", () => {
   });
 
   it("falls back to cached gateway pricing when no configured cost exists", () => {
-    setGatewayModelPricingForTest([
+    setGatewayModelPricing([
       {
         provider: "demo-cached-provider",
         model: "demo-model",
@@ -702,7 +715,7 @@ describe("usage-format", () => {
     const tiers: PricingTier[] = [
       { input: 0.46, output: 2.3, cacheRead: 0, cacheWrite: 0, range: [0, 32_000] },
       { input: 0.7, output: 3.5, cacheRead: 0, cacheWrite: 0, range: [32_000, 128_000] },
-      { input: 1.4, output: 7.0, cacheRead: 0, cacheWrite: 0, range: [128_000, 256_000] },
+      { input: 1.4, output: 7, cacheRead: 0, cacheWrite: 0, range: [128_000, 256_000] },
     ];
     const cost = { input: 0.46, output: 2.3, cacheRead: 0, cacheWrite: 0, tieredPricing: tiers };
 
@@ -768,9 +781,9 @@ describe("usage-format", () => {
   it("bills overflow at last tier when only a single small-range tier exists (e.g. <30K)", () => {
     // Only one tier covering [0, 30000), input is 100000
     const tiers: PricingTier[] = [
-      { input: 1.0, output: 3.0, cacheRead: 0.5, cacheWrite: 0, range: [0, 30_000] },
+      { input: 1, output: 3, cacheRead: 0.5, cacheWrite: 0, range: [0, 30_000] },
     ];
-    const cost = { input: 1.0, output: 3.0, cacheRead: 0.5, cacheWrite: 0, tieredPricing: tiers };
+    const cost = { input: 1, output: 3, cacheRead: 0.5, cacheWrite: 0, tieredPricing: tiers };
 
     // 100000 input exceeds the only range, so Tier 1 is the whole-request fallback.
     // Total = 0.1 + 0.015 + 0.001 = 0.116
@@ -892,7 +905,7 @@ describe("usage-format", () => {
     });
     const tiers1 = requireTieredPricing(requireCostConfig(cost1, "open-ended"), "open-ended");
     expect(tiers1).toHaveLength(2);
-    expect(tiers1[1].range).toEqual([32000, Infinity]);
+    expect(expectDefined(tiers1[1], "tiers1[1] test invariant").range).toEqual([32000, Infinity]);
 
     // [32000, -1] should also be normalized to [32000, Infinity]
     const cost2 = resolveModelCostConfig({
@@ -901,7 +914,7 @@ describe("usage-format", () => {
     });
     const tiers2 = requireTieredPricing(requireCostConfig(cost2, "negative-end"), "negative-end");
     expect(tiers2).toHaveLength(2);
-    expect(tiers2[1].range).toEqual([32000, Infinity]);
+    expect(expectDefined(tiers2[1], "tiers2[1] test invariant").range).toEqual([32000, Infinity]);
   });
 
   it("resolves tiered pricing from models.json", async () => {
@@ -948,12 +961,12 @@ describe("usage-format", () => {
     const tiers = requireTieredPricing(requireCostConfig(cost, "models.json"), "models.json");
 
     expect(tiers).toHaveLength(2);
-    expect(tiers[0].range).toEqual([0, 32000]);
-    expect(tiers[1].input).toBe(0.7);
+    expect(expectDefined(tiers[0], "tiers[0] test invariant").range).toEqual([0, 32000]);
+    expect(expectDefined(tiers[1], "tiers[1] test invariant").input).toBe(0.7);
   });
 
   it("resolves tiered pricing from cached gateway (LiteLLM)", () => {
-    setGatewayModelPricingForTest([
+    setGatewayModelPricing([
       {
         provider: "volcengine",
         model: "doubao-seed",

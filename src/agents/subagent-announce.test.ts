@@ -1,9 +1,11 @@
+// Subagent announce flow tests cover the seam-level orchestration between wait
+// outcomes, requester lookup, delivery, and cleanup.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { EmbeddedPiQueueMessageOutcome } from "./pi-embedded-runner/runs.js";
+import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/runs.js";
 import { createSubagentAnnounceDeliveryRuntimeMock } from "./subagent-announce.test-support.js";
 
 type AgentCallRequest = { method?: string; params?: Record<string, unknown> };
-type AgentCallResponse = { runId?: string; status: string; error?: string };
+type AgentCallResponse = { runId?: string; status: string; error?: string; terminal?: boolean };
 
 const agentSpy = vi.fn(
   async (_req: AgentCallRequest): Promise<AgentCallResponse> => ({
@@ -19,17 +21,18 @@ const resolveAgentIdFromSessionKeyMock = vi.fn((sessionKey: string) => {
 });
 const resolveStorePathMock = vi.fn((_store: unknown, _options: unknown) => "/tmp/sessions.json");
 const resolveMainSessionKeyMock = vi.fn((_cfg: unknown) => "agent:main:main");
-const readLatestAssistantReplyMock = vi.fn(async (_params?: unknown) => "raw subagent reply");
-const isEmbeddedPiRunActiveMock = vi.fn((_sessionId: string) => false);
-const queueEmbeddedPiMessageWithOutcomeMock = vi.fn(
-  (sessionId: string, _text: string, _options?: unknown): EmbeddedPiQueueMessageOutcome => ({
+const isEmbeddedAgentRunActiveMock = vi.fn((_sessionId: string) => false);
+const queueEmbeddedAgentMessageWithOutcomeMock = vi.fn(
+  (sessionId: string, _text: string, _options?: unknown): EmbeddedAgentQueueMessageOutcome => ({
     queued: false,
     sessionId,
     reason: "not_streaming" as const,
     gatewayHealth: "live" as const,
   }),
 );
-const waitForEmbeddedPiRunEndMock = vi.fn(async (_sessionId: string, _timeoutMs?: number) => true);
+const waitForEmbeddedAgentRunEndMock = vi.fn(
+  async (_sessionId: string, _timeoutMs?: number) => true,
+);
 let mockConfig: ReturnType<(typeof import("../config/config.js"))["getRuntimeConfig"]> = {
   session: {
     mainKey: "main",
@@ -57,7 +60,7 @@ vi.mock("./subagent-announce.runtime.js", () => ({
     params: Record<string, unknown>,
     options?: { timeoutMs?: number },
   ) => callGatewayMock({ method, params, timeoutMs: options?.timeoutMs }),
-  isEmbeddedPiRunActive: (sessionId: string) => isEmbeddedPiRunActiveMock(sessionId),
+  isEmbeddedAgentRunActive: (sessionId: string) => isEmbeddedAgentRunActiveMock(sessionId),
   getRuntimeConfig: () => mockConfig,
   loadSessionStore: (storePath: string) => loadSessionStoreMock(storePath),
   readSessionMessagesAsync: vi.fn(async () => []),
@@ -67,12 +70,8 @@ vi.mock("./subagent-announce.runtime.js", () => ({
     resolveAgentIdFromSessionKeyMock(sessionKey),
   resolveMainSessionKey: (cfg: unknown) => resolveMainSessionKeyMock(cfg),
   resolveStorePath: (store: unknown, options: unknown) => resolveStorePathMock(store, options),
-  waitForEmbeddedPiRunEnd: (sessionId: string, timeoutMs?: number) =>
-    waitForEmbeddedPiRunEndMock(sessionId, timeoutMs),
-}));
-
-vi.mock("./tools/agent-step.js", () => ({
-  readLatestAssistantReply: (params?: unknown) => readLatestAssistantReplyMock(params),
+  waitForEmbeddedAgentRunEnd: (sessionId: string, timeoutMs?: number) =>
+    waitForEmbeddedAgentRunEndMock(sessionId, timeoutMs),
 }));
 
 vi.mock("./subagent-announce-delivery.runtime.js", () =>
@@ -84,9 +83,9 @@ vi.mock("./subagent-announce-delivery.runtime.js", () =>
       resolveAgentIdFromSessionKeyMock(sessionKey),
     resolveMainSessionKey: (cfg: unknown) => resolveMainSessionKeyMock(cfg),
     resolveStorePath: (store: unknown, options: unknown) => resolveStorePathMock(store, options),
-    isEmbeddedPiRunActive: (sessionId: string) => isEmbeddedPiRunActiveMock(sessionId),
-    queueEmbeddedPiMessageWithOutcome: (sessionId: string, text: string, options?: unknown) =>
-      queueEmbeddedPiMessageWithOutcomeMock(sessionId, text, options),
+    isEmbeddedAgentRunActive: (sessionId: string) => isEmbeddedAgentRunActiveMock(sessionId),
+    queueEmbeddedAgentMessageWithOutcome: (sessionId: string, text: string, options?: unknown) =>
+      queueEmbeddedAgentMessageWithOutcomeMock(sessionId, text, options),
   }),
 );
 
@@ -106,6 +105,8 @@ vi.mock("./subagent-announce-delivery.js", () => ({
     requesterSessionOrigin?: { provider?: string; channel?: string };
     bestEffortDeliver?: boolean;
   }) => {
+    // The delivery mock preserves the key branch: active Discord requester
+    // sessions are steered in-process, while inactive/direct paths call agent.
     const store = loadSessionStoreMock("/tmp/sessions.json") as Record<string, unknown>;
     const requesterEntry = (store?.[params.targetRequesterSessionKey] ?? {}) as
       | { sessionId?: string; origin?: { provider?: string; channel?: string } }
@@ -117,8 +118,8 @@ vi.mock("./subagent-announce-delivery.js", () => ({
       params.requesterSessionOrigin?.provider ??
       params.requesterSessionOrigin?.channel;
 
-    if (sessionId && queueChannel === "discord" && isEmbeddedPiRunActiveMock(sessionId)) {
-      queueEmbeddedPiMessageWithOutcomeMock(
+    if (sessionId && queueChannel === "discord" && isEmbeddedAgentRunActiveMock(sessionId)) {
+      queueEmbeddedAgentMessageWithOutcomeMock(
         sessionId,
         `[Internal task completion event]\n${params.triggerMessage}`,
         { steeringMode: "all" },
@@ -148,10 +149,15 @@ vi.mock("./subagent-announce-delivery.js", () => ({
               threadId: effectiveOrigin?.threadId,
             }),
       },
-    })) as { status?: string; error?: string };
+    })) as { status?: string; error?: string; terminal?: boolean };
 
     if (response.status === "error") {
-      return { delivered: false, path: "direct", error: response.error ?? "agent delivery failed" };
+      return {
+        delivered: false,
+        path: "direct",
+        error: response.error ?? "agent delivery failed",
+        ...(response.terminal === true ? { terminal: true } : {}),
+      };
     }
 
     return { delivered: true, path: "direct" };
@@ -198,7 +204,7 @@ import { applySubagentWaitOutcome } from "./subagent-announce-output.js";
 import { runSubagentAnnounceFlow } from "./subagent-announce.js";
 
 function requireQueuedMessageCall() {
-  const call = queueEmbeddedPiMessageWithOutcomeMock.mock.calls[0];
+  const call = queueEmbeddedAgentMessageWithOutcomeMock.mock.calls[0];
   if (!call) {
     throw new Error("expected queued message call");
   }
@@ -266,15 +272,16 @@ describe("subagent announce seam flow", () => {
     resolveAgentIdFromSessionKeyMock.mockReset().mockImplementation(() => "main");
     resolveStorePathMock.mockReset().mockImplementation(() => "/tmp/sessions.json");
     resolveMainSessionKeyMock.mockReset().mockImplementation(() => "agent:main:main");
-    readLatestAssistantReplyMock.mockReset().mockResolvedValue("raw subagent reply");
-    isEmbeddedPiRunActiveMock.mockReset().mockReturnValue(false);
-    queueEmbeddedPiMessageWithOutcomeMock.mockReset().mockImplementation((sessionId: string) => ({
-      queued: false,
-      sessionId,
-      reason: "not_streaming",
-      gatewayHealth: "live",
-    }));
-    waitForEmbeddedPiRunEndMock.mockReset().mockResolvedValue(true);
+    isEmbeddedAgentRunActiveMock.mockReset().mockReturnValue(false);
+    queueEmbeddedAgentMessageWithOutcomeMock
+      .mockReset()
+      .mockImplementation((sessionId: string) => ({
+        queued: false,
+        sessionId,
+        reason: "not_streaming",
+        gatewayHealth: "live",
+      }));
+    waitForEmbeddedAgentRunEndMock.mockReset().mockResolvedValue(true);
     mockConfig = {
       session: {
         mainKey: "main",
@@ -329,6 +336,75 @@ describe("subagent announce seam flow", () => {
     });
   });
 
+  it("skips delete cleanup when the lifecycle owner invalidates the attempt", async () => {
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-invalidated-delete",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "do thing",
+      timeoutMs: 10,
+      cleanup: "delete",
+      waitForCompletion: false,
+      outcome: { status: "ok" },
+      roundOneReply: "ANNOUNCE_SKIP",
+      onBeforeDeleteChildSession: () => false,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(sessionsDeleteSpy).not.toHaveBeenCalled();
+  });
+
+  it("warns when ANNOUNCE_SKIP suppresses a cron job completion", async () => {
+    const logSpy = vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:cron-worker",
+      childRunId: "run-cron-announce-skip",
+      requesterSessionKey: "agent:main:cron:daily-report",
+      requesterDisplayKey: "cron:daily-report",
+      task: "cron job",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "ANNOUNCE_SKIP",
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("cron job completion for session=agent:main:cron:daily-report"),
+    );
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("suppressed by ANNOUNCE_SKIP"));
+    logSpy.mockRestore();
+  });
+
+  it("does not warn when fallback reply is delivered for a cron ANNOUNCE_SKIP", async () => {
+    const logSpy = vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:cron-worker",
+      childRunId: "run-cron-announce-skip-fallback",
+      requesterSessionKey: "agent:main:cron:daily-report",
+      requesterDisplayKey: "cron:daily-report",
+      task: "cron job",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "ANNOUNCE_SKIP",
+      fallbackReply: "an actual fallback result",
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(logSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
   it("keeps lifecycle hooks enabled when deleting a completed session-mode child session", async () => {
     const didAnnounce = await runSubagentAnnounceFlow({
       childSessionKey: "agent:main:subagent:test",
@@ -381,8 +457,8 @@ describe("subagent announce seam flow", () => {
         origin: { provider: "discord" },
       },
     }));
-    isEmbeddedPiRunActiveMock.mockReturnValue(true);
-    queueEmbeddedPiMessageWithOutcomeMock.mockImplementation((sessionId: string) => ({
+    isEmbeddedAgentRunActiveMock.mockReturnValue(true);
+    queueEmbeddedAgentMessageWithOutcomeMock.mockImplementation((sessionId: string) => ({
       queued: true,
       sessionId,
       target: "embedded_run",
@@ -546,5 +622,52 @@ describe("subagent announce seam flow", () => {
       "[warn] Subagent completion direct announce failed for run run-direct-failure-log: Outbound not configured for slack",
     );
     logSpy.mockRestore();
+  });
+
+  it("treats terminal direct completion failures as announced for cleanup", async () => {
+    let deliveryResult:
+      | {
+          delivered: boolean;
+          path: string;
+          error?: string;
+          terminal?: boolean;
+        }
+      | undefined;
+    agentSpy.mockResolvedValueOnce({
+      status: "error",
+      error: "prompt lock failed after visible send",
+      terminal: true,
+    });
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:slack",
+      childRunId: "run-terminal-direct-failure",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      requesterOrigin: {
+        channel: "slack",
+        to: "C123",
+      },
+      task: "deliver completion",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "done",
+      expectsCompletionMessage: true,
+      onDeliveryResult: (delivery) => {
+        deliveryResult = delivery;
+      },
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(deliveryResult).toMatchObject({
+      delivered: false,
+      path: "direct",
+      error: "prompt lock failed after visible send",
+      terminal: true,
+    });
   });
 });

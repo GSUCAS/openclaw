@@ -1,3 +1,6 @@
+// Telegram plugin module implements account throttler behavior.
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
+import { parseStrictInteger } from "openclaw/plugin-sdk/number-runtime";
 import { apiThrottler } from "./bot.runtime.js";
 
 type ApiThrottlerTransformer = ReturnType<typeof apiThrottler>;
@@ -67,9 +70,12 @@ class GroupFairQueue {
   }
 
   private takeNext(): QueuedApiRequest<unknown> | undefined {
-    for (let scanned = 0; scanned < this.laneOrder.length; scanned += 1) {
+    for (let remaining = this.laneOrder.length; remaining > 0; remaining -= 1) {
       this.nextLaneIndex %= this.laneOrder.length;
-      const laneKey = this.laneOrder[this.nextLaneIndex];
+      const laneKey = expectDefined(
+        this.laneOrder[this.nextLaneIndex],
+        "non-empty Telegram throttle lane order",
+      );
       const queue = this.lanes.get(laneKey);
       if (!queue || queue.length === 0) {
         this.lanes.delete(laneKey);
@@ -92,14 +98,7 @@ class GroupFairQueue {
 const throttlerByToken = new Map<string, ApiThrottlerTransformer>();
 
 function readNumericId(value: unknown): number | undefined {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? Math.trunc(value) : undefined;
-  }
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const numeric = Number(value.trim());
-  return Number.isFinite(numeric) ? Math.trunc(numeric) : undefined;
+  return parseStrictInteger(value);
 }
 
 function readPayload(payload: unknown): TelegramApiPayload | undefined {

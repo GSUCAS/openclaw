@@ -1,3 +1,4 @@
+// Tlon helper module supports config schema behavior.
 import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import { z } from "zod";
 
@@ -9,7 +10,7 @@ const TlonChannelRuleSchema = z.object({
   allowedShips: z.array(ShipSchema).optional(),
 });
 
-export const TlonAuthorizationSchema = z.object({
+const TlonAuthorizationSchema = z.object({
   channelRules: z.record(z.string(), TlonChannelRuleSchema).optional(),
 });
 
@@ -44,7 +45,7 @@ const TlonAccountSchema = z.object({
   ...tlonCommonConfigFields,
 });
 
-export const TlonConfigSchema = z.object({
+const TlonConfigSchema = z.object({
   ...tlonCommonConfigFields,
   authorization: TlonAuthorizationSchema.optional(),
   defaultAuthorizedShips: z.array(ShipSchema).optional(),

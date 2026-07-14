@@ -1,3 +1,4 @@
+// Media parse tests cover media reference parsing from text and payloads.
 import { describe, expect, it } from "vitest";
 import { splitMediaFromOutput, type SplitMediaFromOutputOptions } from "./parse.js";
 
@@ -20,10 +21,8 @@ describe("splitMediaFromOutput", () => {
     }
     if ("mediaUrls" in expected) {
       expect(result.mediaUrls).toEqual(expected.mediaUrls);
-      expect(result.mediaUrl).toBe(expected.mediaUrls?.[0]);
     } else {
       expect(result.mediaUrls).toBeUndefined();
-      expect(result.mediaUrl).toBeUndefined();
     }
   }
 
@@ -65,6 +64,10 @@ describe("splitMediaFromOutput", () => {
       String.raw`MEDIA:/path/to/image.png\"}],\"details\":{\"provider\":\"openai\"}`,
     ],
     ["/tmp/render,final.png", "MEDIA:/tmp/render,final.png"],
+    ["/tmp/generated.png", "MEDIA:FILE:///tmp/generated.png"],
+    ["/tmp/generated.png", "MEDIA:file:///tmp/generated.png"],
+    ["/Users/pete/My File.png", "MEDIA:FILE:///Users/pete/My File.png"],
+    ["/Users/pete/My File.png", "MEDIA:file:///Users/pete/My File.png"],
   ] as const)("accepts supported media path variant: %s", (expectedPath, input) => {
     expectAcceptedMediaPathCase(expectedPath, input);
   });

@@ -1,5 +1,2 @@
-export {
-  createReplyDispatcherWithTyping,
-  dispatchInboundMessage,
-  settleReplyDispatcher,
-} from "openclaw/plugin-sdk/reply-runtime";
+// Slack plugin module implements reply behavior.
+export { dispatchReplyWithBufferedBlockDispatcher } from "openclaw/plugin-sdk/reply-runtime";

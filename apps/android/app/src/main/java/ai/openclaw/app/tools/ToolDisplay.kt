@@ -1,5 +1,6 @@
 package ai.openclaw.app.tools
 
+import ai.openclaw.app.i18n.nativeString
 import android.content.Context
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -31,6 +32,7 @@ private data class ToolDisplayConfig(
   val tools: Map<String, ToolDisplaySpec>? = null,
 )
 
+/** Compact UI summary for a running or pending tool call. */
 data class ToolDisplaySummary(
   val name: String,
   val emoji: String,
@@ -39,6 +41,7 @@ data class ToolDisplaySummary(
   val verb: String?,
   val detail: String?,
 ) {
+  /** Optional second-line detail assembled from the action verb and best argument preview. */
   val detailLine: String?
     get() {
       val parts = mutableListOf<String>()
@@ -46,11 +49,9 @@ data class ToolDisplaySummary(
       if (!detail.isNullOrBlank()) parts.add(detail)
       return if (parts.isEmpty()) null else parts.joinToString(" · ")
     }
-
-  val summaryLine: String
-    get() = if (detailLine != null) "$emoji $label: $detailLine" else "$emoji $label"
 }
 
+/** Resolves tool-call names and args into user-facing Android display text. */
 object ToolDisplayRegistry {
   private const val CONFIG_ASSET = "tool-display.json"
 
@@ -58,6 +59,7 @@ object ToolDisplayRegistry {
 
   @Volatile private var cachedConfig: ToolDisplayConfig? = null
 
+  /** Resolves a raw tool call into stable, bounded UI text for pending-tool surfaces. */
   fun resolve(
     context: Context,
     name: String?,
@@ -71,13 +73,13 @@ object ToolDisplayRegistry {
     val fallback = config.fallback
 
     val emoji = spec?.emoji ?: fallback?.emoji ?: "🧩"
-    val title = spec?.title ?: titleFromName(trimmedName)
-    val label = spec?.label ?: trimmedName
+    val title = spec?.title?.let(::nativeString) ?: titleFromName(trimmedName)
+    val label = spec?.label?.let(::nativeString) ?: trimmedName
 
     val actionRaw = args?.get("action")?.asStringOrNull()?.trim()
     val action = actionRaw?.takeIf { it.isNotEmpty() }
     val actionSpec = action?.let { spec?.actions?.get(it) }
-    val verb = normalizeVerb(actionSpec?.label ?: action)
+    val verb = normalizeVerb(actionSpec?.label?.let(::nativeString) ?: action)
 
     var detail: String? = null
     if (key == "read") {
@@ -86,6 +88,8 @@ object ToolDisplayRegistry {
       detail = pathDetail(args)
     }
 
+    // Action-specific detail keys win over tool defaults so commands like
+    // read/write can surface the most useful argument for that action.
     val detailKeys = actionSpec?.detailKeys ?: spec?.detailKeys ?: fallback?.detailKeys ?: emptyList()
     if (detail == null) {
       detail = firstValue(args, detailKeys)
@@ -122,6 +126,8 @@ object ToolDisplayRegistry {
       cachedConfig = decoded
       decoded
     } catch (_: Throwable) {
+      // The chat UI should still render pending tools if the asset is absent or
+      // malformed in debug builds.
       val fallback = ToolDisplayConfig()
       cachedConfig = fallback
       fallback

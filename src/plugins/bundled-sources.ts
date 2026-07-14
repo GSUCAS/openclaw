@@ -1,5 +1,6 @@
-import { isRecord } from "../shared/record-coerce.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+// Resolves bundled plugin source metadata from package manifests.
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { discoverOpenClawPlugins, type PluginDiscoveryResult } from "./discovery.js";
 import { loadPluginManifest } from "./manifest.js";
 
@@ -12,9 +13,7 @@ export type BundledPluginSource = {
   requiresConfig?: boolean;
 };
 
-export type BundledPluginLookup =
-  | { kind: "npmSpec"; value: string }
-  | { kind: "pluginId"; value: string };
+type BundledPluginLookup = { kind: "npmSpec"; value: string } | { kind: "pluginId"; value: string };
 
 export function findBundledPluginSourceInMap(params: {
   bundled: ReadonlyMap<string, BundledPluginSource>;

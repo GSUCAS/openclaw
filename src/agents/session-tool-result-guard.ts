@@ -1,5 +1,11 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { SessionManager } from "@earendil-works/pi-coding-agent";
+/**
+ * Session transcript guard for tool-call/result consistency.
+ *
+ * Caps large tool results, repairs missing results, applies redaction, and emits transcript update events.
+ */
+import { resolveIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import {
   boundedJsonUtf8Bytes,
   firstEnumerableOwnKeys,
@@ -16,18 +22,20 @@ import type {
   PluginHookBeforeMessageWriteResult,
 } from "../plugins/types.js";
 import { emitSessionTranscriptUpdate } from "../sessions/transcript-events.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
-import { formatContextLimitTruncationNotice } from "./pi-embedded-runner/context-truncation-notice.js";
+import { isTranscriptOnlyOpenClawAssistantModel } from "../shared/transcript-only-openclaw-assistant.js";
+import { formatContextLimitTruncationNotice } from "./embedded-agent-runner/context-truncation-notice.js";
 import {
   DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS,
   truncateToolResultMessage,
-} from "./pi-embedded-runner/tool-result-truncation.js";
+} from "./embedded-agent-runner/tool-result-truncation.js";
+import type { AgentMessage } from "./runtime/index.js";
 import {
   getRawSessionAppendMessage,
   setRawSessionAppendMessage,
 } from "./session-raw-append-message.js";
 import { createPendingToolCallState } from "./session-tool-result-state.js";
 import { makeMissingToolResult, sanitizeToolCallInputs } from "./session-transcript-repair.js";
+import type { SessionManager } from "./sessions/index.js";
 import { extractToolCallsFromAssistant, extractToolResultId } from "./tool-call-id.js";
 
 /**
@@ -46,13 +54,44 @@ function capToolResultSize(msg: AgentMessage, maxChars: number): AgentMessage {
 }
 
 function resolveMaxToolResultChars(opts?: { maxToolResultChars?: number }): number {
-  return Math.max(1, opts?.maxToolResultChars ?? DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS);
+  return resolveIntegerOption(opts?.maxToolResultChars, DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS, {
+    min: 1,
+  });
 }
 
 type UserAgentMessage = Extract<AgentMessage, { role: "user" }>;
+type AssistantAgentMessage = Extract<AgentMessage, { role: "assistant" }>;
+type AsyncMessageCallback<T extends AgentMessage> = (message: T) => void | Promise<void>;
+type CompactionAppendValidator = (entryId: string, appendedText: string) => boolean;
+type AppendMessageOptions = Parameters<SessionManager["appendMessage"]>[1];
 
 function isUserAgentMessage(message: AgentMessage): message is UserAgentMessage {
   return message.role === "user";
+}
+
+function isExpectedCompactionAppend(entryId: string, appendedText: string): boolean {
+  const lines = appendedText
+    .trimEnd()
+    .split("\n")
+    .filter((line) => line.length > 0);
+  if (lines.length !== 1) {
+    return false;
+  }
+  try {
+    const line = lines.at(0);
+    if (!line) {
+      return false;
+    }
+    const entry: unknown = JSON.parse(line);
+    return (
+      typeof entry === "object" &&
+      entry !== null &&
+      Reflect.get(entry, "type") === "compaction" &&
+      Reflect.get(entry, "id") === entryId
+    );
+  } catch {
+    return false;
+  }
 }
 
 type TranscriptSeqByEntryId = Map<string, number>;
@@ -133,7 +172,8 @@ function redactPersistedDetailString(
     return redactToolPayloadTextWithConfig(value, redactionConfig);
   }
 
-  const scan = `${value.slice(0, maxChars)}${PERSISTED_DETAIL_REDACTION_BOUNDARY}${value.slice(
+  const scan = `${sliceUtf16Safe(value, 0, maxChars)}${PERSISTED_DETAIL_REDACTION_BOUNDARY}${sliceUtf16Safe(
+    value,
     maxChars,
     maxChars + MAX_PERSISTED_DETAIL_REDACTION_LOOKAHEAD_CHARS,
   )}`;
@@ -147,7 +187,7 @@ function redactPersistedDetailString(
     0,
     maxChars - Math.min(maxChars, MAX_PERSISTED_DETAIL_BOUNDARY_OVERLAP_CHARS),
   );
-  const initialPersistedPrefix = redactedPrefix.slice(0, safePrefixChars);
+  const initialPersistedPrefix = truncateUtf16Safe(redactedPrefix, safePrefixChars);
   const persistedPrefix =
     PARTIAL_STRUCTURED_SECRET_VALUE_RE.test(initialPersistedPrefix) ||
     PARTIAL_PRIVATE_KEY_BLOCK_RE.test(initialPersistedPrefix)
@@ -280,6 +320,24 @@ function sanitizePersistedSessionDetail(
   return out;
 }
 
+function copyPersistedResultStateFields(
+  out: Record<string, unknown>,
+  src: Record<string, unknown>,
+  maxStringChars: number,
+  redactionConfig?: ToolResultDetailRedactionConfig,
+): void {
+  for (const key of ["disabled", "unavailable", "success"] as const) {
+    if (typeof src[key] === "boolean") {
+      out[key] = src[key];
+    }
+  }
+  if (typeof src.error === "string" && src.error) {
+    out.error = redactPersistedDetailString(src.error, maxStringChars, redactionConfig);
+  } else if (src.error) {
+    out.error = true;
+  }
+}
+
 function buildPersistedDetailsFallback(
   src: Record<string, unknown> | undefined,
   originalSize: BoundedJsonUtf8Bytes,
@@ -299,7 +357,17 @@ function buildPersistedDetailsFallback(
   }
   if (src) {
     fallback.originalDetailKeys = redactedOriginalDetailKeys(src, redactionConfig);
-    for (const key of ["status", "sessionId", "pid", "exitCode", "exitSignal", "truncated"]) {
+    for (const key of [
+      "status",
+      "sessionId",
+      "pid",
+      "exitCode",
+      "exitSignal",
+      "truncated",
+      "fullOutputPath",
+      "spilledChars",
+      "spillTruncated",
+    ]) {
       const field = src[key];
       if (field !== undefined) {
         fallback[key] = redactPersistedSummaryField(
@@ -310,6 +378,12 @@ function buildPersistedDetailsFallback(
         );
       }
     }
+    copyPersistedResultStateFields(
+      fallback,
+      src,
+      MAX_PERSISTED_DETAIL_FALLBACK_STRING_CHARS,
+      redactionConfig,
+    );
   }
   return fallback;
 }
@@ -419,6 +493,8 @@ function sanitizeToolResultDetailsForPersistence(
     "totalChars",
     "truncated",
     "fullOutputPath",
+    "spilledChars",
+    "spillTruncated",
     "truncation",
   ]) {
     const field = src[key];
@@ -431,6 +507,7 @@ function sanitizeToolResultDetailsForPersistence(
       );
     }
   }
+  copyPersistedResultStateFields(out, src, MAX_PERSISTED_DETAIL_STRING_CHARS, redactionConfig);
   if (typeof src.tail === "string") {
     out.tail = redactPersistedDetailString(
       src.tail,
@@ -508,16 +585,16 @@ function isTranscriptOnlyOpenClawAssistantMessage(message: AgentMessage): boolea
   }
   const provider = normalizeOptionalString((message as { provider?: unknown }).provider) ?? "";
   const model = normalizeOptionalString((message as { model?: unknown }).model) ?? "";
-  return provider === "openclaw" && (model === "delivery-mirror" || model === "gateway-injected");
+  return isTranscriptOnlyOpenClawAssistantModel(provider, model);
 }
-
-export { getRawSessionAppendMessage };
 
 export function installSessionToolResultGuard(
   sessionManager: SessionManager,
   opts?: {
     /** Optional session key for transcript update broadcasts. */
     sessionKey?: string;
+    /** Optional agent id for selected-global transcript update broadcasts. */
+    agentId?: string;
     /**
      * Optional transform applied to any message before persistence.
      */
@@ -554,17 +631,20 @@ export function installSessionToolResultGuard(
     suppressNextUserMessagePersistence?: boolean;
     suppressTranscriptOnlyAssistantPersistence?: boolean;
     suppressAssistantErrorPersistence?: boolean;
-    onUserMessagePersisted?: (
-      message: Extract<AgentMessage, { role: "user" }>,
-    ) => void | Promise<void>;
+    onUserMessagePersisted?: AsyncMessageCallback<UserAgentMessage>;
+    onUserMessagePersistenceSuppressed?: AsyncMessageCallback<UserAgentMessage>;
+    onUserMessageBlocked?: (message: UserAgentMessage) => void;
     onMessagePersisted?: (message: AgentMessage) => void | Promise<void>;
-    onAssistantErrorMessagePersisted?: (
-      message: Extract<AgentMessage, { role: "assistant" }>,
-    ) => void | Promise<void>;
+    withCompactionPersistence?: (
+      append: () => string,
+      validateAppend: CompactionAppendValidator,
+    ) => string;
+    onAssistantErrorMessagePersisted?: AsyncMessageCallback<AssistantAgentMessage>;
   },
 ): {
   flushPendingToolResults: () => void;
   clearPendingToolResults: () => void;
+  clearNextUserMessagePersistenceSuppression: () => void;
   getPendingIds: () => string[];
 } {
   const originalAppend = getRawSessionAppendMessage(sessionManager);
@@ -586,6 +666,7 @@ export function installSessionToolResultGuard(
   const allowSyntheticToolResults = opts?.allowSyntheticToolResults ?? true;
   const missingToolResultText = opts?.missingToolResultText;
   const beforeWrite = opts?.beforeMessageWriteHook;
+  const toolResultTransformerMayMutate = opts?.transformToolResultForPersistence !== undefined;
   const redactionConfig = opts?.redactLoggingConfig;
   const maxToolResultChars = resolveMaxToolResultChars(opts);
   const transcriptSeqByEntryId: TranscriptSeqByEntryId = new Map();
@@ -596,9 +677,10 @@ export function installSessionToolResultGuard(
 
   const appendMessageAndCacheTranscriptSeq = (
     message: AgentMessage,
+    options?: AppendMessageOptions,
   ): { entryId: string; messageSeq?: number; sessionFile?: string | null } => {
     const parentEntryId = sessionManager.getLeafId();
-    const entryId = originalAppend(message as never);
+    const entryId = originalAppend(message as never, options);
     void opts?.onMessagePersisted?.(message);
     const sessionFile = getSessionFile();
     if (!sessionFile) {
@@ -615,23 +697,34 @@ export function installSessionToolResultGuard(
       }),
     };
   };
+  const originalAppendCompaction = sessionManager.appendCompaction.bind(sessionManager);
+  const guardedAppendCompaction = ((
+    ...args: Parameters<SessionManager["appendCompaction"]>
+  ): string => {
+    const append = () => originalAppendCompaction(...args);
+    return opts?.withCompactionPersistence
+      ? opts.withCompactionPersistence(append, isExpectedCompactionAppend)
+      : append();
+  }) as SessionManager["appendCompaction"];
 
   /**
    * Run the before_message_write hook. Returns the (possibly modified) message,
    * or null if the message should be blocked.
    */
-  const applyBeforeWriteHook = (msg: AgentMessage): AgentMessage | null => {
+  const applyBeforeWriteHook = (
+    msg: AgentMessage,
+  ): { message: AgentMessage; changed: boolean } | null => {
     if (!beforeWrite) {
-      return msg;
+      return { message: msg, changed: false };
     }
     const result = beforeWrite({ message: msg });
     if (result?.block) {
       return null;
     }
     if (result?.message) {
-      return result.message;
+      return { message: result.message, changed: true };
     }
-    return msg;
+    return { message: msg, changed: false };
   };
 
   const flushPendingToolResults = () => {
@@ -645,16 +738,22 @@ export function installSessionToolResultGuard(
           toolName: name,
           text: missingToolResultText,
         });
-        const flushed = applyBeforeWriteHook(
-          persistToolResult(persistMessage(synthetic), {
-            toolCallId: id,
-            toolName: name,
-            isSynthetic: true,
-          }),
-        );
+        const persistedSynthetic = persistMessage(synthetic);
+        const transformed = persistToolResult(persistedSynthetic, {
+          toolCallId: id,
+          toolName: name,
+          isSynthetic: true,
+        });
+        const flushed = applyBeforeWriteHook(transformed);
         if (flushed) {
           appendMessageAndCacheTranscriptSeq(
-            capToolResultForPersistence(flushed, maxToolResultChars, redactionConfig),
+            capToolResultForPersistence(flushed.message, maxToolResultChars, redactionConfig),
+            {
+              invalidateSerializedPrefixCache:
+                persistedSynthetic !== synthetic ||
+                toolResultTransformerMayMutate ||
+                flushed.changed,
+            },
           );
         }
       }
@@ -666,7 +765,8 @@ export function installSessionToolResultGuard(
     pendingState.clear();
   };
 
-  const guardedAppend = (message: AgentMessage) => {
+  const guardedAppend = (message: AgentMessage, callerOptions?: AppendMessageOptions) => {
+    const callerInvalidatesCache = callerOptions?.invalidateSerializedPrefixCache === true;
     let nextMessage = message;
     const role = (message as { role?: unknown }).role;
     if (role === "assistant") {
@@ -679,7 +779,11 @@ export function installSessionToolResultGuard(
         }
         return undefined;
       }
-      nextMessage = sanitized[0];
+      const sanitizedMessage = sanitized.at(0);
+      if (!sanitizedMessage) {
+        return undefined;
+      }
+      nextMessage = sanitizedMessage;
     }
     const nextRole = (nextMessage as { role?: unknown }).role;
 
@@ -692,23 +796,30 @@ export function installSessionToolResultGuard(
       const normalizedToolResult = normalizePersistedToolResultName(nextMessage, toolName);
       // Apply hard size cap before persistence to prevent oversized tool results
       // from consuming the entire context window on subsequent LLM calls.
+      const persistedToolResult = persistMessage(normalizedToolResult);
       const capped = capToolResultForPersistence(
-        persistMessage(normalizedToolResult),
+        persistedToolResult,
         maxToolResultChars,
         redactionConfig,
       );
-      const persisted = applyBeforeWriteHook(
-        persistToolResult(capped, {
-          toolCallId: id ?? undefined,
-          toolName,
-          isSynthetic: false,
-        }),
-      );
+      const transformed = persistToolResult(capped, {
+        toolCallId: id ?? undefined,
+        toolName,
+        isSynthetic: false,
+      });
+      const persisted = applyBeforeWriteHook(transformed);
       if (!persisted) {
         return undefined;
       }
       return appendMessageAndCacheTranscriptSeq(
-        capToolResultForPersistence(persisted, maxToolResultChars, redactionConfig),
+        capToolResultForPersistence(persisted.message, maxToolResultChars, redactionConfig),
+        {
+          invalidateSerializedPrefixCache:
+            callerInvalidatesCache ||
+            persistedToolResult !== normalizedToolResult ||
+            toolResultTransformerMayMutate ||
+            persisted.changed,
+        },
       ).entryId;
     }
 
@@ -740,15 +851,27 @@ export function installSessionToolResultGuard(
     ) {
       flushPendingToolResults();
     }
-    // If new tool calls arrive while older ones are pending, flush the old ones first.
-    if (pendingState.shouldFlushBeforeNewToolCalls(toolCalls.length)) {
+    // If synthetic results are disabled, a new assistant tool-call turn is a safe
+    // boundary to drop older pending ids. When synthetic results are enabled,
+    // do not synthesize here: parallel tool-result appends can still be racing
+    // this assistant append, and transcript repair can move late real results
+    // back into strict provider order before the next replay.
+    if (
+      !allowSyntheticToolResults &&
+      pendingState.shouldFlushBeforeNewToolCalls(toolCalls.length)
+    ) {
       flushPendingToolResults();
     }
 
-    const finalMessage = applyBeforeWriteHook(persistMessage(nextMessage));
-    if (!finalMessage) {
+    const transformedMessage = persistMessage(nextMessage);
+    const finalWrite = applyBeforeWriteHook(transformedMessage);
+    if (!finalWrite) {
+      if (isUserAgentMessage(transformedMessage)) {
+        opts?.onUserMessageBlocked?.(transformedMessage);
+      }
       return undefined;
     }
+    const finalMessage = finalWrite.message;
     const finalRole = (finalMessage as { role?: unknown }).role;
     if (
       finalRole === "assistant" &&
@@ -766,17 +889,22 @@ export function installSessionToolResultGuard(
     }
     if (isUserAgentMessage(finalMessage) && suppressNextUserMessagePersistence) {
       suppressNextUserMessagePersistence = false;
+      void opts?.onUserMessagePersistenceSuppressed?.(finalMessage);
       return undefined;
     }
     const {
       entryId: result,
       messageSeq,
       sessionFile,
-    } = appendMessageAndCacheTranscriptSeq(finalMessage);
+    } = appendMessageAndCacheTranscriptSeq(finalMessage, {
+      invalidateSerializedPrefixCache:
+        callerInvalidatesCache || transformedMessage !== nextMessage || finalWrite.changed,
+    });
     if (sessionFile) {
       emitSessionTranscriptUpdate({
         sessionFile,
         sessionKey: opts?.sessionKey,
+        ...(opts?.agentId ? { agentId: opts.agentId } : {}),
         message: finalMessage,
         messageId: typeof result === "string" ? result : undefined,
         ...(messageSeq !== undefined ? { messageSeq } : {}),
@@ -803,10 +931,14 @@ export function installSessionToolResultGuard(
 
   // Monkey-patch appendMessage with our guarded version.
   sessionManager.appendMessage = guardedAppend as SessionManager["appendMessage"];
+  sessionManager.appendCompaction = guardedAppendCompaction;
 
   return {
     flushPendingToolResults,
     clearPendingToolResults,
+    clearNextUserMessagePersistenceSuppression: () => {
+      suppressNextUserMessagePersistence = false;
+    },
     getPendingIds: pendingState.getPendingIds,
   };
 }

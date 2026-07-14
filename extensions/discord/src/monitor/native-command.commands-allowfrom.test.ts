@@ -1,5 +1,6 @@
+// Discord tests cover native command.commands allowfrom plugin behavior.
 import { ChannelType } from "discord-api-types/v10";
-import type { NativeCommandSpec } from "openclaw/plugin-sdk/command-auth";
+import type { NativeCommandSpec } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import * as pluginCommandsModule from "openclaw/plugin-sdk/plugin-runtime";

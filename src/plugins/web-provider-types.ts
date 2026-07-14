@@ -1,3 +1,4 @@
+// Defines web provider plugin schema and runtime types.
 import type { TSchema } from "typebox";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -45,12 +46,12 @@ export type WebFetchProviderContext = {
 
 export type WebSearchCredentialResolutionSource = "config" | "secretRef" | "env" | "missing";
 
-export type WebSearchProviderConfiguredCredentialFallback = {
+type WebSearchProviderConfiguredCredentialFallback = {
   path: string;
   value: unknown;
 };
 
-export type WebFetchProviderConfiguredCredentialFallback = {
+type WebFetchProviderConfiguredCredentialFallback = {
   path: string;
   value: unknown;
 };

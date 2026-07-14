@@ -1,5 +1,6 @@
 package ai.openclaw.app.ui.chat
 
+import ai.openclaw.app.chat.CHAT_IMAGE_MAX_BASE64_CHARS
 import ai.openclaw.app.node.JpegSizeLimiter
 import android.content.ContentResolver
 import android.graphics.Bitmap
@@ -13,7 +14,6 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val CHAT_ATTACHMENT_MAX_WIDTH = 1600
-internal const val CHAT_IMAGE_MAX_BASE64_CHARS = 300 * 1024
 private const val CHAT_ATTACHMENT_START_QUALITY = 85
 private const val CHAT_DECODE_MAX_DIMENSION = 1600
 private const val CHAT_IMAGE_CACHE_BYTES = 16 * 1024 * 1024
@@ -26,16 +26,19 @@ private val decodedBitmapCache =
     ): Int = value.byteCount.coerceAtLeast(1)
   }
 
+/** Loads a picked image URI into the bounded JPEG attachment shape sent to chat. */
 internal fun loadSizedImageAttachment(
   resolver: ContentResolver,
   uri: Uri,
-): PendingImageAttachment {
+): PendingAttachment {
   val fileName = normalizeAttachmentFileName((uri.lastPathSegment ?: "image").substringAfterLast('/'))
   val bitmap = decodeScaledBitmap(resolver, uri, maxDimension = CHAT_ATTACHMENT_MAX_WIDTH)
   if (bitmap == null) {
     throw IllegalStateException("unsupported attachment")
   }
   val maxBytes = (CHAT_IMAGE_MAX_BASE64_CHARS / 4) * 3
+  // Reuse the node JPEG limiter so chat attachments and node photo payloads
+  // stay within the same gateway frame budget.
   val encoded =
     JpegSizeLimiter.compressToLimit(
       initialWidth = bitmap.width,
@@ -64,7 +67,7 @@ internal fun loadSizedImageAttachment(
       },
     )
   val base64 = Base64.encodeToString(encoded.bytes, Base64.NO_WRAP)
-  return PendingImageAttachment(
+  return PendingAttachment(
     id = uri.toString() + "#" + System.currentTimeMillis().toString(),
     fileName = fileName,
     mimeType = "image/jpeg",
@@ -72,10 +75,12 @@ internal fun loadSizedImageAttachment(
   )
 }
 
+/** Decodes chat image payloads into display-sized bitmaps with an LRU cache. */
 internal fun decodeBase64Bitmap(
   base64: String,
   maxDimension: Int = CHAT_DECODE_MAX_DIMENSION,
 ): Bitmap? {
+  if (base64.length > CHAT_IMAGE_MAX_BASE64_CHARS) return null
   val cacheKey = "$maxDimension:${base64.length}:${base64.hashCode()}"
   decodedBitmapCache.get(cacheKey)?.let { return it }
 
@@ -101,6 +106,7 @@ internal fun decodeBase64Bitmap(
   return bitmap
 }
 
+/** Computes Android's power-of-two bitmap sampling size for bounded decode. */
 internal fun computeInSampleSize(
   width: Int,
   height: Int,
@@ -117,6 +123,7 @@ internal fun computeInSampleSize(
   return sample.coerceAtLeast(1)
 }
 
+/** Normalizes arbitrary picked-image names to the JPEG file name sent upstream. */
 internal fun normalizeAttachmentFileName(raw: String): String {
   val trimmed = raw.trim()
   if (trimmed.isEmpty()) return "image.jpg"

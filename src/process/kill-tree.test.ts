@@ -1,3 +1,5 @@
+// Kill tree tests cover process tree termination and platform-specific fallbacks.
+import { EventEmitter } from "node:events";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { withMockedPlatform } from "../test-utils/vitest-spies.js";
 
@@ -127,6 +129,19 @@ describe("killProcessTree", () => {
     });
   });
 
+  it("on Unix force-kills synchronously without SIGTERM or delayed escalation", async () => {
+    killSpy.mockImplementation(() => true);
+
+    await withMockedPlatform("linux", async () => {
+      killProcessTree(4949, { force: true });
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenCalledWith(-4949, "SIGKILL");
+      expect(killSpy).not.toHaveBeenCalledWith(-4949, "SIGTERM");
+    });
+  });
+
   it("on Unix force-kills a live detached group even after the parent pid exits", async () => {
     killSpy.mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
       if (pid === -4545 && signal === 0) {
@@ -211,6 +226,28 @@ describe("killProcessTree", () => {
       expect(spawnMock).toHaveBeenCalledTimes(2);
       expectTaskkillCall(0, ["/T", "/PID", "8888"]);
       expectTaskkillCall(1, ["/F", "/T", "/PID", "8888"]);
+    });
+  });
+
+  it("on Windows force-kills synchronously without delayed taskkill", async () => {
+    await withMockedPlatform("win32", async () => {
+      killProcessTree(9999, { force: true });
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      expectTaskkillCall(0, ["/F", "/T", "/PID", "9999"]);
+    });
+  });
+
+  it("on Windows ignores async taskkill spawn errors", async () => {
+    const taskkillChild = new EventEmitter();
+    spawnMock.mockReturnValueOnce(taskkillChild);
+
+    await withMockedPlatform("win32", async () => {
+      killProcessTree(9191, { force: true });
+
+      expect(() => taskkillChild.emit("error", new Error("spawn ENOENT"))).not.toThrow();
+      expectTaskkillCall(0, ["/F", "/T", "/PID", "9191"]);
     });
   });
 });

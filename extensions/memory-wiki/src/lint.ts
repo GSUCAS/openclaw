@@ -1,3 +1,4 @@
+// Memory Wiki plugin module implements lint behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -11,13 +12,21 @@ import {
 } from "./claim-health.js";
 import { compileMemoryWikiVault } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
+import { collectBrokenWikiLinks, collectExistingMarkdownPaths } from "./lint-links.js";
 import { appendMemoryWikiLog } from "./log.js";
-import { renderWikiMarkdown, type WikiPageSummary } from "./markdown.js";
+import {
+  isUnmanagedRawSourceSummary,
+  parseWikiMarkdown,
+  renderWikiMarkdown,
+  type WikiPageSummary,
+} from "./markdown.js";
+import { readMemoryWikiSourceSyncState } from "./source-sync-state.js";
 
 type MemoryWikiLintIssue = {
   severity: "error" | "warning";
   category: "structure" | "provenance" | "links" | "contradictions" | "open-questions" | "quality";
   code:
+    | "invalid-frontmatter"
     | "missing-id"
     | "duplicate-id"
     | "missing-page-type"
@@ -50,46 +59,40 @@ function toExpectedPageType(page: WikiPageSummary): string {
   return page.kind;
 }
 
-function collectBrokenLinkIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
-  const validTargets = new Set<string>();
-  for (const page of pages) {
-    const withoutExtension = page.relativePath.replace(/\.md$/i, "");
-    validTargets.add(page.relativePath);
-    validTargets.add(withoutExtension);
-    validTargets.add(path.basename(withoutExtension));
-  }
-
-  const issues: MemoryWikiLintIssue[] = [];
-  for (const page of pages) {
-    for (const linkTarget of page.linkTargets) {
-      if (!validTargets.has(linkTarget)) {
-        issues.push({
-          severity: "warning",
-          category: "links",
-          code: "broken-wikilink",
-          path: page.relativePath,
-          message: `Broken wikilink target \`${linkTarget}\`.`,
-        });
-      }
-    }
-  }
-  return issues;
+function isUnmanagedRawSourcePage(
+  page: WikiPageSummary,
+  managedImportedSourcePagePaths: Set<string>,
+): boolean {
+  return (
+    isUnmanagedRawSourceSummary(page) && !managedImportedSourcePagePaths.has(page.relativePath)
+  );
 }
 
-function collectPageIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
+function collectPageIssues(
+  pages: WikiPageSummary[],
+  managedImportedSourcePagePaths: Set<string>,
+  existingMarkdownPaths: readonly string[],
+): MemoryWikiLintIssue[] {
   const issues: MemoryWikiLintIssue[] = [];
   const pagesById = new Map<string, WikiPageSummary[]>();
   const claimHealth = collectWikiClaimHealth(pages);
 
   for (const page of pages) {
+    const requiresStructuredPageMetadata = !isUnmanagedRawSourcePage(
+      page,
+      managedImportedSourcePagePaths,
+    );
+
     if (!page.id) {
-      issues.push({
-        severity: "error",
-        category: "structure",
-        code: "missing-id",
-        path: page.relativePath,
-        message: "Missing `id` frontmatter.",
-      });
+      if (requiresStructuredPageMetadata) {
+        issues.push({
+          severity: "error",
+          category: "structure",
+          code: "missing-id",
+          path: page.relativePath,
+          message: "Missing `id` frontmatter.",
+        });
+      }
     } else {
       const current = pagesById.get(page.id) ?? [];
       current.push(page);
@@ -97,13 +100,15 @@ function collectPageIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
     }
 
     if (!page.pageType) {
-      issues.push({
-        severity: "error",
-        category: "structure",
-        code: "missing-page-type",
-        path: page.relativePath,
-        message: "Missing `pageType` frontmatter.",
-      });
+      if (requiresStructuredPageMetadata) {
+        issues.push({
+          severity: "error",
+          category: "structure",
+          code: "missing-page-type",
+          path: page.relativePath,
+          message: "Missing `pageType` frontmatter.",
+        });
+      }
     } else if (page.pageType !== toExpectedPageType(page)) {
       issues.push({
         severity: "error",
@@ -193,7 +198,11 @@ function collectPageIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
     }
 
     const freshness = assessPageFreshness(page);
-    if (page.kind !== "report" && (freshness.level === "stale" || freshness.level === "unknown")) {
+    if (
+      requiresStructuredPageMetadata &&
+      (page.kind === "source" || page.kind === "entity") &&
+      (freshness.level === "stale" || freshness.level === "unknown")
+    ) {
       issues.push({
         severity: "warning",
         category: "quality",
@@ -260,7 +269,17 @@ function collectPageIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[] {
     }
   }
 
-  issues.push(...collectBrokenLinkIssues(pages));
+  issues.push(
+    ...collectBrokenWikiLinks(pages, existingMarkdownPaths).map(
+      ({ path: pagePath, target }): MemoryWikiLintIssue => ({
+        severity: "warning",
+        category: "links",
+        code: "broken-wikilink",
+        path: pagePath,
+        message: `Broken wikilink target \`${target}\`.`,
+      }),
+    ),
+  );
   return issues.toSorted((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -338,6 +357,9 @@ async function writeLintReport(rootDir: string, issues: MemoryWikiLintIssue[]): 
       body: "# Lint Report\n",
     }),
   );
+  // The lint report is itself a wiki page. Keep its metadata fail-closed before
+  // replacing the managed body so malformed frontmatter is never rewritten.
+  parseWikiMarkdown(original);
   const updated = replaceManagedMarkdownBlock({
     original,
     heading: "## Generated",
@@ -353,7 +375,27 @@ export async function lintMemoryWikiVault(
   config: ResolvedMemoryWikiConfig,
 ): Promise<LintMemoryWikiResult> {
   const compileResult = await compileMemoryWikiVault(config);
-  const issues = collectPageIssues(compileResult.pages);
+  const sourceSyncState = await readMemoryWikiSourceSyncState(config.vault.path);
+  const managedImportedSourcePagePaths = new Set(
+    Object.values(sourceSyncState.entries).map((entry) => entry.pagePath.split(path.sep).join("/")),
+  );
+  const existingMarkdownPaths = await collectExistingMarkdownPaths(config.vault.path);
+  const issues = [
+    ...compileResult.frontmatterErrors.map(
+      (error): MemoryWikiLintIssue => ({
+        severity: "error",
+        category: "structure",
+        code: "invalid-frontmatter",
+        path: error.relativePath,
+        message: `Frontmatter failed to parse: ${error.message}`,
+      }),
+    ),
+    ...collectPageIssues(
+      compileResult.pages,
+      managedImportedSourcePagePaths,
+      existingMarkdownPaths,
+    ),
+  ].toSorted((left, right) => left.path.localeCompare(right.path));
   const issuesByCategory = buildIssuesByCategory(issues);
   const reportPath = await writeLintReport(config.vault.path, issues);
 

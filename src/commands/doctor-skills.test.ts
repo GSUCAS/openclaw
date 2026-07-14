@@ -1,12 +1,15 @@
+// Doctor skills tests cover skill install checks, status summaries, and repair guidance.
 import { describe, expect, it } from "vitest";
-import type { SkillStatusEntry, SkillStatusReport } from "../agents/skills-status.js";
-import type { GhConfigDiscoveryInput } from "../agents/skills/gh-config-discovery.js";
 import { createEmptyInstallChecks } from "../cli/requirements-test-fixtures.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { SkillStatusEntry, SkillStatusReport } from "../skills/discovery/status.js";
+import type { GhConfigDiscoveryInput } from "../skills/lifecycle/gh-config-discovery.js";
 import {
   collectUnavailableAgentSkills,
-  describeGhConfigDirHintFromDiscovery,
   disableUnavailableSkillsInConfig,
+} from "./doctor-skills-core.js";
+import {
+  describeGhConfigDirHintFromDiscovery,
   formatUnavailableSkillDoctorLines,
 } from "./doctor-skills.js";
 
@@ -24,6 +27,7 @@ function createSkill(overrides: Partial<SkillStatusEntry>): SkillStatusEntry {
     blockedByAllowlist: false,
     blockedByAgentFilter: false,
     eligible: true,
+    platformIncompatible: false,
     modelVisible: true,
     userInvocable: true,
     commandVisible: true,
@@ -46,6 +50,7 @@ describe("doctor skills", () => {
     const unavailable = createSkill({
       name: "missing-bin",
       eligible: false,
+      platformIncompatible: false,
       modelVisible: false,
       commandVisible: false,
       missing: { bins: ["tool"], anyBins: [], env: [], config: [], os: [] },
@@ -61,11 +66,12 @@ describe("doctor skills", () => {
     expect(collectUnavailableAgentSkills(report)).toEqual([unavailable]);
   });
 
-  it("formats actionable missing requirement lines without secret values", () => {
+  it("formats unavailable skill names compactly and alphabetically", () => {
     const lines = formatUnavailableSkillDoctorLines([
       createSkill({
         name: "places",
         eligible: false,
+        platformIncompatible: false,
         missing: {
           bins: ["goplaces"],
           anyBins: [],
@@ -82,11 +88,25 @@ describe("doctor skills", () => {
           },
         ],
       }),
+      createSkill({
+        name: "calendar",
+        eligible: false,
+        platformIncompatible: false,
+      }),
     ]);
 
-    expect(lines.join("\n")).toContain("places: bins: goplaces; env: GOOGLE_MAPS_API_KEY");
-    expect(lines.join("\n")).toContain("install option: Install goplaces (brew)");
-    expect(lines.join("\n")).toContain("openclaw doctor --fix");
+    expect(lines).toEqual([
+      "2 allowed skills are not usable in this environment (missing binaries, env vars, or config).",
+      "- calendar, places",
+      "Disable unused skills: openclaw doctor --fix",
+      "Inspect details: openclaw skills check --agent <id> or openclaw skills info <name> --agent <id>",
+    ]);
+  });
+
+  it("uses singular grammar for one unavailable skill", () => {
+    expect(formatUnavailableSkillDoctorLines([createSkill({ name: "places" })])[0]).toBe(
+      "1 allowed skill is not usable in this environment (missing binaries, env vars, or config).",
+    );
   });
 
   it("surfaces a GH_CONFIG_DIR hint when the github skill is eligible but auth lives at a different HOME", () => {
@@ -94,6 +114,7 @@ describe("doctor skills", () => {
       name: "github",
       skillKey: "github",
       eligible: true,
+      platformIncompatible: false,
       missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
     });
     const discovery: GhConfigDiscoveryInput = {
@@ -114,6 +135,7 @@ describe("doctor skills", () => {
       name: "github",
       skillKey: "github",
       eligible: false,
+      platformIncompatible: false,
       missing: { bins: ["gh"], anyBins: [], env: [], config: [], os: [] },
     });
     const discovery: GhConfigDiscoveryInput = {
@@ -130,6 +152,7 @@ describe("doctor skills", () => {
       name: "github",
       skillKey: "github",
       eligible: false,
+      platformIncompatible: false,
       disabled: true,
       missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
     });
@@ -147,6 +170,7 @@ describe("doctor skills", () => {
       name: "github",
       skillKey: "github",
       eligible: true,
+      platformIncompatible: false,
       blockedByAgentFilter: true,
       missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
     });
@@ -164,6 +188,7 @@ describe("doctor skills", () => {
       name: "github",
       skillKey: "github",
       eligible: true,
+      platformIncompatible: false,
       missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
     });
     const discovery: GhConfigDiscoveryInput = {

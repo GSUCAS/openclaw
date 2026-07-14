@@ -1,21 +1,13 @@
+// Covers config validation issue formatting for user-facing output.
 import { describe, expect, it } from "vitest";
 import {
   formatConfigIssueLine,
   formatConfigIssueLines,
   formatConfigIssueSummary,
-  normalizeConfigIssue,
-  normalizeConfigIssuePath,
   normalizeConfigIssues,
 } from "./issue-format.js";
 
 describe("config issue format", () => {
-  it("normalizes empty paths to <root>", () => {
-    expect(normalizeConfigIssuePath("")).toBe("<root>");
-    expect(normalizeConfigIssuePath("   ")).toBe("<root>");
-    expect(normalizeConfigIssuePath(null)).toBe("<root>");
-    expect(normalizeConfigIssuePath(undefined)).toBe("<root>");
-  });
-
   it("formats issue lines with and without markers", () => {
     expect(formatConfigIssueLine({ path: "", message: "broken" }, "-")).toBe("- : broken");
     expect(
@@ -62,20 +54,7 @@ describe("config issue format", () => {
     ).toBe("<root>: root broken; gateway.auth.password.source: Required; and 1 more");
   });
 
-  it("normalizes issue metadata for machine output", () => {
-    expect(
-      normalizeConfigIssue({
-        path: "",
-        message: "invalid",
-        allowedValues: ["stable", "beta"],
-        allowedValuesHiddenCount: 0,
-      }),
-    ).toEqual({
-      path: "<root>",
-      message: "invalid",
-      allowedValues: ["stable", "beta"],
-    });
-
+  it("normalizes issue collections for machine output", () => {
     expect(
       normalizeConfigIssues([
         {
@@ -85,25 +64,6 @@ describe("config issue format", () => {
           allowedValuesHiddenCount: 2,
         },
       ]),
-    ).toEqual([
-      {
-        path: "update.channel",
-        message: "invalid",
-      },
-    ]);
-
-    expect(
-      normalizeConfigIssue({
-        path: "update.channel",
-        message: "invalid",
-        allowedValues: ["stable"],
-        allowedValuesHiddenCount: 2,
-      }),
-    ).toEqual({
-      path: "update.channel",
-      message: "invalid",
-      allowedValues: ["stable"],
-      allowedValuesHiddenCount: 2,
-    });
+    ).toEqual([{ path: "update.channel", message: "invalid" }]);
   });
 });

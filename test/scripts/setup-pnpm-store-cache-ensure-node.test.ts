@@ -1,10 +1,15 @@
+// Setup Pnpm Store Cache Ensure Node tests cover setup pnpm store cache ensure node script behavior.
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 const ensureNodeScript = resolve(".github/actions/setup-pnpm-store-cache/ensure-node.sh");
+let missingToolcacheCase: {
+  status: number | null;
+  stderr: string;
+};
 
 function writeFakeNode(binDir: string, version: string) {
   mkdirSync(binDir, { recursive: true });
@@ -70,6 +75,39 @@ function runVersionMatch(actual: string, requested: string) {
 }
 
 describe("setup-pnpm-store-cache ensure-node", () => {
+  beforeAll(() => {
+    const root = mkdtempSync(join(tmpdir(), "openclaw-ensure-node-"));
+    try {
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          [
+            "set -euo pipefail",
+            `source "${ensureNodeScript}"`,
+            `openclaw_find_toolcache_node "99.99.99"`,
+          ].join("; "),
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            PATH: process.env.PATH ?? "",
+            RUNNER_TOOL_CACHE: join(root, "missing-toolcache"),
+            AGENT_TOOLSDIRECTORY: join(root, "missing-agent-tools"),
+            ACTIONS_RUNNER_TOOL_CACHE: join(root, "missing-actions-cache"),
+            OPENCLAW_CONTAINER_TOOL_CACHE: join(root, "missing-container-cache"),
+          },
+        },
+      );
+      missingToolcacheCase = {
+        status: result.status,
+        stderr: result.stderr,
+      };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses a matching active node", () => {
     const root = mkdtempSync(join(tmpdir(), "openclaw-ensure-node-"));
     try {
@@ -222,7 +260,15 @@ exit 1
 
   it("rejects Node 22 wildcard matches below the supported minimum", () => {
     expect(runVersionMatch("22.18.0", "22.x").status).toBe(1);
-    expect(runVersionMatch("22.19.0", "22.x").status).toBe(0);
+    expect(runVersionMatch("22.22.2", "22.x").status).toBe(1);
+    expect(runVersionMatch("22.22.3", "22.x").status).toBe(0);
+  });
+
+  it("enforces patched Node 24 and 25 wildcard minimums", () => {
+    expect(runVersionMatch("24.14.1", "24.x").status).toBe(1);
+    expect(runVersionMatch("24.15.0", "24.x").status).toBe(0);
+    expect(runVersionMatch("25.8.1", "25.x").status).toBe(1);
+    expect(runVersionMatch("25.9.0", "25.x").status).toBe(0);
   });
 
   it("fails clearly when no matching node is available", () => {
@@ -241,5 +287,10 @@ exit 1
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("handles missing toolcache roots under nounset", () => {
+    expect(missingToolcacheCase.status).toBe(1);
+    expect(missingToolcacheCase.stderr).not.toContain("unbound variable");
   });
 });

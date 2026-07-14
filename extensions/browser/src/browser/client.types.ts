@@ -1,4 +1,10 @@
-export type BrowserTransport = "cdp" | "chrome-mcp";
+/**
+ * Browser client response types.
+ *
+ * Shared by the browser control client, CLI, and Browser agent tool.
+ */
+/** Browser transport backing the selected profile. */
+export type BrowserTransport = "cdp" | "chrome-mcp" | "extension";
 type BrowserHeadlessSource =
   | "request"
   | "env"
@@ -7,10 +13,57 @@ type BrowserHeadlessSource =
   | "linux-display-fallback"
   | "default";
 
+export type BrowserGraphicsAcceleration = "hardware" | "software" | "unknown";
+
+export type BrowserGraphicsDevice = {
+  vendorId: number;
+  deviceId: number;
+  vendor: string;
+  device: string;
+  driverVendor: string;
+  driverVersion: string;
+};
+
+export type BrowserVideoDecodeCapability = {
+  profile: string;
+  minResolution: { width: number; height: number };
+  maxResolution: { width: number; height: number };
+};
+
+export type BrowserVideoEncodeCapability = {
+  profile: string;
+  maxResolution: { width: number; height: number };
+  maxFramerateNumerator: number;
+  maxFramerateDenominator: number;
+};
+
+export type BrowserGraphicsDiagnostics =
+  | {
+      status: "available";
+      observedAt: number;
+      acceleration: BrowserGraphicsAcceleration;
+      renderer: string | null;
+      vendor: string | null;
+      version: string | null;
+      backend: string | null;
+      devices: BrowserGraphicsDevice[];
+      featureStatus: Record<string, string>;
+      disabledFeatures: Array<{ feature: string; status: string }>;
+      driverBugWorkarounds: string[];
+      videoDecoding: BrowserVideoDecodeCapability[];
+      videoEncoding: BrowserVideoEncodeCapability[];
+    }
+  | {
+      status: "unavailable";
+      observedAt: number;
+      reason: string;
+    };
+
+/** Browser status response returned by the control server. */
 export type BrowserStatus = {
   enabled: boolean;
   profile?: string;
-  driver?: "openclaw" | "existing-session";
+  driver?: "openclaw" | "existing-session" | "extension";
   transport?: BrowserTransport;
   running: boolean;
   cdpReady?: boolean;
@@ -36,8 +89,14 @@ export type BrowserStatus = {
   noSandbox?: boolean;
   executablePath?: string | null;
   attachOnly: boolean;
+  /**
+   * Cached process-lifetime diagnostics for a locally launched managed browser.
+   * Passive status calls never launch a browser to populate this field.
+   */
+  graphics?: BrowserGraphicsDiagnostics | null;
 };
 
+/** Browser tab record exposed by tab listing and tab mutation endpoints. */
 export type BrowserTab = {
   /** Best handle for agents to pass back as targetId: label, then tabId, then raw targetId. */
   suggestedTargetId?: string;
@@ -52,6 +111,7 @@ export type BrowserTab = {
   type?: string;
 };
 
+/** ARIA snapshot node exposed in structured snapshot responses. */
 export type SnapshotAriaNode = {
   ref: string;
   role: string;

@@ -1,15 +1,20 @@
+/**
+ * Loaded-channel target parsing helpers.
+ *
+ * Bridges deprecated explicit target parsing with modern channel route target helpers.
+ */
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+  normalizeOptionalThreadValue,
+} from "@openclaw/normalization-core/string-coerce";
 import {
   channelRouteTargetsMatchExact,
   channelRouteTargetsShareConversation,
   type ChannelRouteParsedTarget,
 } from "../../plugin-sdk/channel-route.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-  normalizeOptionalThreadValue,
-} from "../../shared/string-coerce.js";
 import { getChannelPlugin, normalizeChannelId } from "./index.js";
-import { getLoadedChannelPluginForRead } from "./registry-loaded-read.js";
+import { getLoadedChannelPluginForRead } from "./registry-loaded.js";
 
 export type { ChannelRouteParsedTarget } from "../../plugin-sdk/channel-route.js";
 
@@ -20,7 +25,7 @@ export type ParsedChannelExplicitTarget = {
   chatType?: "direct" | "group" | "channel";
 };
 
-export function resolveCompatParsedRouteTarget(params: {
+function resolveCompatParsedRouteTarget(params: {
   channel: string;
   rawTarget?: string | null;
   fallbackThreadId?: string | number | null;

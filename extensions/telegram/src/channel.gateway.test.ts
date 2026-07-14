@@ -1,3 +1,4 @@
+// Telegram tests cover channel.gateway plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +17,6 @@ import {
   resetTelegramPollingLeasesForTests,
 } from "./polling-lease.js";
 import { clearTelegramRuntime, setTelegramRuntime } from "./runtime.js";
-import type { TelegramProbeFn } from "./runtime.types.js";
 import type { TelegramRuntime } from "./runtime.types.js";
 import {
   resetTelegramStartupProbeLimiterForTests,
@@ -37,6 +37,7 @@ const startupBotInfo: TelegramBotInfo = {
   can_read_all_group_messages: false,
   can_manage_bots: false,
   supports_inline_queries: false,
+  supports_join_request_queries: false,
   can_connect_to_business: false,
   has_main_web_app: false,
   has_topics_enabled: false,
@@ -138,7 +139,9 @@ function installTelegramRuntime() {
     channel: {
       ...runtime.channel,
       telegram: {
-        probeTelegram: probeTelegram as TelegramProbeFn,
+        probeTelegram: probeTelegram as NonNullable<
+          NonNullable<TelegramRuntime["channel"]["telegram"]>["probeTelegram"]
+        >,
         monitorTelegramProvider: monitorTelegramProvider as TelegramMonitorFn,
         sendMessageTelegram,
       },
@@ -228,19 +231,6 @@ function sendMessageOptionsAt(index: number): Record<string, unknown> {
   }
   return options;
 }
-
-async function waitForCondition(check: () => boolean, message: string, timeoutMs = 5_000) {
-  vi.useRealTimers();
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (check()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-  throw new Error(message);
-}
-
 async function waitForMicrotaskCondition(check: () => boolean, message: string, attempts = 100) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (check()) {

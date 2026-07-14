@@ -1,3 +1,5 @@
+// Stages bundled plugin runtime overlays into dist-runtime with SDK aliases and
+// Windows-safe symlink fallbacks.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -224,6 +226,10 @@ function isBundledSkillRuntimePath(relativePath) {
   return relativePath === "skills" || relativePath.startsWith("skills/");
 }
 
+function isRawBrowserExtensionAssetPath(relativePath) {
+  return relativePath === "chrome-extension" || relativePath.endsWith("/chrome-extension");
+}
+
 function isPathOrNestedPath(relativePath, nestedPath) {
   return relativePath === nestedPath || relativePath.endsWith(`/${nestedPath}`);
 }
@@ -288,6 +294,12 @@ function stagePluginRuntimeOverlay(sourceDir, targetDir, relativeDir = "") {
     const relativePath = path.join(relativeDir, dirent.name).replace(/\\/g, "/");
 
     if (dirent.isDirectory()) {
+      // Unpacked browser extensions are executable static payloads, not Node
+      // modules. Preserve the staged tree byte-for-byte so Chrome can load it.
+      if (isRawBrowserExtensionAssetPath(relativePath)) {
+        copyPathFallback(sourcePath, targetPath);
+        continue;
+      }
       stagePluginRuntimeOverlay(sourcePath, targetPath, relativePath);
       continue;
     }
@@ -319,6 +331,9 @@ function stagePluginRuntimeOverlay(sourceDir, targetDir, relativeDir = "") {
   }
 }
 
+/**
+ * Stages runtime plugin entries and aliases used by packaged bundled plugins.
+ */
 export function stageBundledPluginRuntime(params = {}) {
   const repoRoot = params.cwd ?? params.repoRoot ?? process.cwd();
   const distRoot = path.join(repoRoot, "dist");

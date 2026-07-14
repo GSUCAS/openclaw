@@ -1,5 +1,6 @@
+// Qa Channel tests cover channel plugin behavior.
 import path from "node:path";
-import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-message";
+import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-outbound";
 import {
   createPluginRuntimeMock,
   createStartAccountContext,
@@ -16,7 +17,7 @@ import { createQaBusState, startQaBusServer } from "../../qa-lab/bus-api.js";
 import { qaChannelPlugin, setQaChannelRuntime } from "../api.js";
 import { listQaChannelAccountIds, resolveDefaultQaChannelAccountId } from "./accounts.js";
 
-type QaRunPreparedTurn = Parameters<PluginRuntime["channel"]["turn"]["runPrepared"]>[0];
+type QaDispatchTurn = Parameters<PluginRuntime["channel"]["inbound"]["dispatchReply"]>[0];
 
 afterEach(() => {
   resetPluginRuntimeStateForTest();
@@ -114,7 +115,9 @@ function createMockQaRuntime(params?: {
           replyOptions,
         }: {
           ctx: { BodyForAgent?: string; Body?: string };
-          dispatcherOptions: { deliver: (payload: { text: string }) => Promise<void> };
+          dispatcherOptions: {
+            deliver: (payload: { text: string }, info: { kind: string }) => Promise<void>;
+          };
           replyOptions?: {
             onToolStart?: (payload: {
               name?: string;
@@ -127,13 +130,16 @@ function createMockQaRuntime(params?: {
             await replyOptions?.onToolStart?.(toolStart);
           }
           params?.onDispatch?.(ctx as Record<string, unknown>);
-          await dispatcherOptions.deliver({
-            text: `qa-echo: ${ctx.BodyForAgent ?? ctx.Body ?? ""}`,
-          });
+          await dispatcherOptions.deliver(
+            {
+              text: `qa-echo: ${ctx.BodyForAgent ?? ctx.Body ?? ""}`,
+            },
+            { kind: "final" },
+          );
         },
       },
-      turn: {
-        async runPrepared(turn: QaRunPreparedTurn) {
+      inbound: {
+        async dispatchReply(turn: QaDispatchTurn) {
           await turn.recordInboundSession({
             storePath: turn.storePath,
             sessionKey:
@@ -148,7 +154,19 @@ function createMockQaRuntime(params?: {
             dispatched: true,
             ctxPayload: turn.ctxPayload,
             routeSessionKey: turn.routeSessionKey,
-            dispatchResult: await turn.runDispatch(),
+            dispatchResult: await turn.dispatchReplyWithBufferedBlockDispatcher({
+              ctx: turn.ctxPayload,
+              cfg: turn.cfg,
+              dispatcherOptions: {
+                ...turn.dispatcherOptions,
+                deliver: async (...args: Parameters<typeof turn.delivery.deliver>) => {
+                  await turn.delivery.deliver(...args);
+                },
+                onError: turn.delivery.onError,
+              },
+              replyOptions: turn.replyOptions,
+              replyResolver: turn.replyResolver,
+            }),
           };
         },
       },

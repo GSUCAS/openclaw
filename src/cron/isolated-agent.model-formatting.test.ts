@@ -1,3 +1,4 @@
+// Isolated agent model formatting tests cover model metadata in cron prompts.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import type { AgentConfig } from "../config/types.agents.js";
@@ -520,6 +521,44 @@ describe("cron model formatting and precedence edge cases", () => {
 
     it("default remains when store has no override", async () => {
       await expectDefaultSelectedModel({ sessionEntry: {} });
+    });
+  });
+
+  describe("Gmail hook model precedence", () => {
+    const gmailModel = {
+      provider: "openrouter",
+      model: "meta-llama/llama-3.3-70b:free",
+    };
+
+    it("keeps an allowed hook model ahead of a stored session override", async () => {
+      resolveHooksGmailModelMock.mockReturnValue(gmailModel);
+      getModelRefStatusMock.mockReturnValue({ allowed: true });
+
+      await expect(
+        selectModel({
+          isGmailHook: true,
+          sessionEntry: {
+            providerOverride: "anthropic",
+            modelOverride: "claude-opus-4-6",
+          },
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        ...gmailModel,
+        modelSource: "hook",
+      });
+    });
+
+    it("keeps the configured default when the hook model is not allowed", async () => {
+      resolveHooksGmailModelMock.mockReturnValue(gmailModel);
+      getModelRefStatusMock.mockReturnValue({ allowed: false });
+
+      await expect(selectModel({ isGmailHook: true })).resolves.toMatchObject({
+        ok: true,
+        provider: DEFAULT_PROVIDER,
+        model: DEFAULT_MODEL,
+        modelSource: "default",
+      });
     });
   });
 

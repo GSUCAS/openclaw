@@ -1,5 +1,14 @@
-import { spawn } from "node:child_process";
+// Crestodian probes check local tools and Gateway health with bounded subprocess/network work.
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { runCommandWithTimeout } from "../process/exec.js";
 
+/**
+ * Local environment probes used by Crestodian overview loading.
+ *
+ * Probes are bounded by output and timeout limits so setup/status commands do
+ * not hang or retain unbounded child output.
+ */
+/** Result from probing a local command binary. */
 export type LocalCommandProbe = {
   command: string;
   found: boolean;
@@ -7,68 +16,59 @@ export type LocalCommandProbe = {
   error?: string;
 };
 
+const LOCAL_COMMAND_PROBE_OUTPUT_MAX_CHARS = 16 * 1024;
+/** Probe a command by running a small version command with bounded output and timeout. */
 export async function probeLocalCommand(
   command: string,
   args: string[] = ["--version"],
-  opts: { timeoutMs?: number } = {},
+  opts: { outputLimit?: number; timeoutMs?: number } = {},
 ): Promise<LocalCommandProbe> {
-  const timeoutMs = opts.timeoutMs ?? 1_500;
-  return await new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
+  const timeoutMs = resolveTimerTimeoutMs(opts.timeoutMs, 1_500);
+  const outputLimit = opts.outputLimit ?? LOCAL_COMMAND_PROBE_OUTPUT_MAX_CHARS;
+  try {
+    const result = await runCommandWithTimeout([command, ...args], {
+      killProcessTree: true,
+      maxOutputBytes: outputLimit,
+      timeoutMs,
     });
-    const finish = (result: LocalCommandProbe) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
+    if (result.termination === "timeout") {
+      return {
+        command,
+        found: true,
+        error: `timed out after ${timeoutMs}ms`,
+      };
+    }
+    // Version output can arrive on stdout or stderr depending on the CLI.
+    const text = `${result.stdout}\n${result.stderr}`.trim().split(/\r?\n/)[0]?.trim();
+    return {
+      command,
+      found: result.code === 0 || Boolean(text),
+      version: text || undefined,
+      error: result.code === 0 ? undefined : `exited ${String(result.code)}`,
     };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish({ command, found: true, error: `timed out after ${timeoutMs}ms` });
-    }, timeoutMs);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      finish({
-        command,
-        found: err.code !== "ENOENT",
-        error: err.code === "ENOENT" ? "not found" : err.message,
-      });
-    });
-    child.on("close", (code) => {
-      const text = `${stdout}\n${stderr}`.trim().split(/\r?\n/)[0]?.trim();
-      finish({
-        command,
-        found: code === 0 || Boolean(text),
-        version: text || undefined,
-        error: code === 0 ? undefined : `exited ${String(code)}`,
-      });
-    });
-  });
+  } catch (error) {
+    const spawnError = error as NodeJS.ErrnoException;
+    return {
+      command,
+      found: spawnError.code !== "ENOENT",
+      error: spawnError.code === "ENOENT" ? "not found" : spawnError.message,
+    };
+  }
 }
 
+/** Probe a Gateway URL by translating it to its HTTP /healthz endpoint. */
 export async function probeGatewayUrl(
   url: string,
   opts: { timeoutMs?: number } = {},
 ): Promise<{ reachable: boolean; url: string; error?: string }> {
   const httpUrl = url.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
   const healthUrl = new URL("/healthz", httpUrl).toString();
+  const timeoutMs = resolveTimerTimeoutMs(opts.timeoutMs, 900);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 900);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response | undefined;
   try {
-    const response = await fetch(healthUrl, {
+    response = await fetch(healthUrl, {
       method: "GET",
       signal: controller.signal,
     });
@@ -81,5 +81,6 @@ export async function probeGatewayUrl(
     };
   } finally {
     clearTimeout(timeout);
+    await response?.body?.cancel().catch(() => undefined);
   }
 }

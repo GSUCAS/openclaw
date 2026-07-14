@@ -1,3 +1,6 @@
+// Core SDK contracts expose stable identifiers, manifests, and shared plugin metadata types.
+import { expectDefined } from "@openclaw/normalization-core";
+import { normalizeLowercaseStringOrEmpty } from "../../packages/normalization-core/src/string-coerce.js";
 import type { ResolvedConfiguredAcpBinding } from "../acp/persistent-bindings.types.js";
 import { buildChatChannelMetaById } from "../channels/chat-meta-shared.js";
 import type { ChatChannelId } from "../channels/ids.js";
@@ -30,11 +33,10 @@ import { resolveBundledPluginsDir } from "../plugins/bundled-dir.js";
 import type { PluginRuntime } from "../plugins/runtime/types.js";
 import type { OpenClawPluginApi } from "../plugins/types.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
-import { parseThreadSessionSuffix } from "../sessions/session-key-utils.js";
 import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
+  normalizeSessionKeyPreservingOpaquePeerIds,
+  parseThreadSessionSuffix,
+} from "../sessions/session-key-utils.js";
 
 export type {
   AgentPromptGuidance,
@@ -114,6 +116,7 @@ export type {
   ProviderResolveTransportTurnStateContext,
   ProviderResolveWebSocketSessionPolicyContext,
   ProviderResolvedUsageAuth,
+  ProviderUsageAuthToken,
   RealtimeTranscriptionProviderPlugin,
   ProviderSanitizeReplayHistoryContext,
   ProviderTransportTurnState,
@@ -132,7 +135,7 @@ export type {
   UnifiedModelCatalogEntry,
   UnifiedModelCatalogKind,
   UnifiedModelCatalogSource,
-} from "../model-catalog/types.js";
+} from "@openclaw/model-catalog-core/model-catalog-types";
 export type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 export type {
   OpenClawPluginActiveModelContext,
@@ -145,6 +148,10 @@ export type {
   MemoryPluginPublicArtifactsProvider,
 } from "../plugins/memory-state.js";
 export type {
+  PluginHookReplyPayloadSendingContext,
+  PluginHookReplyPayloadSendingEvent,
+  PluginHookReplyPayloadSendingResult,
+  PluginHookReplyPayload,
   PluginHookReplyDispatchContext,
   PluginHookReplyDispatchEvent,
   PluginHookReplyDispatchResult,
@@ -163,7 +170,7 @@ export type {
   ChannelSetupInput,
 } from "../channels/plugins/types.public.js";
 export type { ChatType } from "../channels/chat-type.js";
-export type { NormalizedLocation } from "../channels/location.js";
+export type { NormalizedLocation, OutboundLocation } from "../channels/location.js";
 export type { ChannelDirectoryEntry } from "../channels/plugins/types.core.js";
 export type { ChannelOutboundAdapter } from "../channels/plugins/types.adapters.js";
 export type { PollInput } from "../polls.js";
@@ -202,6 +209,7 @@ export type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 export type { ChannelConfigUiHint } from "../channels/plugins/types.config.js";
 export type { PluginRuntime, RuntimeLogger } from "../plugins/runtime/types.js";
 export type { WizardPrompter } from "../wizard/prompts.js";
+export type { ContextEngineSessionTarget } from "../context-engine/types.js";
 
 export { definePluginEntry } from "./plugin-entry.js";
 export {
@@ -212,6 +220,7 @@ export {
 export { KeyedAsyncQueue, enqueueKeyedTask } from "./keyed-async-queue.js";
 export { createDedupeCache, resolveGlobalDedupeCache } from "../infra/dedupe.js";
 export { generateSecureToken, generateSecureUuid } from "../infra/secure-random.js";
+export { resolveTailscalePublishedHost } from "../shared/tailscale-status.js";
 export {
   buildMemorySystemPromptAddition,
   delegateCompactionToRuntime,
@@ -253,7 +262,10 @@ export { resolveGatewayBindUrl } from "../shared/gateway-bind-url.js";
 export type { GatewayBindUrlResult } from "../shared/gateway-bind-url.js";
 export { resolveGatewayPort } from "../config/paths.js";
 export { createSubsystemLogger } from "../logging/subsystem.js";
-export { normalizeAtHashSlug, normalizeHyphenSlug } from "../shared/string-normalization.js";
+export {
+  normalizeAtHashSlug,
+  normalizeHyphenSlug,
+} from "../../packages/normalization-core/src/string-normalization.js";
 export { createActionGate } from "../agents/tools/common.js";
 export {
   jsonResult,
@@ -267,6 +279,7 @@ export { isTrustedProxyAddress, resolveClientIp } from "../gateway/net.js";
 export { formatZonedTimestamp } from "../infra/format-time/format-datetime.js";
 export { resolveConfiguredAcpBindingRecord } from "../acp/persistent-bindings.resolve.js";
 
+/** Ensure a configured ACP binding has live runtime state before channel delivery uses it. */
 export async function ensureConfiguredAcpBindingReady(params: {
   cfg: OpenClawConfig;
   configuredBinding: ResolvedConfiguredAcpBinding | null;
@@ -275,7 +288,10 @@ export async function ensureConfiguredAcpBindingReady(params: {
   return runtime.ensureConfiguredAcpBindingReady(params);
 }
 
-export { resolveTailnetHostWithRunner } from "../shared/tailscale-status.js";
+export {
+  resolveTailnetHostWithRunner,
+  resolveTailscaleServeGatewayUrlsWithRunner,
+} from "../shared/tailscale-status.js";
 export type {
   TailscaleStatusCommandResult,
   TailscaleStatusCommandRunner,
@@ -287,6 +303,7 @@ export {
 } from "../routing/resolve-route.js";
 export { resolveThreadSessionKeys } from "../routing/session-key.js";
 
+/** Params passed to a channel adapter when resolving outbound session routing. */
 export type ChannelOutboundSessionRouteParams = Parameters<
   NonNullable<ChannelMessagingAdapter["resolveOutboundSessionRoute"]>
 >[0];
@@ -306,11 +323,14 @@ function resolveSdkChatChannelMeta(id: string) {
       metaById: buildChatChannelMetaById(),
     };
   }
+  // Optional by design: createChannelPluginBase serves external plugin ids that
+  // are never in the bundled catalog; their meta comes entirely from params.meta.
   return cachedSdkChatChannelMeta.metaById[id];
 }
 
+/** Resolve bundled chat channel metadata while respecting the active bundled-plugin directory. */
 export function getChatChannelMeta(id: ChatChannelId): ChannelMeta {
-  return resolveSdkChatChannelMeta(id);
+  return expectDefined(resolveSdkChatChannelMeta(id), `chat channel metadata: ${id}`);
 }
 
 /** Remove one of the known provider prefixes from a free-form target string. */
@@ -339,6 +359,7 @@ export function buildChannelOutboundSessionRoute(params: {
   agentId: string;
   channel: string;
   accountId?: string | null;
+  recipientSessionExact?: boolean | "direct-alias" | "delivery-identity";
   peer: { kind: "direct" | "group" | "channel"; id: string };
   chatType: "direct" | "group" | "channel";
   from: string;
@@ -355,6 +376,9 @@ export function buildChannelOutboundSessionRoute(params: {
   return {
     sessionKey: baseSessionKey,
     baseSessionKey,
+    ...(params.recipientSessionExact !== undefined
+      ? { recipientSessionExact: params.recipientSessionExact }
+      : {}),
     peer: params.peer,
     chatType: params.chatType,
     from: params.from,
@@ -363,17 +387,20 @@ export function buildChannelOutboundSessionRoute(params: {
   };
 }
 
+/** Candidate source used when choosing a thread id for outbound session routing. */
 export type ThreadAwareOutboundSessionRouteThreadSource =
   | "replyToId"
   | "threadId"
   | "currentSession";
 
+/** Recovery context passed before reusing the current session thread id. */
 export type ThreadAwareOutboundSessionRouteRecoveryContext = {
   route: ChannelOutboundSessionRoute;
   currentBaseSessionKey: string;
   currentThreadId: string;
 };
 
+/** Recover the current thread id when the current session belongs to the same base route. */
 export function recoverCurrentThreadSessionId(params: {
   route: ChannelOutboundSessionRoute;
   currentSessionKey?: string | null;
@@ -384,8 +411,8 @@ export function recoverCurrentThreadSessionId(params: {
     return undefined;
   }
   if (
-    normalizeOptionalLowercaseString(current.baseSessionKey) !==
-    normalizeOptionalLowercaseString(params.route.baseSessionKey)
+    normalizeSessionKeyPreservingOpaquePeerIds(current.baseSessionKey) !==
+    normalizeSessionKeyPreservingOpaquePeerIds(params.route.baseSessionKey)
   ) {
     return undefined;
   }
@@ -400,6 +427,7 @@ export function recoverCurrentThreadSessionId(params: {
   return current.threadId;
 }
 
+/** Add thread-aware session keys and route thread ids to an outbound channel route. */
 export function buildThreadAwareOutboundSessionRoute(params: {
   route: ChannelOutboundSessionRoute;
   replyToId?: string | number | null;
@@ -781,8 +809,10 @@ function resolveChatChannelOutbound(
   };
 }
 
-// Shared higher-level builder for chat-style channels that mostly compose
-// scoped DM security, text pairing, reply threading, and attached send results.
+/**
+ * Build a chat-style channel plugin by composing common security, pairing,
+ * threading, and outbound adapters around a channel-specific base.
+ */
 export function createChatChannelPlugin<
   TResolvedAccount extends { accountId?: string | null },
   Probe = unknown,
@@ -809,7 +839,7 @@ export function createChatChannelPlugin<
   } as ChannelPlugin<TResolvedAccount, Probe, Audit>;
 }
 
-// Shared base object for channel plugins that only need to override a few optional surfaces.
+/** Create the shared base object for channel plugins that override only selected surfaces. */
 export function createChannelPluginBase<TResolvedAccount>(
   params: CreateChannelPluginBaseOptions<TResolvedAccount>,
 ): CreatedChannelPluginBase<TResolvedAccount> {
@@ -818,6 +848,7 @@ export function createChannelPluginBase<TResolvedAccount>(
     meta: {
       ...resolveSdkChatChannelMeta(params.id),
       ...params.meta,
+      id: params.id,
     },
     ...(params.setupWizard ? { setupWizard: params.setupWizard } : {}),
     ...(params.capabilities ? { capabilities: params.capabilities } : {}),

@@ -1,7 +1,8 @@
+// Covers exec command resolution and allowlist paths.
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { makePathEnv, makeTempDir } from "./exec-approvals-test-helpers.js";
+import { makeExecutable, makePathEnv, makeTempDir } from "./exec-approvals-test-helpers.js";
 import {
   evaluateExecAllowlist,
   resolvePlannedSegmentArgv,
@@ -187,6 +188,32 @@ describe("exec-command-resolution", () => {
     );
     expect(timeResolution?.execution.resolvedPath).toBe(fixture.exePath);
     expect(timeResolution?.execution.executableName).toBe(fixture.exeName);
+  });
+
+  it("keeps file-writing dispatch wrappers on the policy boundary", () => {
+    const timeResolution = resolveCommandResolutionFromArgv([
+      "/usr/bin/time",
+      "-o",
+      "/tmp/time.log",
+      "-a",
+      "-f",
+      "payload",
+      "git",
+      "status",
+    ]);
+    expect(timeResolution?.policyBlocked).toBe(true);
+    expect(timeResolution?.blockedWrapper).toBe("time");
+    expect(timeResolution?.execution.rawExecutable).toBe("/usr/bin/time");
+
+    const scriptResolution = resolveCommandResolutionFromArgv(
+      ["script", "/tmp/session.log", "git", "status"],
+      undefined,
+      undefined,
+      "darwin",
+    );
+    expect(scriptResolution?.policyBlocked).toBe(true);
+    expect(scriptResolution?.blockedWrapper).toBe("script");
+    expect(scriptResolution?.execution.rawExecutable).toBe("script");
   });
 
   it("keeps shell multiplexer wrappers as a separate policy target", () => {
@@ -441,6 +468,25 @@ describe("exec-command-resolution", () => {
       );
     },
   );
+
+  it("keeps package-manager exec as the planned execution argv", () => {
+    const dir = makeTempDir();
+    const pnpmPath = makeExecutable(dir, "pnpm");
+    makeExecutable(dir, "eslint");
+    const env = makePathEnv(dir);
+    const argv = ["pnpm", "exec", "eslint", "."];
+    const resolution = resolveCommandResolutionFromArgv(argv, dir, env);
+    const segment = {
+      raw: argv.join(" "),
+      argv,
+      resolution,
+    };
+
+    expect(resolution?.policyBlocked).toBe(false);
+    expect(resolution?.execution.resolvedPath).toBe(pnpmPath);
+    expect(resolution?.effectiveArgv).toEqual(argv);
+    expect(resolvePlannedSegmentArgv(segment)).toEqual([pnpmPath, "exec", "eslint", "."]);
+  });
 
   it("normalizes argv tokens for short clusters, long options, and special sentinels", () => {
     expect(parseExecArgvToken("")).toEqual({ kind: "empty", raw: "" });

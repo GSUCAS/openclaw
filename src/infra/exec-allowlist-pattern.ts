@@ -1,6 +1,7 @@
+// Parses execution allowlist patterns for approval policy checks.
 import fs from "node:fs";
 import path from "node:path";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { expandHomePrefix } from "./home-dir.js";
 
 const GLOB_REGEX_CACHE_LIMIT = 512;
@@ -58,7 +59,7 @@ function compileGlobRegex(pattern: string): RegExp {
   let regex = "^";
   let i = 0;
   while (i < pattern.length) {
-    const ch = pattern[i];
+    const ch = pattern.charAt(i);
     if (ch === "*") {
       const next = pattern[i + 1];
       if (next === "*") {

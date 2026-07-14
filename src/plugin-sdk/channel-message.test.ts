@@ -1,19 +1,37 @@
-import { describe, expect, it, vi } from "vitest";
-import { defineChannelMessageAdapter } from "./channel-message.js";
+/**
+ * Tests channel message helper behavior and mocked runtime interactions.
+ */
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { defineChannelMessageAdapter as defineCoreChannelMessageAdapter } from "../channels/message/index.js";
+import {
+  defineChannelMessageAdapter,
+  type ChannelMessageDurableFinalAdapter,
+} from "./channel-outbound.js";
 
 describe("defineChannelMessageAdapter", () => {
-  it("keeps new and legacy channel plugin SDK subpaths importable", async () => {
-    const [channelMessage, channelMessageRuntime, channelReplyPipeline, compat] = await Promise.all(
-      [
-        import("openclaw/plugin-sdk/channel-message"),
-        import("openclaw/plugin-sdk/channel-message-runtime"),
-        import("openclaw/plugin-sdk/channel-reply-pipeline"),
-        import("openclaw/plugin-sdk/compat"),
-      ],
-    );
+  const loadPluginSdkSubpaths = async () =>
+    await Promise.all([
+      import("openclaw/plugin-sdk/channel-outbound"),
+      import("openclaw/plugin-sdk/channel-message"),
+      import("openclaw/plugin-sdk/channel-message-runtime"),
+      import("openclaw/plugin-sdk/channel-reply-pipeline"),
+      import("openclaw/plugin-sdk/compat"),
+    ] as const);
+  let pluginSdkSubpaths: Awaited<ReturnType<typeof loadPluginSdkSubpaths>>;
 
-    expect(channelMessage.createChannelMessageReplyPipeline).toBe(
+  beforeAll(async () => {
+    pluginSdkSubpaths = await loadPluginSdkSubpaths();
+  });
+
+  it("keeps new and legacy channel plugin SDK subpaths importable", async () => {
+    const [channelOutbound, channelMessage, channelMessageRuntime, channelReplyPipeline, compat] =
+      pluginSdkSubpaths;
+
+    expect(channelOutbound.createChannelMessageReplyPipeline).toBe(
       channelReplyPipeline.createChannelReplyPipeline,
+    );
+    expect(channelMessage.createChannelMessageReplyPipeline).toBe(
+      channelOutbound.createChannelMessageReplyPipeline,
     );
     expect(channelMessage.createReplyPrefixOptions).toBe(
       channelReplyPipeline.createReplyPrefixOptions,
@@ -25,6 +43,7 @@ describe("defineChannelMessageAdapter", () => {
     expect(channelMessageRuntime.withDurableMessageSendContext).toBe(
       channelMessage.withDurableMessageSendContext,
     );
+    expect(channelOutbound.defineChannelMessageAdapter).toBe(defineCoreChannelMessageAdapter);
     expect(compat.createChannelReplyPipeline).toBe(channelReplyPipeline.createChannelReplyPipeline);
   });
 
@@ -62,6 +81,36 @@ describe("defineChannelMessageAdapter", () => {
     expect(adapter.receive).toEqual({
       defaultAckPolicy: "after_agent_dispatch",
       supportedAckPolicies: ["after_receive_record", "after_agent_dispatch"],
+    });
+  });
+
+  it("exposes the synchronous deferred-delivery admission contract", () => {
+    const admitDeferredDelivery = vi.fn<
+      NonNullable<ChannelMessageDurableFinalAdapter["admitDeferredDelivery"]>
+    >((ctx) =>
+      ctx.phase === "recovery"
+        ? { status: "permanent_rejection", reason: "account no longer supports replay" }
+        : { status: "allowed" },
+    );
+    const adapter = defineChannelMessageAdapter({
+      id: "demo",
+      durableFinal: { admitDeferredDelivery },
+    });
+    const context = {
+      cfg: {},
+      channel: "demo",
+      to: "conversation-1",
+      accountId: "workspace-1",
+    } as Parameters<typeof admitDeferredDelivery>[0];
+
+    expect(adapter.durableFinal?.admitDeferredDelivery?.({ ...context, phase: "live" })).toEqual({
+      status: "allowed",
+    });
+    expect(
+      adapter.durableFinal?.admitDeferredDelivery?.({ ...context, phase: "recovery" }),
+    ).toEqual({
+      status: "permanent_rejection",
+      reason: "account no longer supports replay",
     });
   });
 });

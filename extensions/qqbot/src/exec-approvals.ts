@@ -1,4 +1,8 @@
-import { resolveApprovalApprovers } from "openclaw/plugin-sdk/approval-auth-runtime";
+// Qqbot plugin module implements exec approvals behavior.
+import {
+  markImplicitSameChatApprovalAuthorization,
+  resolveApprovalApprovers,
+} from "openclaw/plugin-sdk/approval-auth-runtime";
 import {
   createChannelExecApprovalProfile,
   isChannelExecApprovalClientEnabledFromConfig,
@@ -213,8 +217,8 @@ const qqbotExecApprovalProfile = createChannelExecApprovalProfile({
 });
 
 export const isQQBotExecApprovalClientEnabled = qqbotExecApprovalProfile.isClientEnabled;
-export const isQQBotExecApprovalApprover = qqbotExecApprovalProfile.isApprover;
-export const isQQBotExecApprovalAuthorizedSender = qqbotExecApprovalProfile.isAuthorizedSender;
+const isQQBotExecApprovalApprover = qqbotExecApprovalProfile.isApprover;
+const isQQBotExecApprovalAuthorizedSender = qqbotExecApprovalProfile.isAuthorizedSender;
 export const shouldHandleQQBotExecApprovalRequest = qqbotExecApprovalProfile.shouldHandleRequest;
 
 export function authorizeQQBotApprovalAction(params: {
@@ -224,7 +228,7 @@ export function authorizeQQBotApprovalAction(params: {
   approvalKind: "exec" | "plugin";
 }): { authorized: boolean; reason?: string } {
   if (resolveQQBotExecApprovalConfig(params) === undefined) {
-    return { authorized: true };
+    return markImplicitSameChatApprovalAuthorization({ authorized: true });
   }
 
   const authorized =

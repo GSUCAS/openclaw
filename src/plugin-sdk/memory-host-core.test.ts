@@ -1,3 +1,6 @@
+/**
+ * Tests memory host core public artifact discovery and workspace handling.
+ */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +9,7 @@ import {
   clearMemoryPluginState,
   registerMemoryCapability,
   registerMemoryPromptSection,
-} from "../plugins/memory-state.js";
+} from "../plugins/memory-state.test-fixtures.js";
 import * as memoryCoreAlias from "./memory-core.js";
 import {
   buildActiveMemoryPromptSection,

@@ -1,13 +1,19 @@
+// Covers plugin status reporting from config, discovery, and registry state.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PluginMemoryEmbeddingProviderRegistration } from "./registry.test-fixtures.js";
 import {
   createCompatibilityNotice,
   createCustomHook,
   createPluginLoadResult,
   createPluginRecord,
   createTypedHook,
+  DEPRECATED_MEMORY_EMBEDDING_PROVIDER_API_MESSAGE,
   HOOK_ONLY_MESSAGE,
   LEGACY_BEFORE_AGENT_START_MESSAGE,
-} from "./status.test-helpers.js";
+  REMOVED_SESSION_TRANSCRIPT_FILE_API_MESSAGE,
+} from "./status.test-fixtures.js";
 
 const loadConfigMock = vi.fn();
 const loadOpenClawPluginsMock = vi.fn();
@@ -15,6 +21,9 @@ const loadPluginMetadataRegistrySnapshotMock = vi.fn();
 const loadPluginManifestRegistryForPluginRegistryMock = vi.fn();
 const loadPluginRegistrySnapshotWithMetadataMock = vi.fn();
 const loadPluginManifestRegistryForInstalledIndexMock = vi.fn();
+const isPluginMetadataSnapshotCompatibleMock = vi.fn<
+  typeof import("./plugin-metadata-snapshot.js").isPluginMetadataSnapshotCompatible
+>(() => true);
 const loadPluginMetadataSnapshotMock = vi.fn((rawParams: unknown = {}) => {
   const params = rawParams as { index?: unknown };
   const manifestRegistry = loadPluginManifestRegistryForInstalledIndexMock(params) ?? {
@@ -32,7 +41,6 @@ const loadPluginMetadataSnapshotMock = vi.fn((rawParams: unknown = {}) => {
 });
 const applyPluginAutoEnableMock = vi.fn();
 const resolveBundledProviderCompatPluginIdsMock = vi.fn();
-const withBundledPluginAllowlistCompatMock = vi.fn();
 const withBundledPluginEnablementCompatMock = vi.fn();
 const listImportedBundledPluginFacadeIdsMock = vi.fn();
 const listImportedRuntimePluginIdsMock = vi.fn();
@@ -78,7 +86,8 @@ vi.mock("./manifest-registry-installed.js", () => ({
 }));
 
 vi.mock("./plugin-metadata-snapshot.js", () => ({
-  loadPluginMetadataSnapshot: (...args: unknown[]) => loadPluginMetadataSnapshotMock(...args),
+  isPluginMetadataSnapshotCompatible: isPluginMetadataSnapshotCompatibleMock,
+  loadPluginMetadataSnapshot: (params?: unknown) => loadPluginMetadataSnapshotMock(params),
   resolvePluginMetadataSnapshot: (params?: { pluginMetadataSnapshot?: unknown }) =>
     params?.pluginMetadataSnapshot ?? loadPluginMetadataSnapshotMock(params),
 }));
@@ -89,8 +98,6 @@ vi.mock("./providers.js", () => ({
 }));
 
 vi.mock("./bundled-compat.js", () => ({
-  withBundledPluginAllowlistCompat: (...args: unknown[]) =>
-    withBundledPluginAllowlistCompatMock(...args),
   withBundledPluginEnablementCompat: (...args: unknown[]) =>
     withBundledPluginEnablementCompatMock(...args),
 }));
@@ -233,32 +240,26 @@ function expectAutoEnabledStatusLoad(params: { rawConfig: unknown }) {
 function createCompatChainFixture() {
   const config = { plugins: { allow: ["telegram"] } };
   const pluginIds = ["anthropic", "openai"];
-  const compatConfig = { plugins: { allow: ["telegram", ...pluginIds] } };
   const enabledConfig = {
     plugins: {
-      allow: ["telegram", ...pluginIds],
+      allow: ["telegram"],
       entries: {
         anthropic: { enabled: true },
         openai: { enabled: true },
       },
     },
   };
-  return { config, pluginIds, compatConfig, enabledConfig };
+  return { config, pluginIds, enabledConfig };
 }
 
 function expectBundledCompatChainApplied(params: {
   config: unknown;
   pluginIds: string[];
-  compatConfig: unknown;
   enabledConfig: unknown;
   loadModules: boolean;
 }) {
-  expect(withBundledPluginAllowlistCompatMock).toHaveBeenCalledWith({
-    config: params.config,
-    pluginIds: params.pluginIds,
-  });
   expect(withBundledPluginEnablementCompatMock).toHaveBeenCalledWith({
-    config: params.compatConfig,
+    config: params.config,
     pluginIds: params.pluginIds,
   });
   if (params.loadModules) {
@@ -404,10 +405,11 @@ describe("plugin status reports", () => {
     loadPluginManifestRegistryForPluginRegistryMock.mockReset();
     loadPluginRegistrySnapshotWithMetadataMock.mockReset();
     loadPluginManifestRegistryForInstalledIndexMock.mockReset();
+    isPluginMetadataSnapshotCompatibleMock.mockReset();
+    isPluginMetadataSnapshotCompatibleMock.mockReturnValue(true);
     loadPluginMetadataSnapshotMock.mockClear();
     applyPluginAutoEnableMock.mockReset();
     resolveBundledProviderCompatPluginIdsMock.mockReset();
-    withBundledPluginAllowlistCompatMock.mockReset();
     withBundledPluginEnablementCompatMock.mockReset();
     listImportedBundledPluginFacadeIdsMock.mockReset();
     listImportedRuntimePluginIdsMock.mockReset();
@@ -431,9 +433,6 @@ describe("plugin status reports", () => {
       autoEnabledReasons: {},
     }));
     resolveBundledProviderCompatPluginIdsMock.mockReturnValue([]);
-    withBundledPluginAllowlistCompatMock.mockImplementation(
-      (params: { config: unknown }) => params.config,
-    );
     withBundledPluginEnablementCompatMock.mockImplementation(
       (params: { config: unknown }) => params.config,
     );
@@ -597,10 +596,9 @@ describe("plugin status reports", () => {
   });
 
   it("applies the full bundled provider compat chain before loading plugins", () => {
-    const { config, pluginIds, compatConfig, enabledConfig } = createCompatChainFixture();
+    const { config, pluginIds, enabledConfig } = createCompatChainFixture();
     loadConfigMock.mockReturnValue(config);
     resolveBundledProviderCompatPluginIdsMock.mockReturnValue(pluginIds);
-    withBundledPluginAllowlistCompatMock.mockReturnValue(compatConfig);
     withBundledPluginEnablementCompatMock.mockReturnValue(enabledConfig);
 
     buildPluginSnapshotReport({ config });
@@ -608,7 +606,6 @@ describe("plugin status reports", () => {
     expectBundledCompatChainApplied({
       config,
       pluginIds,
-      compatConfig,
       enabledConfig,
       loadModules: false,
     });
@@ -772,7 +769,10 @@ describe("plugin status reports", () => {
     expect(inspect.map((entry) => entry.plugin.id)).toEqual(["lca", "microsoft"]);
     expect(inspect.map((entry) => entry.shape)).toEqual(["hook-only", "hybrid-capability"]);
     expect(inspect[0]?.usesLegacyBeforeAgentStart).toBe(true);
-    expectCapabilityKinds(inspect[1], ["text-inference", "web-search"]);
+    expectCapabilityKinds(expectDefined(inspect[1], "inspect[1] test invariant"), [
+      "text-inference",
+      "web-search",
+    ]);
   });
 
   it("treats a CLI-command-only plugin as a plain capability", () => {
@@ -836,6 +836,127 @@ describe("plugin status reports", () => {
     expectCompatibilityOutput({
       warnings: [`lca ${LEGACY_BEFORE_AGENT_START_MESSAGE}`, `lca ${HOOK_ONLY_MESSAGE}`],
     });
+  });
+
+  it("warns external plugins off deprecated memory embedding provider registration", () => {
+    setSinglePluginLoadResult(
+      createPluginRecord({
+        id: "legacy-memory-provider",
+        name: "Legacy Memory Provider",
+        memoryEmbeddingProviderIds: ["legacy-memory-provider"],
+        contracts: { memoryEmbeddingProviders: ["legacy-memory-provider"] },
+      }),
+    );
+
+    expectCompatibilityOutput({
+      notices: [
+        createCompatibilityNotice({
+          pluginId: "legacy-memory-provider",
+          code: "deprecated-memory-embedding-provider-api",
+        }),
+      ],
+      warnings: [`legacy-memory-provider ${DEPRECATED_MEMORY_EMBEDDING_PROVIDER_API_MESSAGE}`],
+    });
+  });
+
+  it("warns when external plugins register memory embedding providers at runtime only", () => {
+    const runtimeProviderRegistration: PluginMemoryEmbeddingProviderRegistration = {
+      pluginId: "runtime-only-legacy-memory-provider",
+      pluginName: "Runtime Only Legacy Memory Provider",
+      provider: {
+        id: "runtime-only-legacy-memory-provider",
+        create: async () => ({ provider: null }),
+      },
+      source: "/tmp/runtime-only-legacy-memory-provider/index.ts",
+    };
+    setPluginLoadResult({
+      plugins: [
+        createPluginRecord({
+          id: "runtime-only-legacy-memory-provider",
+          name: "Runtime Only Legacy Memory Provider",
+        }),
+      ],
+      memoryEmbeddingProviders: [runtimeProviderRegistration],
+    });
+
+    expectCompatibilityOutput({
+      notices: [
+        createCompatibilityNotice({
+          pluginId: "runtime-only-legacy-memory-provider",
+          code: "deprecated-memory-embedding-provider-api",
+        }),
+      ],
+      warnings: [
+        `runtime-only-legacy-memory-provider ${DEPRECATED_MEMORY_EMBEDDING_PROVIDER_API_MESSAGE}`,
+      ],
+    });
+  });
+
+  it("does not surface bundled memory embedding migration debt as user warnings", () => {
+    setSinglePluginLoadResult(
+      createPluginRecord({
+        id: "bundled-memory-provider",
+        name: "Bundled Memory Provider",
+        origin: "bundled",
+        memoryEmbeddingProviderIds: ["bundled-memory-provider"],
+        contracts: { memoryEmbeddingProviders: ["bundled-memory-provider"] },
+      }),
+    );
+
+    expectNoCompatibilityWarnings();
+  });
+
+  it("warns external plugins when load diagnostics reference removed session file APIs", () => {
+    setPluginLoadResult({
+      plugins: [
+        createPluginRecord({
+          id: "file-backed-session-plugin",
+          name: "File-backed Session Plugin",
+          error: "The requested module does not provide an export named 'saveSessionStore'",
+          status: "error",
+        }),
+      ],
+      diagnostics: [
+        {
+          level: "error",
+          pluginId: "file-backed-session-plugin",
+          message: "Plugin import failed before SessionTranscriptUpdate.sessionFile migration",
+        },
+      ],
+    });
+
+    expectCompatibilityOutput({
+      notices: [
+        createCompatibilityNotice({
+          pluginId: "file-backed-session-plugin",
+          code: "removed-session-transcript-file-api",
+        }),
+      ],
+      warnings: [`file-backed-session-plugin ${REMOVED_SESSION_TRANSCRIPT_FILE_API_MESSAGE}`],
+    });
+  });
+
+  it("does not surface bundled session file API migration debt as user warnings", () => {
+    setPluginLoadResult({
+      plugins: [
+        createPluginRecord({
+          id: "bundled-session-plugin",
+          name: "Bundled Session Plugin",
+          origin: "bundled",
+          error: "The requested module does not provide an export named 'sessionFile'",
+          status: "error",
+        }),
+      ],
+      diagnostics: [
+        {
+          level: "error",
+          pluginId: "bundled-session-plugin",
+          message: "resolveSessionFilePath failed to load",
+        },
+      ],
+    });
+
+    expectNoCompatibilityWarnings();
   });
 
   it("builds structured compatibility notices with deterministic ordering", () => {

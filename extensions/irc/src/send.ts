@@ -1,7 +1,8 @@
+// Irc plugin module implements send behavior.
 import {
   createMessageReceiptFromOutboundResults,
   type MessageReceipt,
-} from "openclaw/plugin-sdk/channel-message";
+} from "openclaw/plugin-sdk/channel-outbound";
 import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { convertMarkdownTables } from "openclaw/plugin-sdk/text-chunking";

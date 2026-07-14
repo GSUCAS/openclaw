@@ -1,15 +1,17 @@
+// Qa Lab tests cover harness parity plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   buildHarnessParityCell,
   buildHarnessParityResult,
   type HarnessRuntimeParityCell,
-  type HarnessVariant,
 } from "./harness-parity.js";
 import type { RuntimeId } from "./runtime-parity.js";
 import type { RuntimeParityComparisonMode } from "./runtime-tool-metadata.js";
 
-const LEFT: HarnessVariant = { id: "left", label: "Left", runtime: "pi" };
-const RIGHT: HarnessVariant = { id: "right", label: "Right", runtime: "pi" };
+type HarnessVariant = Parameters<typeof buildHarnessParityCell>[0]["variant"];
+
+const LEFT: HarnessVariant = { id: "left", label: "Left", runtime: "openclaw" };
+const RIGHT: HarnessVariant = { id: "right", label: "Right", runtime: "openclaw" };
 
 const BASE_PROMPT_REPORT = {
   systemPrompt: {
@@ -63,12 +65,12 @@ function classify(
     scenarioId: "scenario",
     left: buildHarnessParityCell({
       variant: LEFT,
-      cell: makeCell("pi", left),
+      cell: makeCell("openclaw", left),
       tokenUsageSource: "live-usage",
     }),
     right: buildHarnessParityCell({
       variant: RIGHT,
-      cell: makeCell("pi", right),
+      cell: makeCell("openclaw", right),
       tokenUsageSource: "live-usage",
     }),
     ...(comparisonMode ? { comparisonMode } : {}),
@@ -181,7 +183,7 @@ describe("harness parity", () => {
       classify(
         {
           transcriptBytes:
-            '{"type":"model_change","modelId":"gpt-5.5"}\n' +
+            '{"type":"model_change","modelId":"gpt-5.6-luna"}\n' +
             '{"type":"thinking_level_change","thinkingLevel":"off"}\n' +
             '{"type":"custom","customType":"model-snapshot"}\n' +
             '{"message":{"role":"assistant","content":"same"}}\n',
@@ -266,7 +268,7 @@ describe("harness parity", () => {
   });
 
   it("labels mock token estimates separately from live usage", () => {
-    const sourceCell = makeCell("pi", {
+    const sourceCell = makeCell("openclaw", {
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     });
     const cell = buildHarnessParityCell({

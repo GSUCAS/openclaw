@@ -1,3 +1,4 @@
+// Feishu plugin module implements comment dispatcher behavior.
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
@@ -44,7 +45,7 @@ export function createFeishuCommentReplyDispatcher(
       fallbackLimit: 4000,
     },
   );
-  const chunkMode = core.channel.text.resolveChunkMode(params.cfg, "feishu");
+  const chunkMode = core.channel.text.resolveChunkMode(params.cfg, "feishu", params.accountId);
   const typingReaction = createCommentTypingReactionLifecycle({
     cfg: params.cfg,
     fileToken: params.fileToken,

@@ -1,8 +1,9 @@
+// OC Path module implements parse behavior.
 import { type ParseError, parseTree, printParseErrorCode } from "jsonc-parser/lib/esm/main.js";
 import type { Diagnostic } from "../ast.js";
 import type { JsoncAst, JsoncEntry, JsoncValue } from "./ast.js";
 
-export const MAX_PARSE_DEPTH = 256;
+const MAX_PARSE_DEPTH = 256;
 
 /**
  * Hard cap on jsonc input size. `parseTree` is iterative and stack-safe
@@ -18,11 +19,11 @@ export const MAX_PARSE_DEPTH = 256;
  * by patching this constant — no SDK affordance because it isn't a
  * supported configuration.
  */
-export const MAX_JSONC_INPUT_BYTES = 16 * 1024 * 1024;
+const MAX_JSONC_INPUT_BYTES = 16 * 1024 * 1024;
 const JSONC_PARSE_INVALID_SYMBOL = 1;
 const JSONC_PARSE_END_OF_FILE_EXPECTED = 9;
 
-export interface JsoncParseResult {
+interface JsoncParseResult {
   readonly ast: JsoncAst;
   readonly diagnostics: readonly Diagnostic[];
 }
@@ -184,5 +185,3 @@ function createLineMap(raw: string): LineMap {
     },
   };
 }
-
-export type { Diagnostic };

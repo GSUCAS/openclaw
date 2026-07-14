@@ -1,7 +1,9 @@
+// Line tests cover channel.sendPayload plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
 import {
   verifyChannelMessageAdapterCapabilityProofs,
   verifyChannelMessageReceiveAckPolicyAdapterProofs,
-} from "openclaw/plugin-sdk/channel-message";
+} from "openclaw/plugin-sdk/channel-outbound";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime } from "../api.js";
 import { linePlugin } from "./channel.js";
@@ -158,6 +160,31 @@ describe("line outbound sendPayload", () => {
       accountId: "default",
       cfg,
     });
+  });
+
+  it("reports each platform result for text and media payloads", async () => {
+    const { runtime } = createRuntime();
+    setLineRuntime(runtime);
+    const cfg = { channels: { line: {} } } as OpenClawConfig;
+    const onDeliveryResult = vi.fn();
+
+    await lineOutboundAdapter.sendPayload!({
+      to: "line:user:progress",
+      text: "Hello",
+      payload: {
+        text: "Hello",
+        mediaUrl: "https://example.com/image.jpg",
+      },
+      accountId: "default",
+      cfg,
+      onDeliveryResult,
+    });
+
+    expect(onDeliveryResult).toHaveBeenCalledTimes(2);
+    expect(onDeliveryResult.mock.calls.map(([result]) => result.messageId)).toEqual([
+      "m-text",
+      "m-media",
+    ]);
   });
 
   it("sends template message without dropping text", async () => {
@@ -342,7 +369,9 @@ describe("line outbound sendPayload", () => {
     );
     const mediaOrder = mocks.sendMessageLine.mock.invocationCallOrder[0];
     const quickReplyOrder = mocks.pushTextMessageWithQuickReplies.mock.invocationCallOrder[0];
-    expect(mediaOrder).toBeLessThan(quickReplyOrder);
+    expect(expectDefined(mediaOrder, "LINE media invocation")).toBeLessThan(
+      expectDefined(quickReplyOrder, "LINE quick-reply invocation"),
+    );
   });
 
   it("keeps generic media payloads on the image-only send path", async () => {

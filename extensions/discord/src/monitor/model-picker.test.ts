@@ -1,3 +1,4 @@
+// Discord tests cover model picker plugin behavior.
 import { ComponentType } from "discord-api-types/v10";
 import { describe, expect, it, vi } from "vitest";
 import { serializePayload } from "../internal/discord.js";
@@ -10,6 +11,7 @@ import {
   DISCORD_MODEL_PICKER_PROVIDER_SINGLE_PAGE_MAX,
   buildDiscordModelPickerCustomId,
   computeAlphaBuckets,
+  createDiscordModelPickerModelToken,
   getDiscordModelPickerModelPage,
   getDiscordModelPickerProviderPage,
   findProviderBucketId,
@@ -17,12 +19,14 @@ import {
   loadDiscordModelPickerData,
   parseDiscordModelPickerCustomId,
   parseDiscordModelPickerData,
+} from "./model-picker.state.js";
+import { createModelsProviderData } from "./model-picker.test-utils.js";
+import {
   renderDiscordModelPickerModelsView,
   renderDiscordModelPickerProvidersView,
   renderDiscordModelPickerRecentsView,
   toDiscordModelPickerMessagePayload,
-} from "./model-picker.js";
-import { createModelsProviderData } from "./model-picker.test-utils.js";
+} from "./model-picker.view.js";
 
 const buildModelsProviderDataMock = vi.hoisted(() => vi.fn());
 
@@ -160,6 +164,34 @@ describe("Discord model picker custom_id", () => {
     });
   });
 
+  it("parses plus-signed compact numeric fields", () => {
+    const parsed = parseDiscordModelPickerData({
+      c: "models",
+      a: "submit",
+      v: "recents",
+      u: "42",
+      p: "openai",
+      g: "+03",
+      pp: "+02",
+      mi: "+07",
+      ri: "+04",
+      rs: "+01",
+    });
+
+    expect(parsed).toEqual({
+      command: "models",
+      action: "submit",
+      view: "recents",
+      userId: "42",
+      provider: "openai",
+      page: 3,
+      providerPage: 2,
+      modelIndex: 7,
+      runtimeIndex: 4,
+      recentSlot: 1,
+    });
+  });
+
   it("parses optional submit model index", () => {
     const parsed = parseDiscordModelPickerData({
       cmd: "models",
@@ -181,6 +213,27 @@ describe("Discord model picker custom_id", () => {
       runtime: "codex",
       page: 1,
       modelIndex: 7,
+    });
+  });
+
+  it("does not coerce partial numeric custom_id fields", () => {
+    expect(
+      parseDiscordModelPickerData({
+        cmd: "models",
+        act: "submit",
+        view: "models",
+        u: "42",
+        p: "openai",
+        pg: "3next",
+        mi: "7model",
+      }),
+    ).toEqual({
+      command: "models",
+      action: "submit",
+      view: "models",
+      userId: "42",
+      provider: "openai",
+      page: 1,
     });
   });
 
@@ -226,6 +279,7 @@ describe("Discord model picker custom_id", () => {
   });
 
   it("keeps typical submit ids under Discord max length", () => {
+    const modelToken = createDiscordModelPickerModelToken("azure-openai-responses", "gpt-5.5");
     const customId = buildDiscordModelPickerCustomId({
       command: "models",
       action: "submit",
@@ -234,10 +288,14 @@ describe("Discord model picker custom_id", () => {
       page: 1,
       providerPage: 1,
       modelIndex: 10,
+      modelToken,
       userId: "12345678901234567890",
     });
 
     expect(customId.length).toBeLessThanOrEqual(DISCORD_CUSTOM_ID_MAX_CHARS);
+    const parsed = parseDiscordModelPickerCustomId(customId);
+    expect(parsed?.modelToken).toBe(modelToken);
+    expect(parsed?.modelIndex).toBeUndefined();
   });
 });
 
@@ -613,9 +671,9 @@ describe("Discord model picker rendering", () => {
               "Use the Google Gemini CLI runtime selected by the effective harness policy.",
           },
           {
-            id: "pi",
-            label: "OpenClaw Pi Default",
-            description: "Use the built-in OpenClaw Pi runtime.",
+            id: "openclaw",
+            label: "OpenClaw Default",
+            description: "Use the built-in OpenClaw runtime.",
           },
         ],
       ],
@@ -666,9 +724,9 @@ describe("Discord model picker rendering", () => {
               "Use the Google Gemini CLI runtime selected by the effective harness policy.",
           },
           {
-            id: "pi",
-            label: "OpenClaw Pi Default",
-            description: "Use the built-in OpenClaw Pi runtime.",
+            id: "openclaw",
+            label: "OpenClaw Default",
+            description: "Use the built-in OpenClaw runtime.",
           },
         ],
       ],
@@ -983,7 +1041,8 @@ describe("Discord model picker rendering", () => {
     const submitState = parseDiscordModelPickerCustomId(navButtons[3]?.custom_id ?? "");
     expect(submitState?.action).toBe("submit");
     expect(submitState?.provider).toBe("openai");
-    expect(submitState?.modelIndex).toBe(3);
+    expect(submitState?.modelIndex).toBeUndefined();
+    expect(submitState?.modelToken).toBe(createDiscordModelPickerModelToken("openai", "o3"));
   });
 
   it("defaults the runtime picker to the first effective runtime choice", () => {
@@ -1001,9 +1060,9 @@ describe("Discord model picker rendering", () => {
             description: "Use the OpenAI Codex runtime selected by the effective harness policy.",
           },
           {
-            id: "pi",
-            label: "OpenClaw Pi Default",
-            description: "Use the built-in OpenClaw Pi runtime.",
+            id: "openclaw",
+            label: "OpenClaw Default",
+            description: "Use the built-in OpenClaw runtime.",
           },
         ],
       ],
@@ -1029,7 +1088,9 @@ describe("Discord model picker rendering", () => {
       throw new Error("models view did not render a runtime select");
     }
     expect(runtimeSelect.options?.find((option) => option.value === "codex")?.default).toBe(true);
-    expect(runtimeSelect.options?.find((option) => option.value === "pi")?.default).toBe(false);
+    expect(runtimeSelect.options?.find((option) => option.value === "openclaw")?.default).toBe(
+      false,
+    );
 
     const modelSelect = rows[2]?.components?.find(
       (component) => component.type === DISCORD_STRING_SELECT_COMPONENT_TYPE,
@@ -1041,7 +1102,8 @@ describe("Discord model picker rendering", () => {
     const submitState = parseDiscordModelPickerCustomId(navButtons.at(-1)?.custom_id ?? "");
     expect(submitState?.action).toBe("submit");
     expect(submitState?.runtime).toBeUndefined();
-    expect(submitState?.modelIndex).toBe(3);
+    expect(submitState?.modelIndex).toBeUndefined();
+    expect(submitState?.modelToken).toBe(createDiscordModelPickerModelToken("openai", "o3"));
   });
 
   it("carries only explicit runtime picker state into model submit ids", () => {
@@ -1058,9 +1120,9 @@ describe("Discord model picker rendering", () => {
             description: "Use the OpenAI Codex runtime selected by the effective harness policy.",
           },
           {
-            id: "pi",
-            label: "OpenClaw Pi Default",
-            description: "Use the built-in OpenClaw Pi runtime.",
+            id: "openclaw",
+            label: "OpenClaw Default",
+            description: "Use the built-in OpenClaw runtime.",
           },
         ],
       ],
@@ -1074,7 +1136,7 @@ describe("Discord model picker rendering", () => {
       currentModel: "openai/gpt-4.1",
       pendingModel: "openai/gpt-4o",
       pendingModelIndex: 2,
-      pendingRuntime: "pi",
+      pendingRuntime: "openclaw",
     });
 
     const modelSelect = rows[2]?.components?.find(
@@ -1232,7 +1294,7 @@ describe("Discord model picker recents view", () => {
     });
     expect(rows).toHaveLength(4);
 
-    // First row: default model button (slot 1).
+    // First row: default model button.
     const defaultBtn = requireValue(
       rows[0]?.components?.[0],
       "recents view should render a default model button",
@@ -1244,9 +1306,10 @@ describe("Discord model picker recents view", () => {
     );
     expect(defaultState.action).toBe("submit");
     expect(defaultState.view).toBe("recents");
-    expect(defaultState.recentSlot).toBe(1);
+    expect(defaultState.recentSlot).toBeUndefined();
+    expect(defaultState.modelToken).toBe(createDiscordModelPickerModelToken("openai", "gpt-4.1"));
 
-    // Second row: first recent (slot 2).
+    // Second row: first recent.
     const recentBtn1 = requireValue(
       rows[1]?.components?.[0],
       "recents view should render first recent button",
@@ -1255,9 +1318,10 @@ describe("Discord model picker recents view", () => {
       parseDiscordModelPickerCustomId(recentBtn1.custom_id ?? ""),
       "first recent custom id should parse",
     );
-    expect(recentState1.recentSlot).toBe(2);
+    expect(recentState1.recentSlot).toBeUndefined();
+    expect(recentState1.modelToken).toBe(createDiscordModelPickerModelToken("openai", "gpt-4o"));
 
-    // Third row: second recent (slot 3).
+    // Third row: second recent.
     const recentBtn2 = requireValue(
       rows[2]?.components?.[0],
       "recents view should render second recent button",
@@ -1266,7 +1330,10 @@ describe("Discord model picker recents view", () => {
       parseDiscordModelPickerCustomId(recentBtn2.custom_id ?? ""),
       "second recent custom id should parse",
     );
-    expect(recentState2.recentSlot).toBe(3);
+    expect(recentState2.recentSlot).toBeUndefined();
+    expect(recentState2.modelToken).toBe(
+      createDiscordModelPickerModelToken("anthropic", "claude-sonnet-4-5"),
+    );
 
     // Fourth row (after divider): Back button.
     const backBtn = requireValue(

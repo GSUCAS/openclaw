@@ -1,3 +1,4 @@
+// Memory Wiki tests cover query plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +7,7 @@ import type { OpenClawConfig } from "../api.js";
 import { compileMemoryWikiVault } from "./compile.js";
 import type { MemoryWikiPluginConfig } from "./config.js";
 import { renderWikiMarkdown } from "./markdown.js";
-import { getMemoryWikiPage, isSessionMemoryPath, searchMemoryWiki } from "./query.js";
+import { getMemoryWikiPage, searchMemoryWiki } from "./query.js";
 import { createMemoryWikiTestHarness } from "./test-helpers.js";
 
 const {
@@ -163,8 +164,16 @@ function createMemoryManager(overrides?: {
   };
 }
 
-describe("isSessionMemoryPath", () => {
-  it("classifies all current session storage layouts", () => {
+describe("getMemoryWikiPage", () => {
+  it("enforces visibility for all current session storage layouts", async () => {
+    const { config } = await createQueryVault({
+      initialize: true,
+      config: { search: { backend: "shared", corpus: "memory" } },
+    });
+    const manager = createMemoryManager({
+      readResult: { path: "MEMORY.md", text: "memory" },
+    });
+    getActiveMemorySearchManagerMock.mockResolvedValue({ manager });
     for (const relPath of [
       "sessions/child-session.jsonl",
       "qmd/sessions/child-session.md",
@@ -172,7 +181,15 @@ describe("isSessionMemoryPath", () => {
       "qmd\\sessions-main\\child-session.md",
       "qmd/sessions",
     ]) {
-      expect(isSessionMemoryPath(relPath)).toBe(true);
+      loadCombinedSessionStoreForGatewayMock.mockClear();
+      await getMemoryWikiPage({
+        config,
+        appConfig: createSessionVisibilityAppConfig(),
+        agentSessionKey: "agent:main:child-session",
+        sandboxed: true,
+        lookup: relPath,
+      });
+      expect(loadCombinedSessionStoreForGatewayMock).toHaveBeenCalled();
     }
 
     for (const relPath of [
@@ -181,7 +198,15 @@ describe("isSessionMemoryPath", () => {
       "wiki/sessions/foo.md",
       "wiki\\sessions\\foo.md",
     ]) {
-      expect(isSessionMemoryPath(relPath)).toBe(false);
+      loadCombinedSessionStoreForGatewayMock.mockClear();
+      await getMemoryWikiPage({
+        config,
+        appConfig: createSessionVisibilityAppConfig(),
+        agentSessionKey: "agent:main:child-session",
+        sandboxed: true,
+        lookup: relPath,
+      });
+      expect(loadCombinedSessionStoreForGatewayMock).not.toHaveBeenCalled();
     }
   });
 });
@@ -206,6 +231,61 @@ describe("searchMemoryWiki", () => {
     expect(results[0]?.corpus).toBe("wiki");
     expect(results[0]?.path).toBe("sources/alpha.md");
     expect(getActiveMemorySearchManagerMock).not.toHaveBeenCalled();
+  });
+
+  it("skips malformed pages while searching the rest of the vault (#96125)", async () => {
+    const { rootDir, config } = await createQueryVault({ initialize: true });
+    await fs.writeFile(
+      path.join(rootDir, "sources", "broken.md"),
+      [
+        "---",
+        "pageType: source",
+        "id: source.broken",
+        "sourceIds:",
+        '  - **MEMORY.md line 235**:"some quoted, value"',
+        "---",
+        "",
+        "# Broken",
+        "",
+        "poison needle",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "sources", "healthy.md"),
+      renderWikiMarkdown({
+        frontmatter: { pageType: "source", id: "source.healthy", title: "Healthy Source" },
+        body: "# Healthy Source\n\nhealthy needle\n",
+      }),
+      "utf8",
+    );
+
+    const results = await searchMemoryWiki({ config, query: "needle" });
+
+    expect(collectWikiResultPaths(results)).toEqual(["sources/healthy.md"]);
+  });
+
+  it("uses the default search limit for non-finite maxResults", async () => {
+    const { rootDir, config } = await createQueryVault({
+      initialize: true,
+    });
+    await fs.writeFile(
+      path.join(rootDir, "sources", "alpha.md"),
+      renderWikiMarkdown({
+        frontmatter: { pageType: "source", id: "source.alpha", title: "Alpha Source" },
+        body: "# Alpha Source\n\nalpha body text\n",
+      }),
+      "utf8",
+    );
+
+    const results = await searchMemoryWiki({
+      config,
+      query: "alpha",
+      maxResults: Number.NaN,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.path).toBe("sources/alpha.md");
   });
 
   it("does not match generated related blocks during wiki search", async () => {
@@ -660,6 +740,31 @@ describe("searchMemoryWiki", () => {
     });
   });
 
+  it("reports a contract error when the shared manager lacks search()", async () => {
+    const { config } = await createQueryVault({
+      initialize: true,
+      config: {
+        search: { backend: "shared", corpus: "all" },
+      },
+    });
+    // Partial manager as registered by @mem0/openclaw-mem0 <= 1.0.14.
+    const partialManager = {
+      status: vi.fn().mockReturnValue({ backend: "builtin", provider: "builtin" }),
+      probeEmbeddingAvailability: vi.fn().mockResolvedValue({ ok: true }),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    getActiveMemorySearchManagerMock.mockResolvedValue({ manager: partialManager });
+
+    await expect(
+      searchMemoryWiki({
+        config,
+        appConfig: createAppConfig(),
+        query: "alpha",
+        maxResults: 5,
+      }),
+    ).rejects.toThrow("does not implement search() from the MemorySearchManager contract");
+  });
+
   it("includes memory results and backfills wiki capacity for all-corpus search", async () => {
     const { rootDir, config } = await createQueryVault({
       initialize: true,
@@ -1043,6 +1148,35 @@ describe("searchMemoryWiki", () => {
     ]);
   });
 
+  it("discovers pages in nested subdirectories", async () => {
+    const { rootDir, config } = await createQueryVault({
+      initialize: true,
+    });
+    await fs.mkdir(path.join(rootDir, "sources", "sub"), { recursive: true });
+    await fs.writeFile(
+      path.join(rootDir, "sources", "top.md"),
+      renderWikiMarkdown({
+        frontmatter: { pageType: "source", id: "source.top", title: "Top Source" },
+        body: "# Top Source\n",
+      }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "sources", "sub", "nested.md"),
+      renderWikiMarkdown({
+        frontmatter: { pageType: "source", id: "source.nested", title: "Nested Source" },
+        body: "# Nested Source\n",
+      }),
+      "utf8",
+    );
+
+    const results = await searchMemoryWiki({ config, query: "Source" });
+
+    expect(results).toHaveLength(2);
+    const paths = results.map((r) => r.path).toSorted();
+    expect(paths).toEqual(["sources/sub/nested.md", "sources/top.md"]);
+  });
+
   it("drops gateway-style owner-qualified session hits that collide with the scoped store", async () => {
     const { config } = await createQueryVault({
       initialize: true,
@@ -1311,6 +1445,32 @@ describe("getMemoryWikiPage", () => {
     expect(result?.truncated).toBe(true);
   });
 
+  it("defaults non-finite wiki line options before slicing", async () => {
+    const { rootDir, config } = await createQueryVault({
+      initialize: true,
+    });
+    await fs.writeFile(
+      path.join(rootDir, "sources", "alpha.md"),
+      renderWikiMarkdown({
+        frontmatter: { pageType: "source", id: "source.alpha", title: "Alpha Source" },
+        body: "# Alpha Source\n\nline one\nline two\n",
+      }),
+      "utf8",
+    );
+
+    const result = await getMemoryWikiPage({
+      config,
+      lookup: "sources/alpha.md",
+      fromLine: Number.NaN,
+      lineCount: Number.POSITIVE_INFINITY,
+    });
+
+    expect(result?.corpus).toBe("wiki");
+    expect(result?.content).toContain("line one");
+    expect(result?.fromLine).toBe(1);
+    expect(result?.lineCount).toBe(200);
+  });
+
   it("resolves compiled claim ids back to the owning page", async () => {
     const { rootDir, config } = await createQueryVault({
       initialize: true,
@@ -1426,6 +1586,60 @@ describe("getMemoryWikiPage", () => {
       relPath: "MEMORY.md",
       from: 2,
       lines: 2,
+    });
+  });
+
+  it("reports a contract error when the shared manager lacks readFile()", async () => {
+    const { config } = await createQueryVault({
+      initialize: true,
+      config: {
+        search: { backend: "shared", corpus: "memory" },
+      },
+    });
+    const partialManager = {
+      search: vi.fn().mockResolvedValue([]),
+      status: vi.fn().mockReturnValue({ backend: "builtin", provider: "builtin" }),
+    };
+    getActiveMemorySearchManagerMock.mockResolvedValue({ manager: partialManager });
+
+    await expect(
+      getMemoryWikiPage({
+        config,
+        appConfig: createAppConfig(),
+        lookup: "MEMORY.md",
+      }),
+    ).rejects.toThrow("does not implement readFile() from the MemorySearchManager contract");
+  });
+
+  it("defaults non-finite memory line options before memory reads", async () => {
+    const { config } = await createQueryVault({
+      initialize: true,
+      config: {
+        search: { backend: "shared", corpus: "memory" },
+      },
+    });
+    const manager = createMemoryManager({
+      readResult: {
+        path: "MEMORY.md",
+        text: "durable alpha memory",
+      },
+    });
+    getActiveMemorySearchManagerMock.mockResolvedValue({ manager });
+
+    const result = await getMemoryWikiPage({
+      config,
+      appConfig: createAppConfig(),
+      lookup: "MEMORY.md",
+      fromLine: Number.NaN,
+      lineCount: Number.POSITIVE_INFINITY,
+    });
+
+    expect(result?.fromLine).toBe(1);
+    expect(result?.lineCount).toBe(200);
+    expect(manager.readFile).toHaveBeenCalledWith({
+      relPath: "MEMORY.md",
+      from: 1,
+      lines: 200,
     });
   });
 

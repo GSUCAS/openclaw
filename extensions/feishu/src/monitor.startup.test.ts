@@ -1,7 +1,10 @@
+// Feishu tests cover monitor.startup plugin behavior.
 import { createNonExitingRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
-import { monitorFeishuProvider, stopFeishuMonitor } from "./monitor.js";
+import { resolveStartupProbeTimeoutMs } from "./monitor-startup-timeout.js";
+import { cleanupFeishuMonitorStateForTests } from "./monitor.cleanup.test-helpers.js";
+import { monitorFeishuProvider } from "./monitor.js";
 
 const probeFeishuMock = vi.hoisted(() => vi.fn());
 
@@ -16,6 +19,10 @@ vi.mock("./client.js", async () => {
 vi.mock("./runtime.js", async () => {
   const { createFeishuRuntimeMockModule } = await import("./monitor.test-mocks.js");
   return createFeishuRuntimeMockModule();
+});
+
+beforeAll(async () => {
+  await import("./monitor.account.js");
 });
 
 function buildMultiAccountWebsocketConfig(accountIds: string[]): ClawdbotConfig {
@@ -49,7 +56,7 @@ async function waitForStartedAccount(started: string[], accountId: string) {
 }
 
 afterEach(() => {
-  stopFeishuMonitor();
+  cleanupFeishuMonitorStateForTests();
 });
 
 afterAll(() => {
@@ -60,6 +67,19 @@ afterAll(() => {
 });
 
 describe("Feishu monitor startup preflight", () => {
+  it("parses startup probe timeout env strictly", () => {
+    expect(resolveStartupProbeTimeoutMs({})).toBe(30_000);
+    expect(
+      resolveStartupProbeTimeoutMs({ OPENCLAW_FEISHU_STARTUP_PROBE_TIMEOUT_MS: "90000" }),
+    ).toBe(90_000);
+
+    for (const value of ["0x10", "1e3", "10.5"]) {
+      expect(
+        resolveStartupProbeTimeoutMs({ OPENCLAW_FEISHU_STARTUP_PROBE_TIMEOUT_MS: value }),
+      ).toBe(30_000);
+    }
+  });
+
   it("starts account probes sequentially to avoid startup bursts", async () => {
     let inFlight = 0;
     let maxInFlight = 0;

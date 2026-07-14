@@ -1,10 +1,33 @@
+// Defines user-facing config field help text for docs and UI surfaces.
 import { MEDIA_AUDIO_FIELD_HELP } from "./media-audio-field-metadata.js";
+import { NODE_CAPABILITY_FIELD_HELP } from "./schema.node-capabilities.js";
 import { describeTalkSilenceTimeoutDefaults } from "./talk-defaults.js";
-
 export const FIELD_HELP: Record<string, string> = {
   meta: "Metadata fields automatically maintained by OpenClaw to record write/version history for this config file. Keep these values system-managed and avoid manual edits unless debugging migration history.",
   "meta.lastTouchedVersion": "Auto-set when OpenClaw writes the config.",
   "meta.lastTouchedAt": "ISO timestamp of the last config write (auto-set).",
+  marketplaces:
+    "Marketplace feed and local package source profile settings. Feeds provide package selection and governance metadata, while sources define the local source names that install candidates may reference.",
+  "marketplaces.feeds":
+    "Named marketplace feed profiles. The default public profile can be used as shipped, and deployments can add or override profiles to point OpenClaw at their effective feed endpoint.",
+  "marketplaces.feeds.*.url":
+    "HTTPS URL for the marketplace feed profile. Remote feed documents cannot introduce new registry domains or credentials; they only reference locally configured sources by name.",
+  "marketplaces.feeds.*.verification":
+    "Feed authenticity policy. Use unsigned only as an explicit local opt-in for self-hosted feeds. Use signed to name locally trusted publisher public keys before refresh enforcement consumes verified envelopes.",
+  "marketplaces.feeds.*.verification.mode":
+    'Feed verification mode: "unsigned" for explicit unsigned opt-in, or "signed" for local direct-key verification once refresh enforcement is wired.',
+  "marketplaces.feeds.*.verification.keys":
+    "Trusted publisher public keys for signed feed envelopes. These non-secret local trust anchors belong in source-profile config; remote feed documents cannot introduce or rotate them by themselves.",
+  "marketplaces.feeds.*.verification.keys[].keyId":
+    "Stable publisher key identifier expected in a signed feed envelope signature.",
+  "marketplaces.feeds.*.verification.keys[].publicKey":
+    "Ed25519 publisher public key for feed envelope verification, encoded as PEM or raw base64url. Feed signing private keys are publisher-side secrets managed outside this config; do not reuse platform signing identities or certificates here.",
+  "marketplaces.feeds.*.verification.threshold":
+    "Optional number of trusted signatures required for a signed feed. Defaults to one in the later refresh enforcement slice.",
+  "marketplaces.sources":
+    "Named package source profiles that feed entries can reference using sourceRef. Keep credentials and registry endpoints local so remote feeds cannot bootstrap trust roots.",
+  "marketplaces.sources.*.type":
+    "Package source profile type: npm, clawhub, or git. This slice validates sourceRef names only; registry and host endpoints are added when installer resolution can enforce them.",
   env: "Environment import and override settings used to supply runtime variables to the gateway process. Use this section to control shell-env loading and explicit variable injection behavior.",
   "env.shellEnv":
     "Shell environment import controls for loading variables from your login shell during startup. Keep this enabled when you depend on profile-defined secrets or PATH customizations.",
@@ -26,6 +49,14 @@ export const FIELD_HELP: Record<string, string> = {
     "Command invocation recorded for the latest wizard run to preserve execution context. Use this to reproduce setup steps when verifying setup regressions.",
   "wizard.lastRunMode":
     'Wizard execution mode recorded as "local" or "remote" for the most recent setup flow. Use this to understand whether setup targeted direct local runtime or remote gateway topology.',
+  "wizard.securityAcknowledgedAt":
+    "ISO timestamp for when the setup security acknowledgement was accepted on this config. Setup uses this to avoid repeating the acknowledgement on later wizard runs.",
+  audit:
+    "Bounded metadata-only audit history for operator review. Run and tool records are enabled by default; message lifecycle metadata is a separate privacy-sensitive opt-in. The background writer is best-effort rather than a lossless compliance archive.",
+  "audit.enabled":
+    "Records new run, tool, and enabled message audit events. Default: true. Disabling event inserts does not immediately delete existing records; retained rows remain queryable until they expire.",
+  "audit.messages":
+    'Controls content-free message lifecycle records: "off" (default), "direct" for known direct conversations only, or "all" for direct, group, channel, and unknown conversation kinds. Both audit.enabled and audit.messages are startup-scoped; restart the Gateway after changing either setting.',
   diagnostics:
     "Diagnostics controls for targeted tracing, telemetry export, and cache inspection during debugging. Keep baseline diagnostics minimal in production and enable deeper signals only when investigating issues.",
   "diagnostics.memoryPressureSnapshot":
@@ -55,14 +86,35 @@ export const FIELD_HELP: Record<string, string> = {
     'Controls tagline style in the CLI startup banner: "random" (default) picks from the rotating tagline pool, "default" always shows the neutral default tagline, and "off" hides tagline text while keeping the banner version line.',
   update:
     "Update-channel and startup-check behavior for keeping OpenClaw runtime versions current. Use conservative channels in production and more experimental channels only in controlled environments.",
-  "update.channel": 'Update channel for git + npm installs ("stable", "beta", or "dev").',
-  "update.checkOnStart": "Check for npm updates when the gateway starts (default: true).",
-  "update.auto.enabled": "Enable background auto-update for package installs (default: false).",
+  "update.channel":
+    'Update channel for git + npm installs ("stable", "extended-stable", "beta", or "dev"). Extended-stable is package-only: installation is foreground-only, with optional read-only startup hints.',
+  "update.checkOnStart":
+    "Check for npm updates when the gateway starts, including read-only extended-stable hints (default: true).",
+  "update.auto.enabled":
+    "Enable background auto-update for stable and beta package installs; extended-stable never auto-applies (default: false).",
   "update.auto.stableDelayHours":
     "Minimum delay before stable-channel auto-apply starts (default: 6).",
   "update.auto.stableJitterHours":
     "Extra stable-channel rollout spread window in hours (default: 12).",
   "update.auto.betaCheckIntervalHours": "How often beta-channel checks run in hours (default: 1).",
+  cloudWorkers:
+    "Opt-in cloud worker profiles for disposable remote environments. When this section is omitted or has no profiles, cloud worker creation remains unavailable and existing gateway/node status behavior is unchanged.",
+  "cloudWorkers.profiles":
+    "Named cloud worker profiles. Each profile selects a worker provider registered by a plugin and carries provider-owned settings plus optional stored lifetime policy.",
+  "cloudWorkers.profiles.*":
+    "One cloud worker profile selected by name when creating an environment. Keep provider credentials in supported references rather than embedding secret material in this block.",
+  "cloudWorkers.profiles.*.provider":
+    "Worker provider id registered by a plugin. The configured plugin must expose this id before the gateway can provision environments from the profile.",
+  "cloudWorkers.profiles.*.install":
+    'Worker installation method: "bundle" (default) transfers the gateway\'s content-hashed installed build and supports released, development, and unreleased versions; "npm" installs the exact gateway version and is available only when that version is released.',
+  "cloudWorkers.profiles.*.settings":
+    "Provider-owned settings validated by the selected plugin. Use SecretRef objects for secret-bearing values; opaque settings do not gain automatic secret resolution.",
+  "cloudWorkers.profiles.*.lifetime":
+    "Stored environment lifetime policy. This first cloud-worker slice records these values as data; automatic idle and maximum-lifetime enforcement lands in later lifecycle work.",
+  "cloudWorkers.profiles.*.lifetime.idleTimeoutMinutes":
+    "Positive inactivity interval in minutes after which later lifecycle policy may reclaim an idle environment. Omit to leave idle cleanup unspecified.",
+  "cloudWorkers.profiles.*.lifetime.maxLifetimeMinutes":
+    "Positive maximum environment lifetime in minutes for later lifecycle enforcement. Omit to leave the maximum lifetime unspecified.",
   gateway:
     "Gateway runtime surface for bind mode, auth, control UI, remote transport, and operational safety controls. Keep conservative defaults unless you intentionally expose the gateway beyond trusted local interfaces.",
   "gateway.port":
@@ -70,13 +122,21 @@ export const FIELD_HELP: Record<string, string> = {
   "gateway.mode":
     'Gateway operation mode: "local" runs channels and agent runtime on this host, while "remote" connects through remote transport. Keep "local" unless you intentionally run a split remote gateway topology.',
   "gateway.bind":
-    'Network bind profile: "auto", "lan", "loopback", "custom", or "tailnet" to control interface exposure. Keep "loopback" or "auto" for safest local operation unless external clients must connect.',
+    'Network bind profile: "auto", "lan", "loopback", "custom", or "tailnet" to control interface exposure. Keep "loopback" for local-only operation; "auto" can expose all interfaces.',
   "gateway.customBindHost":
-    "Explicit bind host/IP used when gateway.bind is set to custom for manual interface targeting. Use a precise address and avoid wildcard binds unless external exposure is required.",
+    "IPv4 address used for a custom bind. Specific IPv4s also require the same Gateway port on 127.0.0.1; avoid 0.0.0.0 unless all-interface exposure is required.",
   "gateway.controlUi":
     "Control UI hosting settings including enablement, pathing, and browser-origin/auth hardening behavior. Keep UI exposure minimal and pair with strong auth controls before internet-facing deployments.",
   "gateway.controlUi.enabled":
     "Enables serving the gateway Control UI from the gateway HTTP process when true. Keep enabled for local administration, and disable when an external control surface replaces it.",
+  "gateway.terminal":
+    "Operator terminal served to Control UI and mobile clients: a PTY-backed shell on the gateway host, restricted to admin-scope operator sessions. It starts in the target agent's workspace and is refused for fully-sandboxed agents (sandbox.mode 'all') rather than handing back an unconfined host shell.",
+  "gateway.terminal.enabled":
+    "Enables the operator terminal for admin-scope clients when true (default: false). This exposes a browser/mobile shell with the gateway process environment, so enable it only for trusted operator deployments. Changing this restarts the gateway so connected clients reload with the correct terminal availability and content-security policy.",
+  "gateway.terminal.shell":
+    "Shell executable the operator terminal launches. Leave unset to use the host login shell ($SHELL on Unix, %ComSpec% on Windows), or pin an explicit interpreter for a consistent operator environment.",
+  "gateway.terminal.detachedSessionTimeoutSeconds":
+    "Seconds a terminal session survives after its connection drops (laptop sleep, page reload), staying reattachable via terminal.attach with its recent output replayed. Set 0 to kill sessions the moment the connection drops. Default: 300 (5 minutes). Detached sessions keep running their commands, so shorten this on shared or exposed hosts.",
   "gateway.auth":
     "Authentication policy for gateway HTTP/WebSocket access including mode, credentials, trusted-proxy behavior, and rate limiting. Keep auth enabled for every non-loopback deployment.",
   "gateway.auth.mode":
@@ -111,6 +171,8 @@ export const FIELD_HELP: Record<string, string> = {
     'Tailscale publish mode: "off", "serve", or "funnel" for private or public exposure paths. Use "serve" for tailnet-only access and "funnel" only when public internet reachability is required.',
   "gateway.tailscale.resetOnExit":
     "Resets Tailscale Serve/Funnel state on gateway exit to avoid stale published routes after shutdown. Keep enabled unless another controller manages publish lifecycle outside the gateway.",
+  "gateway.tailscale.serviceName":
+    'Optional Tailscale Service name for Serve mode, such as "svc:openclaw". The value must use Tailscale\'s svc:<dns-label> format. When set, OpenClaw passes it to tailscale serve --service and reports the derived Service URL.',
   "gateway.tailscale.preserveFunnel":
     "When mode='serve' and an externally configured Tailscale Funnel route already covers the gateway port, skip re-applying tailscale serve on startup. Lets operators keep Funnel exposure managed outside OpenClaw without losing it across gateway restarts.",
   "gateway.remote":
@@ -149,6 +211,8 @@ export const FIELD_HELP: Record<string, string> = {
   "gateway.remote.sshTarget":
     "Remote gateway over SSH (tunnels the gateway port to localhost). Format: user@host or user@host:port.",
   "gateway.remote.sshIdentity": "Optional SSH identity file path (passed to ssh -i).",
+  "gateway.remote.sshHostKeyPolicy":
+    'macOS SSH host-key verification policy. "strict" requires an already trusted host key; "openssh" explicitly delegates to effective OpenSSH configuration.',
   "talk.provider": 'Active Talk provider id (for example "acme-speech").',
   "talk.providers":
     "Provider-specific Talk settings keyed by provider id. During migration, prefer this over legacy talk.* keys.",
@@ -162,13 +226,25 @@ export const FIELD_HELP: Record<string, string> = {
   "talk.realtime.providers.*.apiKey": "Provider API key for realtime Talk.", // pragma: allowlist secret
   "talk.realtime.model":
     "Realtime provider model id override for browser or Gateway-owned Talk sessions.",
+  "talk.realtime.speakerVoice":
+    "Realtime provider speaker voice name override for browser or Gateway-owned Talk sessions.",
+  "talk.realtime.speakerVoiceId":
+    "Realtime provider speaker voice id override for browser or Gateway-owned Talk sessions.",
   "talk.realtime.voice":
-    "Realtime provider voice id override for browser or Gateway-owned Talk sessions.",
+    "Deprecated realtime provider voice override. Use talk.realtime.speakerVoice.",
   "talk.realtime.instructions":
     "Additional system instructions appended to OpenClaw's built-in realtime Talk prompt. Use this for voice style, tone, and other provider-facing realtime behavior while keeping agent-consult guidance intact.",
   "talk.realtime.mode": "Talk execution mode: realtime, stt-tts, or transcription.",
   "talk.realtime.transport":
     "Talk byte/session transport: webrtc, provider-websocket, gateway-relay, or managed-room.",
+  "talk.realtime.vadThreshold":
+    "Realtime voice activity detection threshold from 0 (most sensitive) to 1 (least sensitive).",
+  "talk.realtime.silenceDurationMs":
+    "Milliseconds of silence before a realtime Talk user turn is committed.",
+  "talk.realtime.prefixPaddingMs":
+    "Milliseconds of audio retained before realtime voice activity is detected.",
+  "talk.realtime.reasoningEffort":
+    "Provider-specific reasoning effort for realtime Talk sessions, such as minimal, low, medium, or high.",
   "talk.realtime.brain":
     "Talk reasoning strategy: agent-consult for Gateway-mediated agent help, direct-tools for local tool calls, or none.",
   "talk.realtime.consultRouting":
@@ -280,7 +356,7 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.list[].reasoningDefault":
     "Optional per-agent default reasoning visibility (on|off|stream). Applies when no per-message or session reasoning override is set.",
   "agents.list[].fastModeDefault":
-    "Optional per-agent default for fast mode. Applies when no per-message or session fast-mode override is set.",
+    'Optional per-agent default for fast mode ("auto", true, or false). Applies when no per-message or session fast-mode override is set.',
   "agents.list[].runtime":
     "Optional runtime descriptor for this agent. Use embedded for default OpenClaw execution or acp for external ACP harness defaults.",
   "agents.list[].runtime.type":
@@ -302,9 +378,9 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.list[].heartbeat.suppressToolErrorWarnings":
     "Suppress tool error warning payloads during heartbeat runs.",
   "agents.defaults.heartbeat.timeoutSeconds":
-    "Maximum time in seconds allowed for a heartbeat agent turn before it is aborted. Leave unset to use agents.defaults.timeoutSeconds.",
+    "Maximum time in seconds allowed for a heartbeat agent turn before it is aborted. Leave unset to use agents.defaults.timeoutSeconds when set, otherwise the heartbeat cadence capped at 600 seconds.",
   "agents.list[].heartbeat.timeoutSeconds":
-    "Per-agent maximum time in seconds allowed for a heartbeat agent turn before it is aborted. Leave unset to inherit the merged heartbeat/default agent timeout.",
+    "Per-agent maximum time in seconds allowed for a heartbeat agent turn before it is aborted. Leave unset to inherit the merged heartbeat timeout, then agents.defaults.timeoutSeconds when set, otherwise the heartbeat cadence capped at 600 seconds.",
   "agents.defaults.heartbeat.skipWhenBusy":
     "When true, defer heartbeat turns on this agent's extra busy lanes: its own session-keyed subagent or nested command work. Cron lanes always defer heartbeat turns.",
   "agents.list[].heartbeat.skipWhenBusy":
@@ -313,8 +389,10 @@ export const FIELD_HELP: Record<string, string> = {
     "Browser runtime controls for local or remote CDP attachment, profile routing, and screenshot/snapshot behavior. Keep defaults unless your automation workflow requires custom browser transport settings.",
   "browser.enabled":
     "Enables browser capability wiring in the gateway so browser tools and CDP-driven workflows can run. Disable when browser automation is not needed to reduce surface area and startup work.",
+  "browser.allowSystemProfileImport":
+    "Allows macOS hosts to import cookies from a local Chrome-family system profile into a managed OpenClaw browser profile. Disable this to prevent browser profile cookie import and its macOS Keychain consent prompt.",
   "browser.cdpUrl":
-    "Remote CDP websocket URL used to attach to an externally managed browser instance. Use this for centralized browser hosts and keep URL access restricted to trusted network paths.",
+    "CDP/DevTools endpoint URL used to attach to an externally managed browser instance. Use this for centralized browser hosts, tunnels, or existing-session attachment, and keep URL access restricted to trusted network paths.",
   "browser.actionTimeoutMs":
     "Default timeout in milliseconds for browser act requests before the client gives up waiting. Raise this when healthy waits or UI interactions exceed the default request budget.",
   "browser.localLaunchTimeoutMs":
@@ -340,7 +418,7 @@ export const FIELD_HELP: Record<string, string> = {
   "browser.profiles.*.cdpPort":
     "Per-profile local CDP port used when connecting to browser instances by port instead of URL. Use unique ports per profile to avoid connection collisions.",
   "browser.profiles.*.cdpUrl":
-    "Per-profile CDP websocket URL used for explicit remote browser routing by profile name. Use this when profile connections terminate on remote hosts or tunnels.",
+    "Per-profile CDP/DevTools endpoint URL used for explicit browser routing by profile name. Use this for remote CDP hosts, tunnels, or existing-session profiles that should attach through a running Chrome DevTools endpoint.",
   "browser.profiles.*.userDataDir":
     "Per-profile Chromium user data directory for existing-session attachment through Chrome DevTools MCP. Use this for Brave, Edge, Chromium, or non-default Chrome profiles when the built-in auto-connect path would pick the wrong browser data directory on the selected host or browser node. Paths starting with ~ expand to the OS home directory.",
   "browser.profiles.*.mcpCommand":
@@ -382,9 +460,9 @@ export const FIELD_HELP: Record<string, string> = {
   "browser.ssrfPolicy.hostnameAllowlist":
     "Legacy/alternate hostname allowlist field used by SSRF policy consumers for explicit host exceptions. Use stable exact hostnames and avoid wildcard-like broad patterns.",
   "browser.remoteCdpTimeoutMs":
-    "Timeout in milliseconds for connecting to a remote CDP endpoint before failing the browser attach attempt. Increase for high-latency tunnels, or lower for faster failure detection.",
+    "Timeout in milliseconds for connecting to a remote CDP endpoint before failing the browser attach attempt. The larger of this value and remoteCdpHandshakeTimeoutMs also bounds persistent remote tab enumeration. Increase for high-latency tunnels, or lower for faster failure detection.",
   "browser.remoteCdpHandshakeTimeoutMs":
-    "Timeout in milliseconds for post-connect CDP handshake readiness checks against remote browser targets. Raise this for slow-start remote browsers and lower to fail fast in automation loops.",
+    "Timeout in milliseconds for post-connect CDP handshake readiness checks against remote browser targets. The larger of this value and remoteCdpTimeoutMs also bounds persistent remote tab enumeration. Raise this for slow-start remote browsers and lower to fail fast in automation loops.",
   "discovery.mdns.mode":
     'mDNS broadcast mode ("minimal" default, "full" includes cliPath/sshPort, "off" disables mDNS).',
   discovery:
@@ -409,6 +487,14 @@ export const FIELD_HELP: Record<string, string> = {
     "Exec-tool policy grouping for shell execution host, security mode, approval behavior, and runtime bindings. Keep conservative defaults in production and tighten elevated execution paths.",
   "tools.exec.host":
     'Selects execution target strategy for shell commands. Use "auto" for runtime-aware behavior (sandbox when available, otherwise gateway), or pin sandbox/gateway/node explicitly when you need a fixed surface.',
+  "tools.exec.mode":
+    'Normalized exec policy selector. Use "auto" for classifier-reviewed approval misses, "ask" for human-reviewed misses, "allowlist" for deterministic safe commands only, or "full" for trusted local operation.',
+  "tools.exec.reviewer":
+    "Model-backed exec reviewer used by auto mode before human approval fallback. Configure a narrow model override here when you want exec review isolated from the main agent model.",
+  "tools.exec.reviewer.model":
+    "Optional provider/model override for the exec reviewer agent. Omit to reuse the configured primary model for the target agent.",
+  "tools.exec.reviewer.timeoutMs":
+    "Per-stage exec reviewer timeout in milliseconds for model preparation and completion before falling back to human approval (default: 30000).",
   "tools.exec.security":
     "Execution security posture selector controlling sandbox/approval expectations for command execution. Keep strict security mode for untrusted prompts and relax only for trusted operator workflows.",
   "tools.exec.ask":
@@ -424,13 +510,13 @@ export const FIELD_HELP: Record<string, string> = {
   "tools.experimental":
     "Experimental built-in tool flags. Keep these off by default and enable only when you are intentionally testing a preview surface.",
   "tools.experimental.planTool":
-    "Enable the experimental structured `update_plan` tool for non-trivial multi-step work tracking. Leave this off unless you explicitly want the tool outside strict-agentic embedded Pi runs.",
+    "Enable the experimental structured `update_plan` tool for non-trivial multi-step work tracking. Leave this off unless you explicitly want the tool outside strict-agentic embedded OpenClaw runs.",
   "tools.toolSearch":
-    "Compact large OpenClaw, MCP, and client tool catalogs behind one search/call surface. Set to true for the default code bridge or use the object form to choose the structured fallback.",
+    "Compact large OpenClaw, MCP, and client tool catalogs. Set to true for the default code bridge or use the object form to choose structured controls or a compact visible tool directory.",
   "tools.toolSearch.enabled":
-    "Enables Tool Search. When on, OpenClaw hides large tool catalogs behind `tool_search_code` or structured search/describe/call tools during PI runs.",
+    "Enables Tool Search. When on, OpenClaw hides large tool catalogs behind `tool_search_code` or structured search/describe/call tools during embedded runtime runs.",
   "tools.toolSearch.mode":
-    'Choose the model-facing surface: "code" exposes `tool_search_code`; "tools" exposes structured search/describe/call fallback tools.',
+    'Choose the model-facing surface: "code" exposes `tool_search_code`; "tools" exposes structured search/describe/call fallback tools; "directory" keeps a bounded tool directory visible, exposes a bounded set of likely or required schemas, and defers the rest behind search/describe/call.',
   "tools.toolSearch.codeTimeoutMs":
     "Maximum milliseconds for one `tool_search_code` execution. Runtime clamps values to the supported 1s..60s range.",
   "tools.toolSearch.searchDefaultLimit":
@@ -491,13 +577,13 @@ export const FIELD_HELP: Record<string, string> = {
   "web.reconnect.maxAttempts":
     "Maximum reconnect attempts before giving up for the current failure sequence (0 means no retries). Use finite caps for controlled failure handling in automation-sensitive environments.",
   "web.whatsapp":
-    "WhatsApp Web socket timing controls passed directly to Baileys. Tune these when network edges, proxies, or NATs are closing otherwise healthy WhatsApp Web sessions.",
+    "WhatsApp Web socket timing controls used by Baileys and OpenClaw's local outbound and inbound read-receipt operation bounds. Tune these when network edges, proxies, or NATs are closing otherwise healthy WhatsApp Web sessions.",
   "web.whatsapp.keepAliveIntervalMs":
     "Baileys WhatsApp Web application ping interval in milliseconds. Lower values detect and refresh idle links sooner; keep this comfortably below your network's idle-flow timeout.",
   "web.whatsapp.connectTimeoutMs":
     "Maximum time in milliseconds Baileys waits for the WhatsApp WebSocket opening handshake. Use a higher value on slow or lossy networks that report opening handshake 408 timeouts.",
   "web.whatsapp.defaultQueryTimeoutMs":
-    "Default Baileys query timeout in milliseconds for WhatsApp Web requests. Keep aligned with upstream unless a network-specific investigation shows queries need longer.",
+    "Default Baileys query timeout and OpenClaw outbound send/presence and inbound read-receipt operation bound in milliseconds for WhatsApp Web requests. Keep aligned with upstream unless a network-specific investigation shows socket operations need longer.",
   talk: "Talk-mode voice synthesis settings for voice identity, model selection, output format, and interruption behavior. Use this section to tune human-facing voice UX while controlling latency and cost.",
   "gateway.auth.token":
     "Required by default for gateway access (unless using Tailscale Serve identity); required for non-loopback binds.",
@@ -521,12 +607,14 @@ export const FIELD_HELP: Record<string, string> = {
     "Optional URL prefix where the Control UI is served (e.g. /openclaw).",
   "gateway.controlUi.root":
     "Optional filesystem root for Control UI assets (defaults to dist/control-ui).",
+  "gateway.controlUi.toolTitles":
+    "Opt-in AI purpose titles for tool calls in Control UI chat (default off). When enabled, the chat.toolTitles method generates short titles for complex tool calls with the agent's utility model (an explicit utilityModel may route bounded tool arguments to the operator-chosen provider like every utility task; the derived default stays on the session's provider) and caches them in the per-agent state database. Setting utilityModel to an empty string disables titles too. Leave off to keep tool rendering fully deterministic with no background model calls.",
   "gateway.controlUi.embedSandbox":
     'Iframe sandbox policy for hosted Control UI embeds. "strict" disables scripts, "scripts" allows interactive embeds while keeping origin isolation (default), and "trusted" adds `allow-same-origin` for same-site documents that intentionally need stronger privileges.',
   "gateway.controlUi.allowExternalEmbedUrls":
     "DANGEROUS toggle that allows hosted embeds to load absolute external http(s) URLs. Keep this off unless your Control UI intentionally embeds trusted third-party pages; hosted /__openclaw__/canvas and /__openclaw__/a2ui documents do not need it.",
   "gateway.controlUi.chatMessageMaxWidth":
-    'Optional CSS max-width for grouped Control UI chat messages, for example "960px", "82%", or "min(1280px, 82%)". Values are validated against a constrained width grammar before reaching the browser.',
+    'Optional CSS max-width for the centered Control UI chat transcript, for example "960px", "82%", or "min(1280px, 82%)". Values are validated against a constrained width grammar before reaching the browser.',
   "gateway.controlUi.allowedOrigins":
     'Allowed browser origins for Control UI/WebChat websocket connections (full origins only, e.g. https://control.example.com). Required for non-loopback Control UI deployments unless dangerous Host-header fallback is explicitly enabled. Setting ["*"] means allow any browser origin and should be avoided outside tightly controlled local testing.',
   "gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback":
@@ -535,14 +623,22 @@ export const FIELD_HELP: Record<string, string> = {
     "Loosens strict browser auth checks for Control UI when you must run a non-standard setup. Keep this off unless you trust your network and proxy path, because impersonation risk is higher.",
   "gateway.controlUi.dangerouslyDisableDeviceAuth":
     "Disables Control UI device identity checks and relies on token/password only. Use only for short-lived debugging on trusted networks, then turn it off immediately.",
+  "mcp.apps":
+    "MCP Apps UI support. When enabled, configured MCP servers may provide interactive HTML views for their tool results.",
+  "mcp.apps.enabled":
+    "Opt-in MCP Apps rendering and app-to-server bridge. Keep disabled unless you trust the configured MCP servers that provide app UI resources.",
+  "mcp.apps.sandboxOrigin":
+    "Optional dedicated public HTTP(S) origin for MCP Apps. Use this behind a reverse proxy or TLS terminator and proxy it only to the configured MCP Apps sandbox port. It must differ from the Control UI origin and must not serve authenticated content.",
+  "mcp.apps.sandboxPort":
+    "Dedicated MCP Apps sandbox listener port. Defaults to the Gateway port plus one. Set an unused port when another local service or Gateway profile already owns that port.",
   "gateway.push":
     "Push-delivery settings used by the gateway when it needs to wake or notify paired devices. Configure relay-backed APNs here for official iOS builds; direct APNs auth remains env-based for local/manual builds.",
   "gateway.push.apns":
-    "APNs delivery settings for iOS devices paired to this gateway. Use relay settings for official/TestFlight builds that register through the external push relay.",
+    "APNs delivery settings for iOS devices paired to this gateway. Use relay settings for official App Store builds that register through the external push relay.",
   "gateway.push.apns.relay":
-    "External relay settings for relay-backed APNs sends. The gateway uses this relay for push.test, wake nudges, and reconnect wakes after a paired official iOS build publishes a relay-backed registration.",
+    "External relay settings for relay-backed APNs sends. The gateway uses the hosted OpenClaw relay by default, or this custom relay for push.test, wake nudges, and reconnect wakes after a paired official iOS build publishes a relay-backed registration.",
   "gateway.push.apns.relay.baseUrl":
-    "Base HTTPS URL for the external APNs relay service used by official/TestFlight iOS builds. Keep this aligned with the relay URL baked into the iOS build so registration and send traffic hit the same deployment.",
+    "Optional custom base HTTPS URL for the external APNs relay service used by official App Store iOS builds. Keep this aligned with the relay URL baked into the iOS build so registration and send traffic hit the same deployment.",
   "gateway.push.apns.relay.timeoutMs":
     "Timeout in milliseconds for relay send requests from the gateway to the APNs relay (default: 10000). Increase for slower relays or networks, or lower to fail wake attempts faster.",
   "gateway.http.endpoints.chatCompletions.enabled":
@@ -576,29 +672,44 @@ export const FIELD_HELP: Record<string, string> = {
     'Node browser routing ("auto" = pick single connected browser node, "manual" = require node param, "off" = disable).',
   "gateway.nodes.browser.node": "Pin browser routing to a specific node id or name (optional).",
   "gateway.nodes.pairing":
-    "Node pairing policy settings. Defaults keep CIDR auto-approval disabled; enable only with explicit trusted CIDR/IP allowlists you control.",
+    "Node pairing policy settings. SSH-verified auto-approval is enabled by default; CIDR auto-approval stays disabled unless explicit trusted CIDR/IP allowlists are configured.",
   "gateway.nodes.pairing.autoApproveCidrs":
     "Opt-in CIDR/IP allowlist for auto-approving first-time node-role device pairing with no requested scopes. Disabled when unset. Operator, browser, Control UI, and any role, scope, metadata, or public-key upgrade pairing still require manual approval.",
+  "gateway.nodes.pairing.sshVerify":
+    "SSH-verified auto-approval for first-time node-role device pairing (default: enabled). The gateway SSHes back to the pairing host (BatchMode, strict host keys) and approves only when the remote `openclaw node identity` output matches the pending device key. Set false to disable SSH verification (independent of autoApproveCidrs, which stays active); for manual-only pairing also unset autoApproveCidrs. Pass an object to override user/identity/timeoutMs/cidrs.",
+  ...NODE_CAPABILITY_FIELD_HELP,
   "gateway.nodes.allowCommands":
     "Extra node.invoke commands to allow beyond the gateway defaults (array of command strings). Enabling dangerous commands here is a security-sensitive override and is flagged by `openclaw security audit`.",
   "gateway.nodes.denyCommands":
     "Node command names to block even if present in node claims or default allowlist (exact command-name matching only, e.g. `system.run`; does not inspect shell text inside that command).",
-  "gateway.webchat.chatHistoryMaxChars":
-    "Max characters per text field in chat.history responses before truncation (default: 12000).",
   nodeHost:
     "Node host controls for features exposed from this gateway node to other nodes or clients. Keep defaults unless you intentionally proxy local capabilities across your node network.",
+  "nodeHost.agentRuns":
+    "Opt in to approval-gated native agent turns on this headless node host. Disabled by default.",
+  "nodeHost.agentRuns.claude":
+    "Controls whether this headless node host may advertise Claude CLI agent turns to the gateway.",
+  "nodeHost.agentRuns.claude.enabled":
+    "Advertise paired-node Claude session continuation when the local claude binary is available (default: false). Runs still require node exec approval.",
   "nodeHost.browserProxy":
     "Groups browser-proxy settings for exposing local browser control through node routing. Enable only when remote node workflows need your local browser profiles.",
   "nodeHost.browserProxy.enabled":
     "Expose the local browser control server through node proxy routing so remote clients can use this host's browser capabilities. Keep disabled unless remote automation explicitly depends on it.",
   "nodeHost.browserProxy.allowProfiles":
     "Optional allowlist of browser profile names exposed through node proxy routing. Leave empty to preserve the default full profile surface, including profile create/delete routes. When set, OpenClaw enforces least-privilege profile access and blocks persistent profile create/delete through the proxy.",
+  "nodeHost.mcp":
+    "Use MCP servers started by the headless node host and published to its paired gateway as agent tools. Restart the node host after changing this section.",
+  "nodeHost.mcp.servers":
+    "Named MCP server definitions local to this node. Uses the same server shape as mcp.servers; OAuth servers are not supported by the node host.",
+  "nodeHost.skills":
+    "Use this section to publish skills installed in ~/.openclaw/skills from the headless node host. Restart the node host after changing skill files.",
+  "nodeHost.skills.enabled":
+    "Scan and publish node-hosted skills after connecting (default: true). Set false to disable node skill publication.",
   media:
     "Top-level media behavior shared across providers and tools that handle inbound files. Keep defaults unless you need stable filenames for external processing pipelines or longer-lived inbound media retention.",
   "media.preserveFilenames":
     "When enabled, uploaded media keeps its original filename instead of a generated temp-safe name. Turn this on when downstream automations depend on stable names, and leave off to reduce accidental filename leakage.",
   "media.ttlHours":
-    "Optional retention window in hours for persisted inbound media cleanup across the full media tree. Leave unset to preserve legacy behavior, or set values like 24 (1 day) or 168 (7 days) when you want automatic cleanup.",
+    "Optional retention window in hours for persisted media cleanup across the full media tree. Leave unset to disable automatic cleanup (media writes never prune), or set values like 24 (1 day) or 168 (7 days) to periodically remove media older than the window.",
   audio:
     "Global audio ingestion settings used before higher-level tools process speech or media content. Configure this when you need deterministic transcription behavior for voice notes and clips.",
   "audio.transcription":
@@ -679,6 +790,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Enable metrics signal export to the configured OpenTelemetry collector endpoint. Keep enabled for runtime health dashboards, and disable only if metric volume must be minimized.",
   "diagnostics.otel.logs":
     "Enable log signal export through OpenTelemetry in addition to local logging sinks. Use this when centralized log correlation is required across services and agents.",
+  "diagnostics.otel.logsExporter":
+    'Log export sink for diagnostics.otel.logs. Use "otlp" for the configured OTLP logs endpoint, "stdout" for one JSON record per stdout line in container log pipelines, and "both" when both sinks are required.',
   "diagnostics.otel.sampleRate":
     "Trace sampling rate (0-1) controlling how much trace traffic is exported to observability backends. Lower rates reduce overhead/cost, while higher rates improve debugging fidelity.",
   "diagnostics.otel.flushIntervalMs":
@@ -825,6 +938,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Enable filesystem watching for skill-definition changes so updates can be applied without full process restart. Keep enabled in development workflows and disable in immutable production images.",
   "skills.load.watchDebounceMs":
     "Debounce window in milliseconds for coalescing rapid skill file changes before reload logic runs. Increase to reduce reload churn on frequent writes, or lower for faster edit feedback.",
+  "skills.workshop.allowSymlinkTargetWrites":
+    "Allows Skill Workshop apply to write through symlinked workspace skill paths whose real target is already trusted by skills.load.allowSymlinkTargets. Keep disabled unless operators intentionally want generated proposal applies to mutate those shared skill roots.",
   approvals:
     "Approval routing controls for forwarding exec and plugin approval requests to chat destinations outside the originating session. Keep these disabled unless operators need explicit out-of-band approval visibility.",
   "approvals.exec":
@@ -870,7 +985,7 @@ export const FIELD_HELP: Record<string, string> = {
   "tools.fs.workspaceOnly":
     "Restrict filesystem tools (read/write/edit/apply_patch) to the workspace directory (default: false).",
   "tools.sessions.visibility":
-    'Controls which sessions can be targeted by sessions_list/sessions_history/sessions_send. ("tree" default = current session + spawned subagent sessions; "self" = only current; "agent" = any session in the current agent id; "all" = any session; cross-agent still requires tools.agentToAgent).',
+    'Controls which sessions can be targeted by sessions_list/sessions_history/sessions_search/sessions_send. ("tree" default = current session + spawned subagent sessions; "self" = only current; "agent" = any session in the current agent id; "all" = any session; cross-agent still requires tools.agentToAgent).',
   "tools.message.allowCrossContextSend":
     "Legacy override: allow cross-context sends across all providers.",
   "tools.message.crossContext.allowWithinProvider":
@@ -896,7 +1011,7 @@ export const FIELD_HELP: Record<string, string> = {
   "tools.web.search.openaiCodex.enabled":
     "Enable native Codex web search for Codex-capable models.",
   "tools.web.search.openaiCodex.mode":
-    'Native Codex web search mode: "cached" (default) or "live".',
+    'Native Codex web search preference: "cached" (default; unrestricted Codex turns resolve it to live) or "live".',
   "tools.web.search.openaiCodex.allowedDomains":
     "Optional domain allowlist passed to the native Codex web_search tool.",
   "tools.web.search.openaiCodex.contextSize":
@@ -956,7 +1071,9 @@ export const FIELD_HELP: Record<string, string> = {
   "models.providers.*.maxTokens":
     "Default maximum output token budget applied to models under this provider when a model entry does not set maxTokens.",
   "models.providers.*.timeoutSeconds":
-    "Optional per-provider model request timeout in seconds. For built-in providers, this can be set as a standalone overlay. For custom providers, set it alongside the provider baseUrl and models. Applies to provider HTTP fetches, including connect, headers, body, and total request abort handling, and also raises the LLM idle/stream watchdog ceiling for this provider above the implicit ~120s default. Use this for slow local or self-hosted model servers, or for cloud providers that buffer reasoning tokens silently on the wire (Gemini preview, large-tool-payload Claude/Opus), instead of changing global agent timeouts.",
+    "Optional per-provider model request timeout in seconds. Provider-level request settings affect explicit provider-owned model rows; they do not create implicit models. For custom providers, set it alongside the provider baseUrl and models. Applies to provider HTTP fetches, including connect, headers, body, and total request abort handling, and also raises the LLM idle/stream watchdog ceiling for this provider above the implicit ~120s default. Use this for slow local or self-hosted model servers, or for cloud providers that buffer reasoning tokens silently on the wire (Gemini preview, large-tool-payload Claude/Opus), instead of changing global agent timeouts.",
+  "models.providers.*.region":
+    "Optional provider deployment/API region interpreted by providers that expose regional endpoints. Use provider docs for supported values; baseUrl overrides usually take precedence when both are set.",
   "models.providers.*.injectNumCtxForOpenAICompat":
     "Controls whether OpenClaw injects `options.num_ctx` for Ollama providers configured with the OpenAI-compatible adapter (`openai-completions`). Default is true. Set false only if your proxy/upstream rejects unknown `options` payload fields.",
   "models.providers.*.params":
@@ -968,7 +1085,7 @@ export const FIELD_HELP: Record<string, string> = {
   "models.providers.*.agentRuntime":
     "Optional low-level agent runtime policy for this provider. Use provider/model runtime policy instead of agent-wide runtime pins; omitted/default lets OpenClaw choose the runtime for the selected provider.",
   "models.providers.*.agentRuntime.id":
-    'Provider agent runtime id: "pi", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli". OpenAI on the official endpoint defaults to the Codex harness when omitted.',
+    'Provider agent runtime id: "openclaw", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli". OpenAI on the official endpoint defaults to the Codex harness when omitted.',
   "models.providers.*.localService":
     "Optional on-demand local model server process for this provider. OpenClaw probes healthUrl, starts the command when needed, waits for readiness, and then sends the model request.",
   "models.providers.*.localService.command":
@@ -1053,7 +1170,7 @@ export const FIELD_HELP: Record<string, string> = {
   "models.providers.*.models[].agentRuntime":
     "Optional low-level agent runtime policy for this specific model. Model runtime policy overrides the provider runtime policy.",
   "models.providers.*.models[].agentRuntime.id":
-    'Model agent runtime id: "pi", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
+    'Model agent runtime id: "openclaw", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
   "models.providers.*.models[].mediaInput":
     "Optional model media capability metadata used by tools to choose conservative image compression defaults.",
   "models.providers.*.models[].mediaInput.image":
@@ -1107,7 +1224,7 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.contextInjection":
     'Controls when workspace bootstrap files are injected into the system prompt: "always" (default) or "continuation-skip" for safe continuation turns after a completed assistant response.',
   "agents.defaults.bootstrapMaxChars":
-    "Max characters of each workspace bootstrap file injected into the system prompt before truncation (default: 12000).",
+    "Max characters of each workspace bootstrap file injected into the system prompt before truncation (default: 20000).",
   "agents.defaults.bootstrapTotalMaxChars":
     "Max total characters across all injected workspace bootstrap files (default: 60000).",
   "agents.defaults.experimental":
@@ -1141,14 +1258,14 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.envelopeTimezone":
     'Timezone for message envelopes ("utc", "local", "user", or an IANA timezone string).',
   "agents.defaults.envelopeTimestamp":
-    'Include absolute timestamps in message envelopes ("on" or "off").',
+    'Include absolute timestamps in message envelopes, direct agent prompt prefixes, and embedded model-input prefixes ("on" or "off").',
   "agents.defaults.envelopeElapsed": 'Include elapsed time in message envelopes ("on" or "off").',
   "agents.defaults.models":
     "Configured model catalog and allowlist (keys are full provider/model IDs or literal provider/* entries for dynamic provider catalogs).",
   "agents.defaults.models.*.agentRuntime":
     "Optional per-model runtime policy for the default agent. Use this for model-specific runtime exceptions instead of setting a whole-agent runtime.",
   "agents.defaults.models.*.agentRuntime.id":
-    'Default-agent model runtime id: "pi", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
+    'Default-agent model runtime id: "openclaw", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
   "agents.defaults.memorySearch":
     "Vector search over MEMORY.md and memory/*.md (per-agent overrides supported).",
   "agents.defaults.memorySearch.enabled":
@@ -1178,7 +1295,7 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.memorySearch.experimental.sessionMemory":
     "Indexes session transcripts into memory search so responses can reference prior chat turns. Keep this off unless transcript recall is needed, because indexing cost and storage usage both increase.",
   "agents.defaults.memorySearch.provider":
-    'Selects the embedding backend used to build/query memory vectors: "openai", "gemini", "voyage", "mistral", "bedrock", "lmstudio", "ollama", or "local". Keep your most reliable provider here and configure fallback for resilience.',
+    'Selects the embedding backend used to build/query memory vectors. Defaults to "openai"; set "openai-compatible", "gemini", "voyage", "mistral", "bedrock", "deepinfra", "github-copilot", "lmstudio", "ollama", or "local" when you want a different backend.',
   "agents.defaults.memorySearch.model":
     "Embedding model override used by the selected memory provider when a non-default model is required. Set this only when you need explicit recall quality/cost tuning beyond provider defaults.",
   "agents.defaults.memorySearch.inputType":
@@ -1213,8 +1330,6 @@ export const FIELD_HELP: Record<string, string> = {
     'Context window size passed to node-llama-cpp when creating the embedding context (default: 4096). 4096 safely covers typical memory-search chunks (128\u2013512 tokens) while keeping non-weight VRAM bounded. Lower to 1024\u20132048 on resource-constrained hosts. Set to "auto" to let node-llama-cpp use the model\'s trained maximum \u2014 not recommended for large models (e.g. Qwen3-Embedding-8B trained on 40\u202f960 tokens can push VRAM from ~8.8\u202fGB to ~32\u202fGB).',
   "agents.defaults.memorySearch.fallback":
     'Backup provider used when primary embeddings fail: "openai", "gemini", "voyage", "mistral", "bedrock", "lmstudio", "ollama", "local", or "none". Set a real fallback for production reliability; use "none" only if you prefer explicit failures.',
-  "agents.defaults.memorySearch.store.path":
-    "Sets where the SQLite memory index is stored on disk for each agent. Keep the default `~/.openclaw/memory/{agentId}.sqlite` unless you need custom storage placement or backup policy alignment.",
   "agents.defaults.memorySearch.store.vector.enabled":
     "Enables the sqlite-vec extension used for vector similarity queries in memory search (default: true). Keep this enabled for normal semantic recall; disable only for debugging or fallback-only operation.",
   "agents.defaults.memorySearch.store.vector.extensionPath":
@@ -1262,6 +1377,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Automatically starts the mcporter daemon when mcporter-backed QMD mode is enabled (default: true). Keep enabled unless process lifecycle is managed externally by your service supervisor.",
   "memory.qmd.searchMode":
     'Selects the QMD retrieval path: "query" uses standard query flow, "search" uses search-oriented retrieval, and "vsearch" emphasizes vector retrieval. Keep default unless tuning relevance quality.',
+  "memory.qmd.rerank":
+    'Controls QMD query reranking. Set to false with searchMode "query" and QMD 2.1+ to skip QMD reranking for faster hybrid results; leave unset for QMD defaults.',
   "memory.qmd.searchTool":
     "Overrides the exact mcporter tool name used for QMD searches while preserving `searchMode` as the semantic retrieval mode. Use this only when your QMD MCP server exposes a custom tool such as `hybrid_search` and keep it unset for the normal built-in tool mapping.",
   "memory.qmd.includeDefaultMemory":
@@ -1285,9 +1402,9 @@ export const FIELD_HELP: Record<string, string> = {
   "memory.qmd.update.debounceMs":
     "Sets the minimum delay between consecutive QMD refresh attempts in milliseconds (default: 15000). Increase this if frequent file changes cause update thrash or unnecessary background load.",
   "memory.qmd.update.onBoot":
-    "Runs an initial QMD update when the long-lived QMD manager opens (default: true). Set false to disable manager-start updates and legacy/opt-in startup refreshes.",
+    "Runs an initial QMD update when the long-lived QMD manager opens (default: true). Set false to skip manager-start boot updates while keeping configured interval/embed maintenance.",
   "memory.qmd.update.startup":
-    "Controls whether Gateway startup schedules a QMD refresh before memory is first used (`off`, `idle`, or `immediate`; default: off). Keep off for fastest startup and lazy memory initialization.",
+    "Controls whether Gateway startup initializes QMD before memory is first used (`off`, `idle`, or `immediate`; default: off). With onBoot disabled, startup only arms configured interval/embed maintenance.",
   "memory.qmd.update.startupDelayMs":
     'Sets the idle delay before an opt-in `memory.qmd.update.startup: "idle"` refresh runs (default: 120000). Increase to keep cold-start CPU available for channels and providers.',
   "memory.qmd.update.waitForBootSync":
@@ -1337,6 +1454,11 @@ export const FIELD_HELP: Record<string, string> = {
     "Display name shown for the assistant in UI views, chat chrome, and status contexts. Keep this stable so operators can reliably identify which assistant persona is active.",
   "ui.assistant.avatar":
     "Assistant avatar image source used in UI surfaces (URL, path, or data URI depending on runtime support). Use trusted assets and consistent branding dimensions for clean rendering.",
+  tui: "Terminal UI display settings. Use this section for terminal-only presentation preferences without changing Gateway or other UI behavior.",
+  "tui.footer":
+    "Terminal UI footer display settings. Keep optional context compact so session, model, goal, and token information stay readable.",
+  "tui.footer.showRemoteHost":
+    "Show the remote Gateway hostname in the TUI footer for non-local URL-backed connections. Default: false. Loopback and embedded local connections never show a host label.",
   plugins:
     "Plugin system controls for enabling extensions, constraining load scope, configuring entries, and tracking installs. Keep plugin policy explicit and least-privilege in production environments.",
   "plugins.enabled":
@@ -1355,8 +1477,6 @@ export const FIELD_HELP: Record<string, string> = {
     'Select the active memory plugin by id, or "none" to disable memory plugins.',
   "plugins.slots.contextEngine":
     "Selects the active context engine plugin by id so one plugin provides context orchestration behavior.",
-  "plugins.bundledDiscovery":
-    'Controls bundled plugin runtime discovery when plugins.allow is configured. "allowlist" (default) gates bundled provider plugins by plugins.allow like third-party plugins. "compat" preserves legacy behavior where bundled provider plugins can be force-loaded on every chat turn.',
   "plugins.entries":
     "Per-plugin settings keyed by plugin ID including enablement and plugin-specific runtime configuration payloads. Use this for scoped plugin tuning without changing global loader policy.",
   "plugins.entries.*.enabled":
@@ -1396,27 +1516,15 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.model.primary": "Primary model (provider/model).",
   "agents.defaults.model.fallbacks":
     "Ordered fallback models (provider/model). Used when the primary model fails.",
-  "agents.defaults.agentRuntime":
-    "Legacy whole-agent runtime policy. It is ignored by runtime selection; configure runtime policy on a provider or model instead. Run openclaw doctor --fix to remove stale values.",
-  "agents.defaults.agentRuntime.id":
-    "Legacy whole-agent runtime id. It is ignored by runtime selection; configure models.providers.<provider>.agentRuntime.id or a model-specific agentRuntime.id instead.",
-  "agents.defaults.embeddedHarness":
-    "Legacy whole-agent embedded harness input. Run openclaw doctor --fix to remove it and use provider/model runtime policy where needed.",
-  "agents.defaults.embeddedHarness.runtime":
-    "Legacy whole-agent embedded harness runtime. Runtime selection ignores it; use provider/model runtime policy.",
+  "agents.defaults.utilityModel":
+    "Optional lower-cost model (provider/model or alias) for short internal tasks such as generated titles and progress narration. Unset derives the primary provider's declared small model when available (otherwise the primary model); set to an empty string to disable utility routing.",
+  "agents.list.*.utilityModel":
+    "Optional per-agent utility model override for short internal tasks. Overrides agents.defaults.utilityModel.",
   "agents.list.*.models": "Per-agent model catalog overrides keyed by full provider/model IDs.",
   "agents.list.*.models.*.agentRuntime":
     "Optional per-model runtime policy for this agent. Use this for agent-specific model exceptions instead of setting a whole-agent runtime.",
   "agents.list.*.models.*.agentRuntime.id":
-    'Per-agent model runtime id: "pi", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
-  "agents.list.*.agentRuntime":
-    "Legacy per-agent runtime policy. It is ignored by runtime selection; configure provider/model runtime policy instead. Run openclaw doctor --fix to remove stale values.",
-  "agents.list.*.agentRuntime.id":
-    "Legacy per-agent runtime id. It is ignored by runtime selection; configure a provider/model runtime id instead.",
-  "agents.list.*.embeddedHarness":
-    "Legacy per-agent embedded harness input. Run openclaw doctor --fix to remove it and use provider/model runtime policy where needed.",
-  "agents.list.*.embeddedHarness.runtime":
-    "Legacy per-agent embedded harness runtime. Runtime selection ignores it; use provider/model runtime policy.",
+    'Per-agent model runtime id: "openclaw", "auto", a registered plugin harness id such as "codex", or a supported CLI backend alias such as "claude-cli".',
   "agents.defaults.imageModel.primary":
     "Optional image model (provider/model) used when the primary model lacks image input.",
   "agents.defaults.imageModel.fallbacks": "Ordered fallback image models (provider/model).",
@@ -1436,6 +1544,11 @@ export const FIELD_HELP: Record<string, string> = {
     "Optional music-generation model (provider/model) used by the shared music generation capability.",
   "agents.defaults.musicGenerationModel.fallbacks":
     "Ordered fallback music-generation models (provider/model).",
+  "agents.defaults.voiceModel.primary":
+    "Optional voice model (provider/model) used by speech, transcription, and realtime voice capabilities.",
+  "agents.defaults.voiceModel.fallbacks": "Ordered fallback voice models (provider/model).",
+  "agents.defaults.voiceModel.timeoutMs":
+    "Default provider request timeout in milliseconds for voice model operations when the caller supports timeouts.",
   "agents.defaults.mediaGenerationAutoProviderFallback":
     "When true (default), shared image, music, and video generation automatically appends other auth-backed provider defaults after explicit primary/fallback refs. Set false to disable implicit cross-provider fallback while keeping explicit fallbacks.",
   "agents.defaults.pdfModel.primary":
@@ -1457,11 +1570,11 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.compaction.provider":
     "Id of a registered compaction provider plugin used for summarization. When set and the provider is registered, its summarize() method is called instead of the built-in summarizeInStages pipeline. Falls back to built-in on provider failure. Leave unset to use the default built-in summarization.",
   "agents.defaults.compaction.reserveTokens":
-    "Token headroom reserved for reply generation and tool output after compaction runs. Use higher reserves for verbose/tool-heavy sessions, and lower reserves when maximizing retained history matters more.",
+    "Token headroom reserved for reply generation and tool output after compaction runs. Use higher reserves for verbose/tool-heavy sessions, and lower reserves when maximizing retained history matters more. When the active model context window is known, the effective reserve is capped to preserve usable prompt space.",
   "agents.defaults.compaction.keepRecentTokens":
     "Minimum token budget preserved from the most recent conversation window during compaction. Use higher values to protect immediate context continuity and lower values to keep more long-tail history.",
   "agents.defaults.compaction.reserveTokensFloor":
-    "Minimum floor enforced for reserveTokens in Pi compaction paths (0 disables the floor guard). Use a non-zero floor to avoid over-aggressive compression under fluctuating token estimates.",
+    "Minimum floor enforced for reserveTokens in embedded OpenClaw compaction paths (0 disables the floor guard). Use a non-zero floor to avoid over-aggressive compression under fluctuating token estimates.",
   "agents.defaults.compaction.maxHistoryShare":
     "Maximum fraction of total context budget allowed for retained history after compaction (range 0.1-0.9). Use lower shares for more generation headroom or higher shares for deeper historical continuity.",
   "agents.defaults.compaction.identifierPolicy":
@@ -1477,23 +1590,23 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.compaction.qualityGuard.maxRetries":
     "Maximum number of regeneration retries after a failed safeguard summary quality audit. Use small values to bound extra latency and token cost.",
   "agents.defaults.compaction.midTurnPrecheck":
-    "Optional Pi tool-loop precheck that detects context pressure after a tool result is appended and before the next model call. When enabled, OpenClaw reuses existing precheck recovery to truncate tool results or compact before retrying.",
+    "Optional embedded OpenClaw tool-loop precheck that detects context pressure after a tool result is appended and before the next model call. When enabled, OpenClaw reuses existing precheck recovery to truncate tool results or compact before retrying.",
   "agents.defaults.compaction.midTurnPrecheck.enabled":
-    "Enable structured mid-turn context pressure checks for Pi tool loops. Default: false. Keep disabled unless long tool-heavy sessions hit context overflow before normal turn-end compaction can run.",
+    "Enable structured mid-turn context pressure checks for embedded OpenClaw tool loops. Default: false. Keep disabled unless long tool-heavy sessions hit context overflow before normal turn-end compaction can run.",
   "agents.defaults.compaction.postIndexSync":
     'Controls post-compaction session memory reindex mode: "off", "async", or "await" (default: "async"). Use "await" for strongest freshness, "async" for lower compaction latency, and "off" only when session-memory sync is handled elsewhere.',
   "agents.defaults.compaction.postCompactionSections":
     'Opt-in AGENTS.md H2/H3 section names re-injected after compaction so the agent reruns critical startup guidance. Leave unset or set [] to disable reinjection. Explicitly set ["Session Startup", "Red Lines"] to enable the legacy default pair with fallback to older "Every Session"/"Safety" headings. Enabling this can duplicate project context already present in the compaction summary.',
   "agents.defaults.compaction.timeoutSeconds":
-    "Maximum time in seconds allowed for a single compaction operation before it is aborted (default: 900). Increase this for very large sessions that need more time to summarize, or decrease it to fail faster on unresponsive models.",
+    "Maximum time in seconds allowed for a single compaction operation before it is aborted (default: 180). Increase this for very large sessions that need more time to summarize, or decrease it to fail faster on unresponsive models.",
   "agents.defaults.compaction.model":
-    "Optional provider/model override used only for compaction summarization. Set this when you want compaction to run on a different model than the session default, and leave it unset to keep using the primary agent model.",
+    "Optional provider/model or configured bare alias used only for compaction summarization. Bare aliases resolve before dispatch; a configured literal model ID wins if it collides with an alias. Leave unset to keep using the primary agent model.",
   "agents.defaults.compaction.truncateAfterCompaction":
-    "When enabled, rotates the active session JSONL file after compaction so future turns load only the summary and unsummarized tail while the previous full transcript remains archived. Prevents unbounded active transcript growth in long-running sessions. Default: false.",
+    "When enabled, rotates the active session transcript after compaction so future turns load only the summary and unsummarized tail while the previous full transcript remains archived. Prevents unbounded active transcript growth in long-running sessions. Default: false.",
   "agents.defaults.compaction.maxActiveTranscriptBytes":
     'Triggers normal local compaction when the active session transcript reaches this size (bytes or strings like "20mb"). Requires truncateAfterCompaction so successful compaction can rotate to a smaller successor transcript; set to 0 or leave unset to disable. This never splits raw transcript bytes.',
   "agents.defaults.compaction.notifyUser":
-    "When enabled, sends brief compaction notices to the user when compaction starts and when it completes (for example, '🧹 Compacting context...' and '🧹 Compaction complete'). Disabled by default to keep compaction silent and non-intrusive.",
+    "When enabled, sends brief context-maintenance notices to the user: when compaction starts and completes (for example, '🧹 Compacting context...' and '🧹 Compaction complete'), and when a pre-compaction memory flush is exhausted so the reply continues in a degraded state (for example, '⚠️ Memory maintenance temporarily failed; continuing your reply.'). Disabled by default to keep context maintenance silent and non-intrusive.",
   "agents.defaults.compaction.memoryFlush":
     "Pre-compaction memory flush settings that run an agentic memory write before heavy compaction. Keep enabled for long sessions so salient context is persisted before aggressive trimming.",
   "agents.defaults.compaction.memoryFlush.enabled":
@@ -1503,15 +1616,15 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.compaction.memoryFlush.softThresholdTokens":
     "Threshold distance to compaction (in tokens) that triggers pre-compaction memory flush execution. Use earlier thresholds for safer persistence, or tighter thresholds for lower flush frequency.",
   "agents.defaults.compaction.memoryFlush.forceFlushTranscriptBytes":
-    'Forces pre-compaction memory flush when transcript file size reaches this threshold (bytes or strings like "2mb"). Use this to prevent long-session hangs even when token counters are stale; set to 0 to disable.',
+    'Forces pre-compaction memory flush when active transcript size reaches this threshold (bytes or strings like "2mb"). Use this to prevent long-session hangs even when token counters are stale; set to 0 to disable.',
   "agents.defaults.compaction.memoryFlush.prompt":
     "User-prompt template used for the pre-compaction memory flush turn when generating memory candidates. Use this only when you need custom extraction instructions beyond the default memory flush behavior.",
   "agents.defaults.compaction.memoryFlush.systemPrompt":
     "System-prompt override for the pre-compaction memory flush turn to control extraction style and safety constraints. Use carefully so custom instructions do not reduce memory quality or leak sensitive context.",
   "agents.defaults.runRetries":
-    "Outer run loop retry iteration boundaries for the embedded Pi runner to prevent infinite execution loops during failure recovery.",
+    "Outer run loop retry iteration boundaries for the embedded OpenClaw runner to prevent infinite execution loops during failure recovery.",
   "agents.defaults.runRetries.base":
-    "Base number of run retry iterations for the embedded Pi runner's outer run loop (default: 24).",
+    "Base number of run retry iterations for the embedded OpenClaw runner's outer run loop (default: 24).",
   "agents.defaults.runRetries.perProfile":
     "Additional run retry iterations granted per fallback profile candidate (default: 8).",
   "agents.defaults.runRetries.min":
@@ -1519,22 +1632,22 @@ export const FIELD_HELP: Record<string, string> = {
   "agents.defaults.runRetries.max":
     "Maximum absolute limit for run retry iterations to prevent runaway execution (default: 160).",
   "agents.list[].runRetries":
-    "Optional per-agent override for the embedded Pi runner's outer run loop retry iteration boundaries.",
+    "Optional per-agent override for the embedded OpenClaw runner's outer run loop retry iteration boundaries.",
   "agents.list[].runRetries.base": "Base number of run retry iterations for this agent.",
   "agents.list[].runRetries.perProfile":
     "Additional run retry iterations granted per fallback profile candidate for this agent.",
   "agents.list[].runRetries.min": "Minimum absolute limit for run retry iterations for this agent.",
   "agents.list[].runRetries.max": "Maximum absolute limit for run retry iterations for this agent.",
-  "agents.defaults.embeddedPi":
-    "Embedded Pi runner hardening controls for how workspace-local Pi settings are trusted and applied in OpenClaw sessions.",
-  "agents.defaults.embeddedPi.projectSettingsPolicy":
-    'How embedded Pi handles workspace-local `.pi/config/settings.json`: "sanitize" (default) strips shellPath/shellCommandPrefix, "ignore" disables project settings entirely, and "trusted" applies project settings as-is.',
-  "agents.defaults.embeddedPi.executionContract":
-    'Embedded Pi execution contract: "default" keeps the standard runner behavior, while "strict-agentic" keeps OpenAI/OpenAI Codex GPT-5-family runs acting until they hit a real blocker instead of stopping at plans or filler.',
-  "agents.list[].embeddedPi":
-    "Optional per-agent embedded Pi overrides. Use this to opt specific agents into stricter GPT-5 execution behavior without changing the global default.",
-  "agents.list[].embeddedPi.executionContract":
-    'Optional per-agent embedded Pi execution contract override. Set "strict-agentic" to keep that agent acting through plan-only turns on OpenAI/OpenAI Codex GPT-5-family runs, or "default" to inherit the standard runner behavior.',
+  "agents.defaults.embeddedAgent":
+    "Embedded OpenClaw runner hardening controls for how workspace-local agent settings are trusted and applied in OpenClaw sessions.",
+  "agents.defaults.embeddedAgent.projectSettingsPolicy":
+    'How embedded OpenClaw handles workspace-local `.openclaw/settings.json`: "sanitize" (default) strips shellPath/shellCommandPrefix, "ignore" disables project settings entirely, and "trusted" applies project settings as-is.',
+  "agents.defaults.embeddedAgent.executionContract":
+    'Embedded OpenClaw execution contract: "default" keeps the standard runner behavior, while "strict-agentic" enables structured plan tracking and non-visible turn recovery for supported OpenAI/OpenAI Codex GPT-5-family runs.',
+  "agents.list[].embeddedAgent":
+    "Optional per-agent embedded OpenClaw overrides. Use this to opt specific agents into stricter GPT-5 execution behavior without changing the global default.",
+  "agents.list[].embeddedAgent.executionContract":
+    'Optional per-agent embedded OpenClaw execution contract override. Set "strict-agentic" to enable structured plan tracking and non-visible turn recovery for that agent on supported OpenAI/OpenAI Codex GPT-5-family runs, or "default" to inherit the standard runner behavior.',
   "agents.defaults.humanDelay.mode": 'Delay style for block replies ("off", "natural", "custom").',
   "agents.defaults.humanDelay.minMs": "Minimum delay in ms for custom humanDelay (default: 800).",
   "agents.defaults.humanDelay.maxMs": "Maximum delay in ms for custom humanDelay (default: 2500).",
@@ -1566,11 +1679,19 @@ export const FIELD_HELP: Record<string, string> = {
     "Optional secret used to HMAC hash owner IDs when ownerDisplay=hash. Prefer env substitution.",
   "commands.allowFrom":
     "Defines elevated command allow rules by channel and sender for owner-level command surfaces. Use narrow provider-specific identities so privileged commands are not exposed to broad chat audiences.",
-  mcp: "Global MCP server definitions managed by OpenClaw. Embedded Pi and other runtime adapters can consume these servers without storing them inside Pi-owned project settings.",
+  mcp: "Global MCP server definitions managed by OpenClaw. Embedded OpenClaw and other runtime adapters can consume these servers without storing them inside runtime-owned project settings.",
   "mcp.servers":
     "Named MCP server definitions. OpenClaw stores them in its own config and runtime adapters decide which transports are supported at execution time.",
   "mcp.servers.*.codex":
     "OpenClaw projection metadata for Codex app-server threads only. It does not affect ACP sessions or generic Codex harness config. Omit this block to keep the server available to every Codex app-server agent with Codex's default MCP approval behavior.",
+  "mcp.servers.*.toolFilter":
+    "Per-server MCP tool selection. Use include to expose only selected MCP tool names, or exclude to hide selected MCP tool names. Entries accept exact names and simple '*' globs.",
+  "mcp.servers.*.toolFilter.include":
+    "Exact MCP tool names or simple '*' globs to expose from this server. When omitted, all server tools remain eligible unless excluded.",
+  "mcp.servers.*.toolFilter.exclude":
+    "Exact MCP tool names or simple '*' globs to hide from this server.",
+  "mcp.servers.*.oauth.authProfileId":
+    "Refresh-capable auth profile id used to inject the current bearer token into this remote MCP server. When set, OpenClaw resolves and refreshes the profile at runtime and does not project refresh material downstream.",
   "mcp.servers.*.codex.agents":
     "Optional non-empty OpenClaw agent ids that should receive this MCP server in Codex app-server thread config. Empty, blank, or invalid lists fail closed; when omitted, the server is projected for all Codex app-server agents.",
   "mcp.servers.*.codex.defaultToolsApprovalMode":
@@ -1671,12 +1792,10 @@ export const FIELD_HELP: Record<string, string> = {
     "Deprecated age-retention field kept for compatibility with legacy configs using day counts. Use session.maintenance.pruneAfter instead so duration syntax and behavior are consistent.",
   "session.maintenance.maxEntries":
     "Caps total session entry count retained in the store to prevent unbounded growth over time. Use lower limits for constrained environments, or higher limits when longer history is required.",
-  "session.maintenance.rotateBytes":
-    'Deprecated and ignored. Do not use for `sessions.json` growth control; OpenClaw no longer creates automatic rotation backups, and "openclaw doctor --fix" removes this key.',
   "session.maintenance.resetArchiveRetention":
-    "Retention for reset transcript archives (`*.reset.<timestamp>`). Accepts a duration (for example `30d`), or `false` to disable cleanup. Defaults to pruneAfter so reset artifacts do not grow forever.",
+    "Age-based retention for archived transcripts (`*.reset.<timestamp>` and `*.deleted.<timestamp>`). Defaults to keeping archives until the disk budget evicts them oldest-first; set a duration (for example `30d`) to opt into wall-clock deletion, or `false` to disable it explicitly.",
   "session.maintenance.maxDiskBytes":
-    "Optional per-agent sessions-directory disk budget (for example `500mb`). Use this to cap session storage per agent; when exceeded, warn mode reports pressure and enforce mode performs oldest-first cleanup.",
+    "Per-agent sessions-directory disk budget (for example `500mb`). Defaults to `2gb`; when exceeded, warn mode reports pressure and enforce mode performs oldest-first cleanup (archived transcripts before live sessions). Set `false` to disable.",
   "session.maintenance.highWaterBytes":
     "Target size after disk-budget cleanup (high-water mark). Defaults to 80% of maxDiskBytes; set explicitly for tighter reclaim behavior on constrained disks.",
   cron: "Global scheduler settings for stored cron jobs, run concurrency, delivery fallback, and run-session retention. Keep defaults unless you are scaling job volume or integrating external webhook receivers.",
@@ -1695,17 +1814,19 @@ export const FIELD_HELP: Record<string, string> = {
   "cron.retry.retryOn":
     "Error types to retry: rate_limit, overloaded, network, timeout, server_error. Use to restrict which errors trigger retries; omit to retry all transient types.",
   "cron.webhook":
-    'Deprecated legacy fallback webhook URL used only for old jobs with `notify=true`. Migrate to per-job delivery using `delivery.mode="webhook"` plus `delivery.to`, and avoid relying on this global field.',
+    'Deprecated legacy fallback webhook URL used by `openclaw doctor --fix` to migrate old jobs with `notify=true`. Runtime delivery uses per-job `delivery.mode="webhook"` plus `delivery.to`, or `delivery.completionDestination` when preserving announce delivery.',
   "cron.webhookToken":
     "Bearer token attached to cron webhook POST deliveries when webhook mode is used. Prefer secret/env substitution and rotate this token regularly if shared webhook endpoints are internet-reachable.",
   "cron.sessionRetention":
     "Controls how long completed cron run sessions are kept before pruning (`24h`, `7d`, `1h30m`, or `false` to disable pruning; default: `24h`). Use shorter retention to reduce storage growth on high-frequency schedules.",
-  "cron.runLog":
-    "Pruning controls for per-job cron run history files under `cron/runs/<jobId>.jsonl`, including size and line retention.",
-  "cron.runLog.maxBytes":
-    "Maximum bytes per cron run-log file before pruning rewrites to the last keepLines entries (for example `2mb`, default `2000000`).",
-  "cron.runLog.keepLines":
-    "How many trailing run-log lines to retain when a file exceeds maxBytes (default `2000`). Increase for longer forensic history or lower for smaller disks.",
+  worktrees:
+    "Managed worktree retention settings applied by hourly cleanup and manual `openclaw worktrees gc`. Keep defaults unless managed worktrees accumulate faster than idle cleanup reclaims them.",
+  "worktrees.cleanup":
+    "Retention limits for OpenClaw-managed worktrees across all repositories. Cleanup snapshots and removes the least recently active session- and Workboard-owned worktrees first; manual, locked, and recently active worktrees are never limit-evicted.",
+  "worktrees.cleanup.maxCount":
+    "Maximum number of managed worktrees to retain across all repositories. When exceeded, the least recently active evictable worktrees are snapshotted and removed until the count fits. 0 or unset disables the count limit.",
+  "worktrees.cleanup.maxTotalSizeGb":
+    "Maximum total disk size in GB across all managed worktrees, measured during cleanup. When exceeded, the least recently active evictable worktrees are snapshotted and removed until usage fits. 0 or unset disables the size limit.",
   transcripts:
     "Core transcript capture settings for recording-capable agent tools and configured live meeting auto-start sources. Keep disabled unless operators explicitly want agents to capture or import meeting transcripts.",
   "transcripts.enabled":
@@ -1743,7 +1864,7 @@ export const FIELD_HELP: Record<string, string> = {
   "hooks.allowedSessionKeyPrefixes":
     "Allowlist of accepted session-key prefixes for inbound hook requests when caller-provided keys are enabled. Use narrow prefixes to prevent arbitrary session-key injection.",
   "hooks.allowedAgentIds":
-    "Allowlist of agent IDs that hook mappings are allowed to target when selecting execution agents. Use this to constrain automation events to dedicated service agents and reduce blast radius if a hook token is exposed.",
+    "Allowlist of effective agent IDs that hook requests and mappings are allowed to target, including default-agent routing when agentId is omitted. Use this to constrain automation events to dedicated service agents and reduce blast radius if a hook token is exposed.",
   "hooks.maxBodyBytes":
     "Maximum accepted webhook payload size in bytes before the request is rejected. Keep this bounded to reduce abuse risk and protect memory usage under bursty integrations.",
   "hooks.presets":
@@ -1856,6 +1977,10 @@ export const FIELD_HELP: Record<string, string> = {
     'Controls visible source replies across direct, group, and channel conversations. "message_tool" requires message(action=send) for visible output and keeps normal final text private. "automatic" posts normal replies as before.',
   "messages.responsePrefix":
     "Prefix text prepended to outbound assistant replies before sending to channels. Use for lightweight branding/context tags and avoid long prefixes that reduce content density.",
+  "messages.usageTemplate":
+    "Custom /usage full footer template, either an inline object or a JSON file path. Invalid or unavailable templates fall back to the built-in usage line.",
+  "messages.responseUsage":
+    'Default per-reply usage footer mode ("off"|"tokens"|"full") seeded into sessions that have not chosen one via /usage. Also accepts "on" as a legacy alias for "tokens". Accepts a bare mode or a per-channel map with a "default" fallback. Precedence: session value -> channel entry -> default -> off; an explicit /usage choice (including off) is persisted and overrides the default. Use /usage reset (aliases: inherit, clear, default) to clear a session override and re-inherit this configured default.',
   "messages.groupChat":
     "Group-message handling controls including mention triggers and history window sizing. Keep mention patterns narrow so group channels do not trigger on every message.",
   "messages.groupChat.mentionPatterns":
@@ -1945,7 +2070,7 @@ export const FIELD_HELP: Record<string, string> = {
   "channels.mattermost.configWrites":
     "Allow Mattermost to write config in response to channel events/commands (default: true).",
   "channels.modelByChannel":
-    "Map provider -> channel id -> model override (values are provider/model or aliases).",
+    "Map provider -> channel id / DM peer id -> model override (values are provider/model or aliases).",
   "messages.suppressToolErrors":
     "When true, suppress ⚠️ tool-error warnings from being shown to the user. The agent already sees errors in context and can retry. Default: false.",
   "messages.ackReaction": "Emoji reaction used to acknowledge inbound messages (empty disables).",
@@ -1954,7 +2079,7 @@ export const FIELD_HELP: Record<string, string> = {
   "messages.statusReactions":
     "Lifecycle status reactions that update the emoji on the trigger message as the agent progresses (queued → thinking → tool → done/error).",
   "messages.statusReactions.enabled":
-    "Enable lifecycle status reactions on supported channels. Slack and Discord treat unset as enabled when ack reactions are active; Telegram and WhatsApp require this to be true before lifecycle reactions are used.",
+    "Enable lifecycle status reactions on supported channels. Discord treats unset as enabled when ack reactions are active; Slack, Signal, Telegram, and WhatsApp require this to be true before lifecycle reactions are used. Slack uses native assistant thread status for progress by default.",
   "messages.statusReactions.emojis":
     "Override default status reaction emojis. Keys: queued, thinking, compacting, tool, coding, web, deploy, build, concierge, done, error, stallSoft, stallHard. Telegram chooses the first supported fallback when a configured emoji is not available in the chat.",
   "messages.statusReactions.timing":

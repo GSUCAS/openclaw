@@ -5,30 +5,35 @@
  * inside the owning plugin package instead of hanging off core runtime slots
  * keyed by plugin id.
  */
-import type { DispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.types.js";
-import type { CreateReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.runtime-types.js";
 import type {
-  ReadChannelAllowFromStoreForAccount,
-  UpsertChannelPairingRequestForAccount,
-} from "../../pairing/pairing-store.types.js";
-type ShouldHandleTextCommands =
-  import("../../auto-reply/commands-registry.runtime-types.js").ShouldHandleTextCommands;
-type IsControlCommandMessage =
-  import("../../auto-reply/command-detection.runtime-types.js").IsControlCommandMessage;
-type ShouldComputeCommandAuthorized =
-  import("../../auto-reply/command-detection.runtime-types.js").ShouldComputeCommandAuthorized;
-type BuildMentionRegexes = import("../../auto-reply/reply/mentions.types.js").BuildMentionRegexes;
-type MatchesMentionPatterns =
-  import("../../auto-reply/reply/mentions.types.js").MatchesMentionPatterns;
-type MatchesMentionWithExplicit =
-  import("../../auto-reply/reply/mentions.types.js").MatchesMentionWithExplicit;
-type ReadSessionUpdatedAt = import("../../config/sessions/runtime-types.js").ReadSessionUpdatedAt;
-type RecordSessionMetaFromInbound =
-  import("../../config/sessions/runtime-types.js").RecordSessionMetaFromInbound;
-type UpdateLastRoute = import("../../config/sessions/runtime-types.js").UpdateLastRoute;
+  IsControlCommandMessage,
+  ShouldComputeCommandAuthorized,
+} from "../../auto-reply/command-detection.runtime-types.js";
+import type { ShouldHandleTextCommands } from "../../auto-reply/commands-registry.runtime-types.js";
+import type { DispatchReplyFromConfig } from "../../auto-reply/reply/dispatch-from-config.types.js";
+import type {
+  BuildMentionRegexes,
+  MatchesMentionPatterns,
+  MatchesMentionWithExplicit,
+} from "../../auto-reply/reply/mentions.types.js";
+import type { CreateReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.runtime-types.js";
+import type { LoadChannelOutboundAdapter } from "../../channels/plugins/outbound/load.types.js";
+import type { ResolveMarkdownTableMode } from "../../config/markdown-tables.types.js";
+import type {
+  ReadSessionUpdatedAt,
+  RecordSessionMetaFromInbound,
+  UpdateLastRoute,
+} from "../../config/sessions/runtime-types.js";
+
+type DispatchReplyWithBufferedBlockDispatcher =
+  import("../../auto-reply/reply/provider-dispatcher.types.js").DispatchReplyWithBufferedBlockDispatcher;
+type ReadChannelAllowFromStoreForAccount =
+  import("../../pairing/pairing-store.types.js").ReadChannelAllowFromStoreForAccount;
+type UpsertChannelPairingRequestForAccount =
+  import("../../pairing/pairing-store.types.js").UpsertChannelPairingRequestForAccount;
 type RecordInboundSession = import("../../channels/session.types.js").RecordInboundSession;
 
-export type RuntimeThreadBindingLifecycleRecord =
+type RuntimeThreadBindingLifecycleRecord =
   | import("../../infra/outbound/session-binding.types.js").SessionBindingRecord
   | {
       boundAt: number;
@@ -37,13 +42,13 @@ export type RuntimeThreadBindingLifecycleRecord =
       maxAgeMs?: number;
     };
 
-export type PluginRuntimeChannelContextKey = {
+type PluginRuntimeChannelContextKey = {
   channelId: string;
   accountId?: string | null;
   capability: string;
 };
 
-export type PluginRuntimeChannelContextEvent = {
+type PluginRuntimeChannelContextEvent = {
   type: "registered" | "unregistered";
   key: {
     channelId: string;
@@ -53,7 +58,7 @@ export type PluginRuntimeChannelContextEvent = {
   context?: unknown;
 };
 
-export type PluginRuntimeChannelContextRegistry = {
+type PluginRuntimeChannelContextRegistry = {
   register: (
     params: PluginRuntimeChannelContextKey & {
       context: unknown;
@@ -80,13 +85,13 @@ export type PluginRuntimeChannel = {
     resolveChunkMode: typeof import("../../auto-reply/chunk.js").resolveChunkMode;
     resolveTextChunkLimit: typeof import("../../auto-reply/chunk.js").resolveTextChunkLimit;
     hasControlCommand: typeof import("../../auto-reply/command-detection.js").hasControlCommand;
-    resolveMarkdownTableMode: import("../../config/markdown-tables.types.js").ResolveMarkdownTableMode;
-    convertMarkdownTables: typeof import("../../markdown/tables.js").convertMarkdownTables;
+    resolveMarkdownTableMode: ResolveMarkdownTableMode;
+    convertMarkdownTables: typeof import("../../../packages/markdown-core/src/tables.js").convertMarkdownTables;
   };
   reply: {
     dispatchReplyWithBufferedBlockDispatcher: DispatchReplyWithBufferedBlockDispatcher;
     /**
-     * @deprecated Prefer `openclaw/plugin-sdk/channel-message` adapters plus
+     * @deprecated Prefer `openclaw/plugin-sdk/channel-outbound` adapters plus
      * `dispatchReplyWithBufferedBlockDispatcher` or channel turn helpers.
      * This is a low-level legacy dispatcher escape hatch.
      */
@@ -103,13 +108,13 @@ export type PluginRuntimeChannel = {
      * manually preserve source reply delivery metadata such as
      * `sourceReplyDeliveryMode`.
      */
-    dispatchReplyFromConfig: import("../../auto-reply/reply/dispatch-from-config.types.js").DispatchReplyFromConfig;
+    dispatchReplyFromConfig: DispatchReplyFromConfig;
     withReplyDispatcher: typeof import("../../auto-reply/dispatch-dispatcher.js").withReplyDispatcher;
     settleReplyDispatcher: typeof import("../../auto-reply/dispatch-dispatcher.js").settleReplyDispatcher;
     /**
-     * @deprecated Prefer `buildChannelInboundEventContext` /
-     * `buildChannelTurnContext` from `openclaw/plugin-sdk/channel-inbound` so
-     * inbound event metadata is carried into reply dispatch.
+     * @deprecated Prefer `buildChannelInboundEventContext` from
+     * `openclaw/plugin-sdk/channel-inbound` so inbound event metadata is
+     * carried into reply dispatch.
      */
     finalizeInboundContext: typeof import("../../auto-reply/reply/inbound-context.js").finalizeInboundContext;
     formatAgentEnvelope: typeof import("../../auto-reply/envelope.js").formatAgentEnvelope;
@@ -175,17 +180,14 @@ export type PluginRuntimeChannel = {
     shouldHandleTextCommands: ShouldHandleTextCommands;
   };
   outbound: {
-    loadAdapter: import("../../channels/plugins/outbound/load.types.js").LoadChannelOutboundAdapter;
+    loadAdapter: LoadChannelOutboundAdapter;
   };
-  turn: {
-    run: typeof import("../../channels/turn/kernel.js").runChannelTurn;
-    runAssembled: typeof import("../../channels/turn/kernel.js").dispatchAssembledChannelTurn;
-    /** @deprecated Prefer `run(...)`. */
-    runResolved: typeof import("../../channels/turn/kernel.js").runResolvedChannelTurn;
-    buildContext: typeof import("../../channels/turn/kernel.js").buildChannelInboundEventContext;
-    runPrepared: typeof import("../../channels/turn/kernel.js").runPreparedChannelTurn;
-    /** @deprecated Prefer `runAssembled(...)`. */
-    dispatchAssembled: typeof import("../../channels/turn/kernel.js").dispatchAssembledChannelTurn;
+  inbound: {
+    buildContext: typeof import("../../channels/inbound-event/context.js").buildChannelInboundEventContext;
+    run: typeof import("../../channels/turn/kernel.js").runChannelInboundEvent;
+    /** @deprecated Prefer `run` for raw inbound events or `dispatchReply` for assembled contexts. */
+    runPreparedReply: typeof import("../../channels/turn/kernel.js").runPreparedInboundReply;
+    dispatchReply: typeof import("../../channels/turn/kernel.js").dispatchChannelInboundReply;
   };
   threadBindings: {
     setIdleTimeoutBySessionKey: (params: {

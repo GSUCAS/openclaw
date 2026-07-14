@@ -1,8 +1,13 @@
+// Extracts user commitments from conversation text through model prompts.
+import {
+  asFiniteNumber,
+  timestampMsToIsoString,
+} from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString as asString } from "@openclaw/normalization-core/string-coerce";
 import { resolveAgentConfig } from "../agents/agent-scope.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { parseAbsoluteTimeMs } from "../cron/parse.js";
 import { resolveHeartbeatIntervalMs } from "../infra/heartbeat-summary.js";
-import { asFiniteNumber } from "../shared/number-coercion.js";
-import { normalizeOptionalString as asString } from "../shared/string-coerce.js";
 import { isRecord } from "../utils.js";
 import { resolveCommitmentsConfig } from "./config.js";
 import { listPendingCommitmentsForScope, upsertInferredCommitments } from "./store.js";
@@ -179,13 +184,30 @@ export async function hydrateCommitmentExtractionItem(params: {
 }
 
 function formatExistingPending(item: CommitmentExtractionItem) {
-  return item.existingPending.map((commitment) => ({
-    kind: commitment.kind,
-    reason: commitment.reason,
-    dedupeKey: commitment.dedupeKey,
-    earliest: new Date(commitment.earliestMs).toISOString(),
-    latest: new Date(commitment.latestMs).toISOString(),
-  }));
+  return item.existingPending.flatMap((commitment) => {
+    const earliest = timestampMsToIsoString(commitment.earliestMs);
+    const latest = timestampMsToIsoString(commitment.latestMs);
+    if (!earliest || !latest) {
+      return [];
+    }
+    return [
+      {
+        kind: commitment.kind,
+        reason: commitment.reason,
+        dedupeKey: commitment.dedupeKey,
+        earliest,
+        latest,
+      },
+    ];
+  });
+}
+
+function formatExtractionNow(valueMs: unknown): string {
+  return (
+    timestampMsToIsoString(valueMs) ??
+    timestampMsToIsoString(Date.now()) ??
+    "1970-01-01T00:00:00.000Z"
+  );
 }
 
 export function buildCommitmentExtractionPrompt(params: {
@@ -194,7 +216,7 @@ export function buildCommitmentExtractionPrompt(params: {
 }): string {
   const items = params.items.map((item) => ({
     itemId: item.itemId,
-    now: new Date(item.nowMs).toISOString(),
+    now: formatExtractionNow(item.nowMs),
     timezone: item.timezone,
     latestUserMessage: item.userText,
     assistantResponse: item.assistantText ?? "",
@@ -231,7 +253,11 @@ function parseDueMs(raw: string | undefined): number | undefined {
     return undefined;
   }
   const parsed = Date.parse(raw);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  if (!Number.isFinite(parsed) || parseAbsoluteTimeMs(raw) === null) {
+    return undefined;
+  }
+  // The cron parser validates the ISO shape and calendar; preserve Date.parse's existing interpretation.
+  return parsed;
 }
 
 function resolveMinimumDueMs(params: {

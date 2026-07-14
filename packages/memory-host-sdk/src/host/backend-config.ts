@@ -1,7 +1,13 @@
+// Memory Host SDK module implements backend config behavior.
 import fs from "node:fs";
 import path from "node:path";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
-  CANONICAL_ROOT_MEMORY_FILENAME,
+  normalizeStringEntries,
+  uniqueStrings,
+} from "@openclaw/normalization-core/string-normalization";
+import {
+  MEMORY_HOST_ROOT_FILENAME,
   type MemoryBackend,
   type MemoryCitationsMode,
   type MemoryQmdConfig,
@@ -10,22 +16,45 @@ import {
   type MemoryQmdSearchMode,
   type MemoryQmdStartupMode,
   type OpenClawConfig,
-  parseDurationMs,
-  resolveAgentWorkspaceDir,
+  resolveMemoryHostAgentWorkspaceDir,
   normalizeAgentId,
-  resolveUserPath,
+  resolveMemoryHostUserPath,
   type SessionSendPolicyConfig,
   splitShellArgs,
 } from "./config-utils.js";
 import { isPathInside } from "./fs-utils.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeStringEntries,
-  uniqueStrings,
-} from "./string-utils.js";
+import { parseDurationMs } from "./openclaw-runtime-config.js";
 
 function escapeQmdExactFilePattern(fileName: string): string {
   return fileName.replace(/[\\*?[\]{}()!+@]/g, "\\$&");
+}
+
+const WINDOWS_COMMAND_EXTENSION_RE =
+  /^((?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/]).*?\.(?:bat|cmd|cjs|exe|js|mjs|ps1))(?:\s+|$)/i;
+
+function resolveQmdCommand(rawCommand: string): string {
+  const trimmedCommand = rawCommand.trim();
+  const windowsCommand = resolveWindowsAbsoluteCommand(trimmedCommand);
+  if (windowsCommand) {
+    return windowsCommand;
+  }
+
+  const parsedCommand = splitShellArgs(trimmedCommand);
+  return parsedCommand?.[0] || trimmedCommand.split(/\s+/)[0] || "qmd";
+}
+
+function resolveWindowsAbsoluteCommand(rawCommand: string): string | undefined {
+  if (!path.win32.isAbsolute(rawCommand)) {
+    return undefined;
+  }
+
+  const extensionMatch = WINDOWS_COMMAND_EXTENSION_RE.exec(rawCommand);
+  if (extensionMatch) {
+    return extensionMatch[1];
+  }
+
+  const firstWhitespace = rawCommand.search(/\s/);
+  return firstWhitespace === -1 ? rawCommand : rawCommand.slice(0, firstWhitespace);
 }
 
 export type ResolvedMemoryBackendConfig = {
@@ -34,14 +63,14 @@ export type ResolvedMemoryBackendConfig = {
   qmd?: ResolvedQmdConfig;
 };
 
-export type ResolvedQmdCollection = {
+/** @public */ export type ResolvedQmdCollection = {
   name: string;
   path: string;
   pattern: string;
   kind: "memory" | "custom" | "sessions";
 };
 
-export type ResolvedQmdUpdateConfig = {
+/** @public */ export type ResolvedQmdUpdateConfig = {
   intervalMs: number;
   debounceMs: number;
   onBoot: boolean;
@@ -54,14 +83,14 @@ export type ResolvedQmdUpdateConfig = {
   embedTimeoutMs: number;
 };
 
-export type ResolvedQmdLimitsConfig = {
+/** @public */ export type ResolvedQmdLimitsConfig = {
   maxResults: number;
   maxSnippetChars: number;
   maxInjectedChars: number;
   timeoutMs: number;
 };
 
-export type ResolvedQmdSessionConfig = {
+/** @public */ export type ResolvedQmdSessionConfig = {
   enabled: boolean;
   exportDir?: string;
   retentionDays?: number;
@@ -77,6 +106,7 @@ export type ResolvedQmdConfig = {
   command: string;
   mcporter: ResolvedQmdMcporterConfig;
   searchMode: MemoryQmdSearchMode;
+  rerank?: boolean;
   searchTool?: string;
   collections: ResolvedQmdCollection[];
   sessions: ResolvedQmdSessionConfig;
@@ -159,7 +189,7 @@ function isPathInsideRoot(candidatePath: string, rootPath: string): boolean {
 }
 
 function ensureUniqueName(base: string, existing: Set<string>): string {
-  let name = sanitizeName(base);
+  const name = sanitizeName(base);
   if (!existing.has(name)) {
     existing.add(name);
     return name;
@@ -179,7 +209,7 @@ function resolvePath(raw: string, workspaceDir: string): string {
     throw new Error("path required");
   }
   if (trimmed.startsWith("~") || path.isAbsolute(trimmed)) {
-    return path.normalize(resolveUserPath(trimmed));
+    return path.normalize(resolveMemoryHostUserPath(trimmed));
   }
   return path.normalize(path.resolve(workspaceDir, trimmed));
 }
@@ -216,10 +246,19 @@ function resolveDebounceMs(raw: number | undefined): number {
 }
 
 function resolveTimeoutMs(raw: number | undefined, fallback: number): number {
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
-    return Math.floor(raw);
+  return resolvePositiveIntegerConfig(raw, fallback);
+}
+
+function resolvePositiveIntegerConfig(raw: number | undefined, fallback: number): number;
+function resolvePositiveIntegerConfig(raw: number | undefined): number | undefined;
+function resolvePositiveIntegerConfig(
+  raw: number | undefined,
+  fallback?: number,
+): number | undefined {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    return fallback;
   }
-  return fallback;
+  return Math.max(1, Math.floor(raw));
 }
 
 function resolveStartupMode(raw: MemoryQmdConfig["update"]): MemoryQmdStartupMode {
@@ -238,20 +277,18 @@ function resolveStartupDelayMs(raw: number | undefined): number {
 }
 
 function resolveLimits(raw?: MemoryQmdConfig["limits"]): ResolvedQmdLimitsConfig {
-  const parsed: ResolvedQmdLimitsConfig = { ...DEFAULT_QMD_LIMITS };
-  if (raw?.maxResults && raw.maxResults > 0) {
-    parsed.maxResults = Math.floor(raw.maxResults);
-  }
-  if (raw?.maxSnippetChars && raw.maxSnippetChars > 0) {
-    parsed.maxSnippetChars = Math.floor(raw.maxSnippetChars);
-  }
-  if (raw?.maxInjectedChars && raw.maxInjectedChars > 0) {
-    parsed.maxInjectedChars = Math.floor(raw.maxInjectedChars);
-  }
-  if (raw?.timeoutMs && raw.timeoutMs > 0) {
-    parsed.timeoutMs = Math.floor(raw.timeoutMs);
-  }
-  return parsed;
+  return {
+    maxResults: resolvePositiveIntegerConfig(raw?.maxResults, DEFAULT_QMD_LIMITS.maxResults),
+    maxSnippetChars: resolvePositiveIntegerConfig(
+      raw?.maxSnippetChars,
+      DEFAULT_QMD_LIMITS.maxSnippetChars,
+    ),
+    maxInjectedChars: resolvePositiveIntegerConfig(
+      raw?.maxInjectedChars,
+      DEFAULT_QMD_LIMITS.maxInjectedChars,
+    ),
+    timeoutMs: resolvePositiveIntegerConfig(raw?.timeoutMs, DEFAULT_QMD_LIMITS.timeoutMs),
+  };
 }
 
 function resolveSearchMode(raw?: MemoryQmdConfig["searchMode"]): MemoryQmdSearchMode {
@@ -273,8 +310,7 @@ function resolveSessionConfig(
   const enabled = Boolean(cfg?.enabled);
   const exportDirRaw = cfg?.exportDir?.trim();
   const exportDir = exportDirRaw ? resolvePath(exportDirRaw, workspaceDir) : undefined;
-  const retentionDays =
-    cfg?.retentionDays && cfg.retentionDays > 0 ? Math.floor(cfg.retentionDays) : undefined;
+  const retentionDays = resolvePositiveIntegerConfig(cfg?.retentionDays);
   return {
     enabled,
     exportDir,
@@ -371,7 +407,7 @@ function resolveDefaultCollections(
     return [];
   }
   const entries: Array<{ path: string; pattern: string; base: string }> = [
-    { path: workspaceDir, pattern: CANONICAL_ROOT_MEMORY_FILENAME, base: "memory-root" },
+    { path: workspaceDir, pattern: MEMORY_HOST_ROOT_FILENAME, base: "memory-root" },
     { path: path.join(workspaceDir, "memory"), pattern: "**/*.md", base: "memory-dir" },
   ];
   return entries.map((entry) => ({
@@ -393,7 +429,7 @@ export function resolveMemoryBackendConfig(params: {
     return { backend: "builtin", citations };
   }
 
-  const workspaceDir = resolveAgentWorkspaceDir(params.cfg, normalizedAgentId);
+  const workspaceDir = resolveMemoryHostAgentWorkspaceDir(params.cfg, normalizedAgentId);
   const qmdCfg = params.cfg.memory?.qmd;
   const includeDefaultMemory = qmdCfg?.includeDefaultMemory !== false;
   const nameSet = new Set<string>();
@@ -431,12 +467,12 @@ export function resolveMemoryBackendConfig(params: {
   ];
 
   const rawCommand = qmdCfg?.command?.trim() || "qmd";
-  const parsedCommand = splitShellArgs(rawCommand);
-  const command = parsedCommand?.[0] || rawCommand.split(/\s+/)[0] || "qmd";
+  const command = resolveQmdCommand(rawCommand);
   const resolved: ResolvedQmdConfig = {
     command,
     mcporter: resolveMcporterConfig(qmdCfg?.mcporter),
     searchMode: resolveSearchMode(qmdCfg?.searchMode),
+    rerank: qmdCfg?.rerank,
     searchTool: resolveSearchTool(qmdCfg?.searchTool),
     collections,
     includeDefaultMemory,

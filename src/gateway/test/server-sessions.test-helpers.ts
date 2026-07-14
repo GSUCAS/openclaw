@@ -1,40 +1,130 @@
+/**
+ * HTTP server session fixtures shared by gateway session tests.
+ */
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
+import { expectDefined } from "@openclaw/normalization-core";
+import type { AssistantMessage, UserMessage } from "openclaw/plugin-sdk/llm";
 import { afterAll, beforeAll, beforeEach, expect, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
+import {
+  loadTranscriptEvents,
+  persistSessionTranscriptTurn,
+} from "../../config/sessions/session-accessor.js";
 import type { InternalHookEvent } from "../../hooks/internal-hooks.js";
 import { resetSystemEventsForTest } from "../../infra/system-events.js";
+import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import { startGatewayServerHarness, type GatewayServerHarness } from "../server.e2e-ws-harness.js";
 import {
   connectOk,
   embeddedRunMock,
   installGatewayTestHooks,
-  piSdkMock,
+  agentDiscoveryMock,
   rpcReq,
   testState,
   writeSessionStore,
 } from "../test-helpers.js";
 
-let sessionManagerModulePromise:
-  | Promise<typeof import("@earendil-works/pi-coding-agent")>
-  | undefined;
-let gatewayConfigModulePromise: Promise<typeof import("../../config/config.js")> | undefined;
+export const getSessionManagerModule = createLazyRuntimeModule(
+  () => import("../../agents/sessions/index.js"),
+);
 
-export async function getSessionManagerModule() {
-  sessionManagerModulePromise ??= import("@earendil-works/pi-coding-agent");
-  return await sessionManagerModulePromise;
-}
-
-export async function getGatewayConfigModule() {
-  gatewayConfigModulePromise ??= import("../../config/config.js");
-  return await gatewayConfigModulePromise;
-}
+export const getGatewayConfigModule = createLazyRuntimeModule(
+  () => import("../../config/config.js"),
+);
 
 export async function getSessionsHandlers() {
   return (await import("../server-methods/sessions.js")).sessionsHandlers;
+}
+
+export function createLinearSessionTranscript(sessionId: string, contents: string[]): string {
+  const records: Array<Record<string, unknown>> = [
+    {
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp: "2026-06-19T12:00:00.000Z",
+      cwd: "/tmp",
+    },
+  ];
+  for (const [index, content] of contents.entries()) {
+    records.push({
+      type: "message",
+      id: `${sessionId}-entry-${index}`,
+      parentId: index === 0 ? null : `${sessionId}-entry-${index - 1}`,
+      timestamp: `2026-06-19T12:00:${String(index + 1).padStart(2, "0")}.000Z`,
+      message: { role: "user", content, timestamp: index + 1 },
+    });
+  }
+  return `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+}
+
+type TestTranscriptMessage = Record<string, unknown> & {
+  role: string;
+};
+
+export async function seedSessionTranscript(params: {
+  agentId?: string;
+  messages: readonly TestTranscriptMessage[];
+  sessionId: string;
+  sessionKey: string;
+  storePath: string;
+}): Promise<void> {
+  await persistSessionTranscriptTurn(
+    {
+      agentId: params.agentId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath,
+    },
+    {
+      cwd: "/tmp",
+      updateMode: "none",
+      messages: params.messages.map((message, index) => ({
+        message: {
+          timestamp: index + 1,
+          ...message,
+        },
+        now: Date.parse(`2026-06-19T12:00:${String(index + 1).padStart(2, "0")}.000Z`),
+      })),
+    },
+  );
+}
+
+export async function seedLinearSessionTranscript(params: {
+  agentId?: string;
+  contents: readonly string[];
+  role?: string;
+  sessionId: string;
+  sessionKey: string;
+  storePath: string;
+}): Promise<void> {
+  await seedSessionTranscript({
+    agentId: params.agentId,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    storePath: params.storePath,
+    messages: params.contents.map((content) => ({
+      role: params.role ?? "user",
+      content,
+    })),
+  });
+}
+
+export async function loadSeededTranscriptEvents(params: {
+  agentId?: string;
+  sessionId: string;
+  sessionKey: string;
+  storePath: string;
+}): Promise<unknown[]> {
+  return await loadTranscriptEvents({
+    agentId: params.agentId,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    storePath: params.storePath,
+  });
 }
 
 export function createDeferred<T>() {
@@ -97,7 +187,7 @@ const subagentLifecycleHookState = vi.hoisted(() => ({
 }));
 
 const threadBindingMocks = vi.hoisted(() => ({
-  unbindThreadBindingsBySessionKey: vi.fn((_params?: unknown) => []),
+  unbindThreadBindingsBySessionKey: vi.fn(async (_params?: unknown) => []),
 }));
 const acpRuntimeMocks = vi.hoisted(() => ({
   cancel: vi.fn(async () => {}),
@@ -231,7 +321,7 @@ vi.mock("../../plugin-sdk/browser-maintenance.js", () => ({
   movePathToTrash: vi.fn(async () => {}),
 }));
 
-vi.mock("../../agents/pi-bundle-mcp-tools.js", () => ({
+vi.mock("../../agents/agent-bundle-mcp-tools.js", () => ({
   disposeSessionMcpRuntime: bundleMcpRuntimeMocks.disposeSessionMcpRuntime,
   disposeAllSessionMcpRuntimes: bundleMcpRuntimeMocks.disposeAllSessionMcpRuntimes,
   retireSessionMcpRuntime: ({ sessionId }: { sessionId?: string | null }) =>
@@ -320,6 +410,122 @@ export function setupGatewaySessionsTestHarness() {
     return { dir, storePath };
   }
 
+  async function createSelectedGlobalSessionStore() {
+    const { dir } = await createSessionStoreDir();
+    const storeTemplate = path.join(dir, "agents", "{agentId}", "sessions", "sessions.json");
+    testState.sessionStorePath = storeTemplate;
+    testState.sessionConfig = { scope: "global" };
+    testState.agentsConfig = { list: [{ id: "main", default: true }, { id: "work" }] };
+    return {
+      dir,
+      storeTemplate,
+      mainStorePath: storeTemplate.replace("{agentId}", "main"),
+      workStorePath: storeTemplate.replace("{agentId}", "work"),
+    };
+  }
+
+  async function createConfiguredGlobalAgentSessionStore({
+    writePrimeStore = false,
+    withTranscripts = false,
+  }: {
+    writePrimeStore?: boolean;
+    withTranscripts?: boolean;
+  } = {}) {
+    const { dir } = await createSessionStoreDir();
+    const storeTemplate = path.join(dir, "agents", "{agentId}", "sessions", "sessions.json");
+    testState.sessionStorePath = storeTemplate;
+    testState.sessionConfig = { scope: "global" };
+    if (writePrimeStore) {
+      await writeSessionStore({
+        entries: {},
+        storePath: path.join(dir, "prime-sessions.json"),
+      });
+    }
+
+    const mainStorePath = storeTemplate.replace("{agentId}", "main");
+    const workStorePath = storeTemplate.replace("{agentId}", "work");
+    await fs.mkdir(path.dirname(mainStorePath), { recursive: true });
+    await fs.mkdir(path.dirname(workStorePath), { recursive: true });
+    await writeSessionStore({
+      agentId: "main",
+      entries: {
+        global: sessionStoreEntry("sess-main-global"),
+      },
+      storePath: mainStorePath,
+    });
+    await writeSessionStore({
+      agentId: "work",
+      entries: {
+        global: sessionStoreEntry("sess-work-global", {
+          authProfileOverride: "github-copilot:work",
+        }),
+      },
+      storePath: workStorePath,
+    });
+    if (withTranscripts) {
+      await seedLinearSessionTranscript({
+        agentId: "main",
+        contents: ["main one", "main two"],
+        sessionId: "sess-main-global",
+        sessionKey: "global",
+        storePath: mainStorePath,
+      });
+      await seedLinearSessionTranscript({
+        agentId: "work",
+        contents: ["work one", "work two"],
+        sessionId: "sess-work-global",
+        sessionKey: "global",
+        storePath: workStorePath,
+      });
+    }
+
+    const configPath = process.env.OPENCLAW_CONFIG_PATH;
+    if (!configPath) {
+      throw new Error("OPENCLAW_CONFIG_PATH is required");
+    }
+    await fs.writeFile(
+      configPath,
+      `${JSON.stringify(
+        {
+          agents: { list: [{ id: "main", default: true }, { id: "work" }] },
+          session: { scope: "global", store: storeTemplate },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf-8",
+    );
+    const { clearConfigCache, clearRuntimeConfigSnapshot, getRuntimeConfig } =
+      await getGatewayConfigModule();
+    clearRuntimeConfigSnapshot();
+    clearConfigCache();
+
+    return {
+      clearConfigCache,
+      clearRuntimeConfigSnapshot,
+      configPath,
+      getRuntimeConfig,
+      mainStorePath,
+      workStorePath,
+    };
+  }
+
+  async function resetConfiguredGlobalAgentSessionStore({
+    clearConfigCache,
+    clearRuntimeConfigSnapshot,
+    configPath,
+  }: {
+    clearConfigCache: () => void;
+    clearRuntimeConfigSnapshot: () => void;
+    configPath: string;
+  }) {
+    testState.sessionStorePath = undefined;
+    testState.sessionConfig = undefined;
+    await fs.writeFile(configPath, "{}\n", "utf-8");
+    clearRuntimeConfigSnapshot();
+    clearConfigCache();
+  }
+
   async function seedActiveMainSession() {
     const { dir, storePath } = await createSessionStoreDir();
     await writeSingleLineSession(dir, "sess-main", "hello");
@@ -332,9 +538,12 @@ export function setupGatewaySessionsTestHarness() {
   }
 
   return {
+    createConfiguredGlobalAgentSessionStore,
     createSessionStoreDir,
+    createSelectedGlobalSessionStore,
     getHarness: requireHarness,
     openClient,
+    resetConfiguredGlobalAgentSessionStore,
     seedActiveMainSession,
   };
 }
@@ -434,6 +643,12 @@ export function expectActiveRunCleanup(
     cfg: expect.any(Object),
     requesterSessionKey,
   });
+  expectSessionQueueCleanup(expectedQueueKeys);
+  expect(embeddedRunMock.abortCalls).toEqual([sessionId]);
+  expect(embeddedRunMock.waitCalls).toEqual([sessionId]);
+}
+
+export function expectSessionQueueCleanup(expectedQueueKeys: string[]) {
   expect(sessionCleanupMocks.clearSessionQueues).toHaveBeenCalledTimes(1);
   const clearedKeys = (
     sessionCleanupMocks.clearSessionQueues.mock.calls as unknown as Array<[string[]]>
@@ -441,8 +656,6 @@ export function expectActiveRunCleanup(
   for (const key of expectedQueueKeys) {
     expect(clearedKeys).toContain(key);
   }
-  expect(embeddedRunMock.abortCalls).toEqual([sessionId]);
-  expect(embeddedRunMock.waitCalls).toEqual([sessionId]);
 }
 
 export async function getMainPreviewEntry(ws: import("ws").WebSocket) {
@@ -477,7 +690,10 @@ export async function directSessionReq<TPayload = unknown>(
   let result:
     | { ok: boolean; payload?: TPayload; error?: { code?: string; message?: string } }
     | undefined;
-  await sessionsHandlers[method]({
+  await expectDefined(
+    sessionsHandlers[method],
+    "sessions handlers entry at method",
+  )({
     req: {} as never,
     params,
     respond: (ok, payload, error) => {
@@ -494,9 +710,12 @@ export async function directSessionReq<TPayload = unknown>(
     },
     context: {
       broadcastToConnIds: vi.fn(),
+      chatAbortControllers: new Map(),
+      chatQueuedTurns: new Map(),
+      dedupe: new Map(),
       getSessionEventSubscriberConnIds: () => new Set<string>(),
-      loadGatewayModelCatalog: async () => piSdkMock.models,
-      getRuntimeConfig: getRuntimeConfig,
+      loadGatewayModelCatalog: async () => agentDiscoveryMock.models,
+      getRuntimeConfig,
       ...opts?.context,
     } as never,
     client: opts?.client ?? null,

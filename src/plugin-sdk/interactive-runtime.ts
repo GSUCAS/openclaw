@@ -1,3 +1,6 @@
+/**
+ * Runtime SDK subpath for interactive replies and message presentation helpers.
+ */
 export {
   adaptMessagePresentationForChannel,
   applyPresentationActionLimits,
@@ -13,15 +16,21 @@ export type {
   InteractiveReplySelectBlock,
   InteractiveReplyTextBlock,
   MessagePresentation,
+  MessagePresentationAction,
   MessagePresentationBlock,
   MessagePresentationButton,
   MessagePresentationButtonStyle,
   MessagePresentationButtonsBlock,
+  MessagePresentationChartBlock,
+  MessagePresentationChartSegment,
+  MessagePresentationChartSeries,
   MessagePresentationContextBlock,
   MessagePresentationDividerBlock,
   MessagePresentationInteractiveBlock,
   MessagePresentationOption,
   MessagePresentationSelectBlock,
+  MessagePresentationTableBlock,
+  MessagePresentationTableCell,
   MessagePresentationTextBlock,
   MessagePresentationTone,
   ReplyPayloadDelivery,
@@ -38,6 +47,12 @@ export {
   normalizeInteractiveReply,
   presentationToInteractiveControlsReply,
   presentationToInteractiveReply,
+  renderMessagePresentationChartFallbackText,
   renderMessagePresentationFallbackText,
+  renderMessagePresentationTableFallbackText,
+  resolveMessagePresentationActionValue,
+  resolveMessagePresentationButtonAction,
+  resolveMessagePresentationControlValue,
+  resolveMessagePresentationOptionAction,
   resolveInteractiveTextFallback,
 } from "../interactive/payload.js";

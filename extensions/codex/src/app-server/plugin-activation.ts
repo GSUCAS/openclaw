@@ -1,10 +1,13 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+/**
+ * Activates curated Codex marketplace plugins and keeps require-active
+ * marketplaces outside OpenClaw's install authority.
+ */
+import type { CodexAppInventoryCache, CodexAppInventoryRequest } from "./app-inventory-cache.js";
 import {
-  type CodexAppInventoryCache,
-  type CodexAppInventoryRequest,
-} from "./app-inventory-cache.js";
-import { CODEX_PLUGINS_MARKETPLACE_NAME, type ResolvedCodexPluginPolicy } from "./config.js";
+  CODEX_PLUGINS_MARKETPLACE_NAME,
+  CODEX_PLUGINS_WORKSPACE_MARKETPLACE_NAME,
+  type ResolvedCodexPluginPolicy,
+} from "./config.js";
 import {
   findOpenAiCuratedPluginSummary,
   pluginReadParams,
@@ -13,7 +16,8 @@ import {
 } from "./plugin-inventory.js";
 import type { v2 } from "./protocol.js";
 
-export type CodexPluginActivationReason =
+/** Terminal reason reported after trying to activate one Codex plugin policy. */
+type CodexPluginActivationReason =
   | "already_active"
   | "installed"
   | "disabled"
@@ -22,10 +26,12 @@ export type CodexPluginActivationReason =
   | "auth_required"
   | "refresh_failed";
 
-export type CodexPluginActivationDiagnostic = {
+/** Human-readable diagnostic emitted during Codex plugin activation. */
+type CodexPluginActivationDiagnostic = {
   message: string;
 };
 
+/** Result of ensuring one configured Codex plugin is installed and enabled. */
 export type CodexPluginActivationResult = {
   identity: ResolvedCodexPluginPolicy;
   ok: boolean;
@@ -36,24 +42,29 @@ export type CodexPluginActivationResult = {
   diagnostics: CodexPluginActivationDiagnostic[];
 };
 
-export type EnsureCodexPluginActivationParams = {
+/** Inputs for activating one resolved Codex plugin policy. */
+type EnsureCodexPluginActivationParams = {
   identity: ResolvedCodexPluginPolicy;
   request: CodexPluginRuntimeRequest;
   appCache?: CodexAppInventoryCache;
   appCacheKey?: string;
   installEvenIfActive?: boolean;
+  targetAppIds?: readonly string[];
 };
 
-export type CodexPluginRuntimeRefreshResult = {
+/** Diagnostics from refreshing Codex runtime surfaces after plugin activation. */
+type CodexPluginRuntimeRefreshResult = {
   diagnostics: CodexPluginActivationDiagnostic[];
 };
 
+/** Activates a curated plugin or rejects a workspace plugin that is not already active. */
 export async function ensureCodexPluginActivation(
   params: EnsureCodexPluginActivationParams,
 ): Promise<CodexPluginActivationResult> {
-  if (params.identity.marketplaceName !== CODEX_PLUGINS_MARKETPLACE_NAME) {
-    return activationFailure(params.identity, "marketplace_missing", {
-      message: "Only " + CODEX_PLUGINS_MARKETPLACE_NAME + " plugins can be activated.",
+  if (params.identity.marketplaceName === CODEX_PLUGINS_WORKSPACE_MARKETPLACE_NAME) {
+    return activationFailure(params.identity, "disabled", {
+      message:
+        "workspace-directory plugins must be installed and enabled outside OpenClaw before use.",
     });
   }
 
@@ -90,7 +101,9 @@ export async function ensureCodexPluginActivation(
     "plugin/install",
     pluginReadParams(
       resolved.marketplace,
-      params.identity.pluginName,
+      resolved.marketplace.remoteMarketplaceName && resolved.summary.remotePluginId
+        ? resolved.summary.remotePluginId
+        : params.identity.pluginName,
     ) satisfies v2.PluginInstallParams,
   )) as v2.PluginInstallResponse;
   const refreshDiagnostics: CodexPluginActivationDiagnostic[] = [];
@@ -100,6 +113,7 @@ export async function ensureCodexPluginActivation(
       request: params.request,
       appCache: params.appCache,
       appCacheKey: params.appCacheKey,
+      targetAppIds: params.targetAppIds,
     });
     refreshDiagnostics.push(...refreshResult.diagnostics);
   } catch (error) {
@@ -133,10 +147,12 @@ export async function ensureCodexPluginActivation(
   };
 }
 
-export async function refreshCodexPluginRuntimeState(params: {
+/** Forces Codex plugin, skill, hook, MCP, and app inventory refreshes after activation. */
+async function refreshCodexPluginRuntimeState(params: {
   request: CodexPluginRuntimeRequest;
   appCache?: CodexAppInventoryCache;
   appCacheKey?: string;
+  targetAppIds?: readonly string[];
 }): Promise<CodexPluginRuntimeRefreshResult> {
   const diagnostics: CodexPluginActivationDiagnostic[] = [];
   await params.request("plugin/list", {
@@ -166,6 +182,7 @@ export async function refreshCodexPluginRuntimeState(params: {
         key: params.appCacheKey,
         request,
         forceRefetch: true,
+        targetAppIds: params.targetAppIds,
       });
     } catch (error) {
       diagnostics.push({
@@ -179,105 +196,17 @@ export async function refreshCodexPluginRuntimeState(params: {
   return { diagnostics };
 }
 
-export async function ensureCodexAppsSubstrateConfig(params: {
-  codexHome: string;
-  readFile?: (filePath: string, encoding: "utf8") => Promise<string>;
-  writeFile?: (filePath: string, content: string, encoding: "utf8") => Promise<void>;
-  mkdir?: (dirPath: string, options: { recursive: true }) => Promise<unknown>;
-}): Promise<{ changed: boolean; configPath: string }> {
-  const readFile = params.readFile ?? ((filePath, encoding) => fs.readFile(filePath, encoding));
-  const writeFile =
-    params.writeFile ??
-    ((filePath, content, encoding) => fs.writeFile(filePath, content, encoding));
-  const mkdir = params.mkdir ?? ((dirPath, options) => fs.mkdir(dirPath, options));
-  const configPath = path.join(params.codexHome, "config.toml");
-  let current = "";
-  try {
-    current = await readFile(configPath, "utf8");
-  } catch (error) {
-    if (!isEnoent(error)) {
-      throw error;
-    }
-  }
-
-  const next = upsertTomlBoolean(
-    upsertTomlBoolean(current, "features", "apps", true),
-    "apps._default",
-    "enabled",
-    true,
-  );
-  if (next === current) {
-    return { changed: false, configPath };
-  }
-  await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, next, "utf8");
-  return { changed: true, configPath };
-}
-
-export function upsertTomlBoolean(
-  source: string,
-  section: string,
-  key: string,
-  value: boolean,
-): string {
-  const lines = source.replace(/\r\n/g, "\n").split("\n");
-  if (lines.length > 0 && lines.at(-1) === "") {
-    lines.pop();
-  }
-  const sectionHeaderPattern = new RegExp(`^\\s*\\[${escapeRegExp(section)}\\]\\s*(?:#.*)?$`);
-  const anySectionPattern = /^\s*\[[^\]]+\]\s*(?:#.*)?$/;
-  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=`);
-  const desiredLine = `${key} = ${value ? "true" : "false"}`;
-  const sectionStart = lines.findIndex((line) => sectionHeaderPattern.test(line));
-  if (sectionStart === -1) {
-    const nextLines = [...lines];
-    if (nextLines.length > 0 && nextLines.at(-1)?.trim()) {
-      nextLines.push("");
-    }
-    nextLines.push(`[${section}]`, desiredLine);
-    return `${nextLines.join("\n")}\n`;
-  }
-
-  let sectionEnd = lines.length;
-  for (let index = sectionStart + 1; index < lines.length; index += 1) {
-    if (anySectionPattern.test(lines[index] ?? "")) {
-      sectionEnd = index;
-      break;
-    }
-  }
-  for (let index = sectionStart + 1; index < sectionEnd; index += 1) {
-    if (keyPattern.test(lines[index] ?? "")) {
-      if (lines[index] === desiredLine) {
-        return `${lines.join("\n")}\n`;
-      }
-      const nextLines = [...lines];
-      nextLines[index] = desiredLine;
-      return `${nextLines.join("\n")}\n`;
-    }
-  }
-  const nextLines = [...lines];
-  nextLines.splice(sectionEnd, 0, desiredLine);
-  return `${nextLines.join("\n")}\n`;
-}
-
 function activationFailure(
   identity: ResolvedCodexPluginPolicy,
   reason: CodexPluginActivationReason,
   diagnostic: CodexPluginActivationDiagnostic,
+  extraDiagnostics: CodexPluginActivationDiagnostic[] = [],
 ): CodexPluginActivationResult {
   return {
     identity,
     ok: false,
     reason,
     installAttempted: false,
-    diagnostics: [diagnostic],
+    diagnostics: [diagnostic, ...extraDiagnostics],
   };
-}
-
-function isEnoent(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

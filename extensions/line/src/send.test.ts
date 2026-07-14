@@ -1,3 +1,5 @@
+// Line tests cover send plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -13,36 +15,36 @@ const {
   logVerboseMock,
   resolvePinnedHostnameWithPolicyMock,
 } = vi.hoisted(() => {
-  const pushMessageMock = vi.fn();
-  const replyMessageMock = vi.fn();
-  const showLoadingAnimationMock = vi.fn();
-  const getProfileMock = vi.fn();
-  const MessagingApiClientMock = vi.fn(function () {
+  const pushMessageMockLocal = vi.fn();
+  const replyMessageMockLocal = vi.fn();
+  const showLoadingAnimationMockLocal = vi.fn();
+  const getProfileMockLocal = vi.fn();
+  const MessagingApiClientMockLocal = vi.fn(function () {
     return {
-      pushMessage: pushMessageMock,
-      replyMessage: replyMessageMock,
-      showLoadingAnimation: showLoadingAnimationMock,
-      getProfile: getProfileMock,
+      pushMessage: pushMessageMockLocal,
+      replyMessage: replyMessageMockLocal,
+      showLoadingAnimation: showLoadingAnimationMockLocal,
+      getProfile: getProfileMockLocal,
     };
   });
-  const requireRuntimeConfigMock = vi.fn((cfg: unknown) => cfg ?? {});
-  const resolveLineAccountMock = vi.fn(() => ({ accountId: "default" }));
-  const resolveLineChannelAccessTokenMock = vi.fn(() => "line-token");
-  const recordChannelActivityMock = vi.fn();
-  const logVerboseMock = vi.fn();
-  const resolvePinnedHostnameWithPolicyMock = vi.fn();
+  const requireRuntimeConfigMockLocal = vi.fn((cfg: unknown) => cfg ?? {});
+  const resolveLineAccountMockLocal = vi.fn(() => ({ accountId: "default" }));
+  const resolveLineChannelAccessTokenMockLocal = vi.fn(() => "line-token");
+  const recordChannelActivityMockLocal = vi.fn();
+  const logVerboseMockLocal = vi.fn();
+  const resolvePinnedHostnameWithPolicyMockLocal = vi.fn();
   return {
-    pushMessageMock,
-    replyMessageMock,
-    showLoadingAnimationMock,
-    getProfileMock,
-    MessagingApiClientMock,
-    requireRuntimeConfigMock,
-    resolveLineAccountMock,
-    resolveLineChannelAccessTokenMock,
-    recordChannelActivityMock,
-    logVerboseMock,
-    resolvePinnedHostnameWithPolicyMock,
+    pushMessageMock: pushMessageMockLocal,
+    replyMessageMock: replyMessageMockLocal,
+    showLoadingAnimationMock: showLoadingAnimationMockLocal,
+    getProfileMock: getProfileMockLocal,
+    MessagingApiClientMock: MessagingApiClientMockLocal,
+    requireRuntimeConfigMock: requireRuntimeConfigMockLocal,
+    resolveLineAccountMock: resolveLineAccountMockLocal,
+    resolveLineChannelAccessTokenMock: resolveLineChannelAccessTokenMockLocal,
+    recordChannelActivityMock: recordChannelActivityMockLocal,
+    logVerboseMock: logVerboseMockLocal,
+    resolvePinnedHostnameWithPolicyMock: resolvePinnedHostnameWithPolicyMockLocal,
   };
 });
 
@@ -153,6 +155,16 @@ describe("LINE send helpers", () => {
     const quickReply = sendModule.createQuickReplyItems(labels);
 
     expect(quickReply.items).toHaveLength(13);
+  });
+
+  it("truncates quick reply labels without leaving lone surrogates", () => {
+    const label = "1234567890123456789😀";
+    const quickReply = sendModule.createQuickReplyItems([label]);
+    const item = quickReply.items?.[0] as { action: { label: string; text: string } } | undefined;
+
+    expect(item?.action.label).toBe("1234567890123456789");
+    expect(item?.action.text).toBe(label);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(item?.action.label ?? "")).toBe(false);
   });
 
   it("pushes images via normalized LINE target", async () => {
@@ -373,6 +385,24 @@ describe("LINE send helpers", () => {
     expect(pushMessageMock).not.toHaveBeenCalled();
   });
 
+  it("preserves UTF-16 boundaries in invalid recipient diagnostics", async () => {
+    await expect(
+      sendModule.pushMessagesLine(`aab😀${"x".repeat(40)}`, [{ type: "text", text: "hello" }], {
+        cfg: LINE_TEST_CFG,
+      }),
+    ).rejects.toThrow(
+      "Recipient is not a valid LINE id (case-sensitive; expected leading capital C/U/R): aab…",
+    );
+    await expect(
+      sendModule.pushMessagesLine(`aa😀${"y".repeat(40)}`, [{ type: "text", text: "hello" }], {
+        cfg: LINE_TEST_CFG,
+      }),
+    ).rejects.toThrow(
+      "Recipient is not a valid LINE id (case-sensitive; expected leading capital C/U/R): aa😀…",
+    );
+    expect(pushMessageMock).not.toHaveBeenCalled();
+  });
+
   it("accepts case-exact LINE recipients with the leading capital preserved", async () => {
     await sendModule.pushMessagesLine(
       "Cabcdef0123456789abcdef0123456789",
@@ -448,6 +478,9 @@ describe("LINE send helpers", () => {
     const firstCall = pushMessageMock.mock.calls.at(0) as [
       { messages: Array<{ quickReply?: { items: unknown[] } }> },
     ];
-    expect(firstCall[0].messages[0].quickReply?.items).toHaveLength(13);
+    const payload = expectDefined(firstCall[0], "LINE push payload");
+    expect(expectDefined(payload.messages[0], "LINE push message").quickReply?.items).toHaveLength(
+      13,
+    );
   });
 });

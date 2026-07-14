@@ -1,13 +1,25 @@
+// Telegram plugin module implements button types behavior.
+import { parseExecApprovalCommandText } from "openclaw/plugin-sdk/approval-reply-runtime";
 import { reduceInteractiveReply } from "openclaw/plugin-sdk/interactive-runtime";
 import {
   isMessagePresentationInteractiveBlock,
   normalizeMessagePresentation,
   normalizeInteractiveReply,
+  resolveMessagePresentationButtonAction,
   type InteractiveReply,
   type MessagePresentation,
   type MessagePresentationButton,
 } from "openclaw/plugin-sdk/interactive-runtime";
-import { sanitizeTelegramCallbackData } from "./approval-callback-data.js";
+import {
+  buildTelegramApprovalCallbackData,
+  hasTelegramApprovalCallbackPrefix,
+  rewriteTelegramApprovalDecisionAlias,
+  sanitizeTelegramCallbackData,
+} from "./approval-callback-data.js";
+import {
+  buildTelegramNativeCommandCallbackData,
+  buildTelegramOpaqueCallbackData,
+} from "./native-command-callback-data.js";
 
 export type TelegramButtonStyle = "danger" | "success" | "primary";
 
@@ -33,29 +45,40 @@ function toTelegramInlineButton(
   button: MessagePresentationButton,
 ): TelegramInlineButton | undefined {
   const style = toTelegramButtonStyle(button.style);
-  if (button.url) {
-    return {
-      text: button.label,
-      url: button.url,
-      style,
-    };
+  const action = resolveMessagePresentationButtonAction(button);
+  if (!action) {
+    return undefined;
   }
-  const callbackData = button.value ? sanitizeTelegramCallbackData(button.value) : undefined;
-  if (callbackData) {
-    return {
-      text: button.label,
-      callback_data: callbackData,
-      style,
-    };
+  if (action.type === "url") {
+    return { text: button.label, url: action.url, style };
   }
-  if (button.webApp?.url) {
-    return {
-      text: button.label,
-      web_app: { url: button.webApp.url },
-      style,
-    };
+  if (action.type === "web-app") {
+    return { text: button.label, web_app: { url: action.url }, style };
   }
-  return undefined;
+  if (action.type === "approval") {
+    const callbackData = buildTelegramApprovalCallbackData(action);
+    return callbackData ? { text: button.label, callback_data: callbackData, style } : undefined;
+  }
+  if (action.type === "command") {
+    const command = rewriteTelegramApprovalDecisionAlias(action.command.trim());
+    const nativeCallbackData = command
+      ? sanitizeTelegramCallbackData(buildTelegramNativeCommandCallbackData(command))
+      : undefined;
+    // Historical approval commands may consume the full callback budget. Preserve
+    // their authorized raw-command path when tgcmd: is the only overflow.
+    const callbackData =
+      nativeCallbackData ??
+      (parseExecApprovalCommandText(command) ? sanitizeTelegramCallbackData(command) : undefined);
+    return callbackData ? { text: button.label, callback_data: callbackData, style } : undefined;
+  }
+  // Reserve the full approval prefix, including malformed values, so legacy
+  // plugin callbacks cannot be consumed by the approval handler.
+  const needsOpaqueEnvelope =
+    Boolean(button.action) || hasTelegramApprovalCallbackPrefix(action.value);
+  const callbackData = sanitizeTelegramCallbackData(
+    needsOpaqueEnvelope ? buildTelegramOpaqueCallbackData(action.value) : action.value,
+  );
+  return callbackData ? { text: button.label, callback_data: callbackData, style } : undefined;
 }
 
 function chunkInteractiveButtons(
@@ -76,7 +99,7 @@ function chunkInteractiveButtons(
 /**
  * @deprecated Use buildTelegramPresentationButtons with MessagePresentation.
  */
-export function buildTelegramInteractiveButtons(
+function buildTelegramInteractiveButtons(
   interactive?: InteractiveReply,
 ): TelegramInlineButtons | undefined {
   const rows = reduceInteractiveReply(
@@ -91,6 +114,7 @@ export function buildTelegramInteractiveButtons(
         chunkInteractiveButtons(
           block.options.map((option) => ({
             label: option.label,
+            action: option.action,
             value: option.value,
           })),
           state,
@@ -118,6 +142,7 @@ export function buildTelegramPresentationButtons(
     chunkInteractiveButtons(
       block.options.map((option) => ({
         label: option.label,
+        action: option.action,
         value: option.value,
       })),
       rows,

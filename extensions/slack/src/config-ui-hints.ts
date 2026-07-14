@@ -1,3 +1,5 @@
+import { createChannelConfigUiHints } from "openclaw/plugin-sdk/channel-core";
+// Slack helper module supports config ui hints behavior.
 import type { ChannelConfigUiHint } from "openclaw/plugin-sdk/channel-core";
 
 export const slackChannelConfigUiHints = {
@@ -5,26 +7,21 @@ export const slackChannelConfigUiHints = {
     label: "Slack",
     help: "Slack channel provider configuration for bot/app tokens, streaming behavior, and DM policy controls. Keep token handling and thread behavior explicit to avoid noisy workspace interactions.",
   },
-  "dm.policy": {
-    label: "Slack DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"] (legacy: channels.slack.dm.allowFrom).',
+  enterpriseOrgInstall: {
+    label: "Slack Enterprise Grid Org Install",
+    help: 'Enable only for an Enterprise Grid org-wide bot installation. OpenClaw verifies the token with Slack auth.test at startup; DMs must be disabled or use dmPolicy="open" with allowFrom=["*"].',
   },
-  dmPolicy: {
-    label: "Slack DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"].',
-  },
-  configWrites: {
-    label: "Slack Config Writes",
-    help: "Allow Slack to write config in response to channel events/commands (default: true).",
-  },
-  "commands.native": {
-    label: "Slack Native Commands",
-    help: 'Override native commands for Slack (bool or "auto").',
-  },
-  "commands.nativeSkills": {
-    label: "Slack Native Skill Commands",
-    help: 'Override native skill commands for Slack (bool or "auto").',
-  },
+  ...createChannelConfigUiHints({
+    channelLabel: "Slack",
+    dmPolicy: { channelKey: "slack", includeLegacyNestedPolicy: true },
+    configWrites: true,
+    mentionPatterns: {
+      targetDescription: "Slack channel IDs",
+      policyNote: "Native Slack @mentions still trigger even when regex patterns are denied.",
+      denyNote: "Native @mentions still trigger.",
+    },
+    nativeCommands: true,
+  }),
   allowBots: {
     label: "Slack Allow Bot Messages",
     help: "Allow bot-authored messages to trigger Slack replies (default: false).",
@@ -64,6 +61,22 @@ export const slackChannelConfigUiHints = {
   "socketMode.pingPongLoggingEnabled": {
     label: "Slack Socket Mode Ping/Pong Logging",
     help: "Enable Slack SDK ping/pong transport logs while debugging Socket Mode websocket health.",
+  },
+  relay: {
+    label: "Slack Relay Mode",
+    help: 'Relay-delivered Slack events. Use with mode="relay" when openclaw-slack-router owns the Slack Socket Mode connection.',
+  },
+  "relay.url": {
+    label: "Slack Relay URL",
+    help: "Full websocket URL for openclaw-slack-router. Include the route path, for example ws://127.0.0.1:8081/gateway/ws.",
+  },
+  "relay.authToken": {
+    label: "Slack Relay Auth Token",
+    help: "Bearer token used by this gateway to authenticate its reverse websocket connection to openclaw-slack-router.",
+  },
+  "relay.gatewayId": {
+    label: "Slack Relay Gateway ID",
+    help: "Destination id that openclaw-slack-router uses when routing user-group mentions to this gateway.",
   },
   botToken: {
     label: "Slack Bot Token",
@@ -160,6 +173,10 @@ export const slackChannelConfigUiHints = {
   "streaming.progress.render": {
     label: "Slack Progress Renderer",
     help: 'Progress draft renderer: "text" uses one portable text body; "rich" renders structured Slack Block Kit fields with the same text fallback.',
+  },
+  "streaming.progress.nativeTaskCards": {
+    label: "Slack Native Progress Task Cards",
+    help: 'Opt in to Slack native task-card progress updates when channels.slack.streaming.mode="progress" and streaming.nativeTransport is enabled. Default: false.',
   },
   "streaming.progress.toolProgress": {
     label: "Slack Progress Tool Lines",

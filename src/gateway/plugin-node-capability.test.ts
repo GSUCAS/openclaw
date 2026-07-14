@@ -1,3 +1,5 @@
+// Plugin node capability tests cover scoped host URLs, request rewriting, and
+// authorization state attached to gateway node clients.
 import { describe, expect, test } from "vitest";
 import {
   buildPluginNodeCapabilityScopedHostUrl,
@@ -5,7 +7,6 @@ import {
   indexPluginNodeCapabilitySurfaces,
   normalizePluginNodeCapabilityScopedUrl,
   refreshClientPluginNodeCapability,
-  replacePluginNodeCapabilityInScopedHostUrl,
   setClientPluginNodeCapability,
 } from "./plugin-node-capability.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
@@ -54,13 +55,17 @@ describe("plugin node capability helpers", () => {
     });
   });
 
-  test("replaces scoped capability tokens without nesting capability prefixes", () => {
-    expect(
-      replacePluginNodeCapabilityInScopedHostUrl(
-        "http://127.0.0.1:18789/__openclaw__/cap/old-token/__openclaw__/a2ui/",
-        "new token",
-      ),
-    ).toBe("http://127.0.0.1:18789/__openclaw__/cap/new%20token/__openclaw__/a2ui");
+  test("treats the scoped path capability as authoritative over a stale query", () => {
+    const normalized = normalizePluginNodeCapabilityScopedUrl(
+      "/__openclaw__/cap/current-token/__openclaw__/canvas/?oc_cap=stale-token",
+    );
+    expect(normalized).toEqual({
+      pathname: "/__openclaw__/canvas/",
+      capability: "current-token",
+      rewrittenUrl: "/__openclaw__/canvas/?oc_cap=current-token",
+      scopedPath: true,
+      malformedScopedPath: false,
+    });
   });
 
   test("marks malformed scoped urls without authorizing a path capability", () => {
@@ -165,6 +170,29 @@ describe("plugin node capability helpers", () => {
     });
   });
 
+  test("does not refresh client plugin capabilities when the clock is invalid", () => {
+    const client = makeClient({
+      pluginSurfaceUrls: {
+        canvas: "http://127.0.0.1:18789/__openclaw__/cap/old-token",
+      },
+      pluginNodeCapabilitySurfaces: {
+        canvas: { surface: "canvas", ttlMs: 100 },
+      },
+    });
+
+    expect(
+      refreshClientPluginNodeCapability({
+        client,
+        surface: { surface: "canvas" },
+        nowMs: Number.NaN,
+      }),
+    ).toBeUndefined();
+    expect(client.pluginSurfaceUrls?.canvas).toBe(
+      "http://127.0.0.1:18789/__openclaw__/cap/old-token",
+    );
+    expect(client.pluginNodeCapabilities).toBeUndefined();
+  });
+
   test("authorizes matching plugin surface capabilities and slides expiry", () => {
     const client = makeClient({
       pluginNodeCapabilities: {
@@ -193,6 +221,39 @@ describe("plugin node capability helpers", () => {
       hasAuthorizedPluginNodeCapability({
         clients,
         surface: { surface: "files" },
+        capability: "canvas-token",
+        nowMs: 1_000,
+      }),
+    ).toBe(false);
+  });
+
+  test("rejects plugin surface capabilities when the clock is invalid", () => {
+    const client = makeClient({
+      pluginNodeCapabilities: {
+        canvas: { capability: "canvas-token", expiresAtMs: 1_500 },
+      },
+    });
+    expect(
+      hasAuthorizedPluginNodeCapability({
+        clients: new Set([client]),
+        surface: { surface: "canvas", ttlMs: 100 },
+        capability: "canvas-token",
+        nowMs: Number.NaN,
+      }),
+    ).toBe(false);
+    expect(client.pluginNodeCapabilities?.canvas?.expiresAtMs).toBe(1_500);
+  });
+
+  test("rejects plugin surface capabilities with invalid stored expiries", () => {
+    const client = makeClient({
+      pluginNodeCapabilities: {
+        canvas: { capability: "canvas-token", expiresAtMs: Number.POSITIVE_INFINITY },
+      },
+    });
+    expect(
+      hasAuthorizedPluginNodeCapability({
+        clients: new Set([client]),
+        surface: { surface: "canvas", ttlMs: 100 },
         capability: "canvas-token",
         nowMs: 1_000,
       }),

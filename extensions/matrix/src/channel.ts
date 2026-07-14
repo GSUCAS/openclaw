@@ -1,3 +1,4 @@
+// Matrix plugin module implements channel behavior.
 import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
 import {
   adaptScopedAccountAccessor,
@@ -5,7 +6,10 @@ import {
 } from "openclaw/plugin-sdk/channel-config-helpers";
 import type { ChannelDoctorAdapter } from "openclaw/plugin-sdk/channel-contract";
 import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
-import { createChannelMessageAdapterFromOutbound } from "openclaw/plugin-sdk/channel-message";
+import {
+  createChannelMessageAdapterFromOutbound,
+  createRuntimeOutboundDelegates,
+} from "openclaw/plugin-sdk/channel-outbound";
 import {
   createAllowlistProviderOpenWarningCollector,
   projectAccountConfigWarningCollector,
@@ -17,8 +21,10 @@ import {
   createResolvedDirectoryEntriesLister,
   createRuntimeDirectoryLiveAdapter,
 } from "openclaw/plugin-sdk/directory-runtime";
-import { createLazyRuntimeNamedExport } from "openclaw/plugin-sdk/lazy-runtime";
-import { createRuntimeOutboundDelegates } from "openclaw/plugin-sdk/outbound-runtime";
+import {
+  createLazyRuntimeNamedExport,
+  createLazyRuntimeModule,
+} from "openclaw/plugin-sdk/lazy-runtime";
 import {
   buildProbeChannelStatusSummary,
   collectStatusIssuesFromLastError,
@@ -29,7 +35,10 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { chunkTextForOutbound } from "openclaw/plugin-sdk/text-chunking";
+import {
+  chunkTextForOutbound,
+  sanitizeAssistantVisibleText,
+} from "openclaw/plugin-sdk/text-chunking";
 import { matrixMessageActions } from "./actions.js";
 import { matrixApprovalCapability } from "./approval-native.js";
 import { createMatrixPairingText, createMatrixProbeAccount } from "./channel-account-paths.js";
@@ -69,8 +78,10 @@ import {
   singleAccountKeysToMove,
 } from "./setup-contract.js";
 import { createMatrixSetupWizardProxy, matrixSetupAdapter } from "./setup-core.js";
-import { runMatrixStartupMaintenance } from "./startup-maintenance.js";
-import { resolveMatrixInboundConversation } from "./thread-binding-api.js";
+import {
+  defaultTopLevelPlacement,
+  resolveMatrixInboundConversation,
+} from "./thread-binding-api.js";
 import type { CoreConfig } from "./types.js";
 // Mutex for serializing account startup (workaround for concurrent dynamic import race condition)
 let matrixStartupLock: Promise<void> = Promise.resolve();
@@ -84,6 +95,8 @@ const loadMatrixChannelRuntime = createLazyRuntimeNamedExport(
   "matrixChannelRuntime",
 );
 
+const loadMatrixDoctorModule = createLazyRuntimeModule(() => import("./doctor.js"));
+
 const meta = {
   id: "matrix",
   label: "Matrix",
@@ -92,6 +105,7 @@ const meta = {
   docsLabel: "matrix",
   blurb: "open protocol; configure a homeserver + access token.",
   order: 70,
+  markdownCapable: true,
   quickstartAllowFrom: true,
 };
 
@@ -115,9 +129,9 @@ const matrixDoctor: ChannelDoctorAdapter = {
   legacyConfigRules: MATRIX_LEGACY_CONFIG_RULES,
   normalizeCompatibilityConfig: normalizeMatrixCompatibilityConfig,
   runConfigSequence: async ({ cfg, env, shouldRepair }) =>
-    await (await import("./doctor.js")).runMatrixDoctorSequence({ cfg, env, shouldRepair }),
+    await (await loadMatrixDoctorModule()).runMatrixDoctorSequence({ cfg, env, shouldRepair }),
   cleanStaleConfig: async ({ cfg }) =>
-    await (await import("./doctor.js")).cleanStaleMatrixPluginConfig(cfg),
+    await (await loadMatrixDoctorModule()).cleanStaleMatrixPluginConfig(cfg),
 };
 
 const listMatrixDirectoryPeersFromConfig =
@@ -326,6 +340,7 @@ const matrixChannelOutbound: ChannelOutboundAdapter = {
   chunker: chunkTextForOutbound,
   chunkerMode: "markdown",
   textChunkLimit: 4000,
+  sanitizeText: ({ text }) => sanitizeAssistantVisibleText(text),
   deliveryCapabilities: {
     durableFinal: {
       text: true,
@@ -441,7 +456,7 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
       },
       conversationBindings: {
         supportsCurrentConversationBinding: true,
-        defaultTopLevelPlacement: "child",
+        defaultTopLevelPlacement,
         setIdleTimeoutBySessionKey: ({ targetSessionKey, accountId, idleTimeoutMs }) =>
           setMatrixThreadBindingIdleTimeoutBySessionKey({
             targetSessionKey,
@@ -533,9 +548,9 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
           buildProbeChannelStatusSummary(snapshot, { baseUrl: snapshot.baseUrl ?? null }),
         probeAccount: async ({ account, timeoutMs, cfg }) =>
           await createMatrixProbeAccount({
-            resolveMatrixAuth: async ({ cfg, accountId }) =>
+            resolveMatrixAuth: async ({ cfg: cfgLocal, accountId }) =>
               (await loadMatrixChannelRuntime()).resolveMatrixAuth({
-                cfg,
+                cfg: cfgLocal,
                 accountId,
               }),
             probeMatrix: async (params) =>
@@ -606,9 +621,6 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
         },
       },
       doctor: matrixDoctor,
-      lifecycle: {
-        runStartupMaintenance: runMatrixStartupMaintenance,
-      },
       heartbeat: {
         sendTyping: async ({ cfg, to, accountId }) => {
           await (

@@ -1,15 +1,31 @@
+// Covers shell environment fallback loading.
 import fs from "node:fs";
 import os from "node:os";
-import { describe, expect, it, vi } from "vitest";
-import {
-  getShellEnvAppliedKeys,
-  getShellPathFromLoginShell,
-  loadShellEnvFallback,
-  resetShellPathCacheForTests,
-  resolveShellEnvFallbackTimeoutMs,
-  shouldDeferShellEnvFallback,
-  shouldEnableShellEnvFallback,
-} from "./shell-env.js";
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+type ShellEnvModule = typeof import("./shell-env.js");
+
+let clearShellEnvAppliedKeys: ShellEnvModule["clearShellEnvAppliedKeys"];
+let getShellEnvAppliedKeys: ShellEnvModule["getShellEnvAppliedKeys"];
+let getShellPathFromLoginShell: ShellEnvModule["getShellPathFromLoginShell"];
+let loadShellEnvFallback: ShellEnvModule["loadShellEnvFallback"];
+let resolveShellEnvFallbackTimeoutMs: ShellEnvModule["resolveShellEnvFallbackTimeoutMs"];
+let shouldDeferShellEnvFallback: ShellEnvModule["shouldDeferShellEnvFallback"];
+let shouldEnableShellEnvFallback: ShellEnvModule["shouldEnableShellEnvFallback"];
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({
+    clearShellEnvAppliedKeys,
+    getShellEnvAppliedKeys,
+    getShellPathFromLoginShell,
+    loadShellEnvFallback,
+    resolveShellEnvFallbackTimeoutMs,
+    shouldDeferShellEnvFallback,
+    shouldEnableShellEnvFallback,
+  } = await import("./shell-env.js"));
+});
 
 describe("shell env fallback", () => {
   function getShellPathTwice(params: {
@@ -30,7 +46,6 @@ describe("shell env fallback", () => {
   }
 
   function runShellEnvFallbackForShell(shell: string) {
-    resetShellPathCacheForTests();
     const env: NodeJS.ProcessEnv = { SHELL: shell };
     const exec = vi.fn(() => Buffer.from("OPENAI_API_KEY=from-shell\0"));
     const res = runShellEnvFallback({
@@ -118,7 +133,6 @@ describe("shell env fallback", () => {
     exec: ReturnType<typeof vi.fn>;
     platform: NodeJS.Platform;
   }) {
-    resetShellPathCacheForTests();
     return getShellPathTwiceWithExec(params);
   }
 
@@ -150,6 +164,36 @@ describe("shell env fallback", () => {
         OPENCLAW_SHELL_ENV_TIMEOUT_MS: "nope",
       }),
     ).toBe(15000);
+    expect(
+      resolveShellEnvFallbackTimeoutMs({
+        OPENCLAW_SHELL_ENV_TIMEOUT_MS: "42abc",
+      }),
+    ).toBe(15000);
+    expect(
+      resolveShellEnvFallbackTimeoutMs({
+        OPENCLAW_SHELL_ENV_TIMEOUT_MS: String(Number.MAX_SAFE_INTEGER),
+      }),
+    ).toBe(MAX_TIMER_TIMEOUT_MS);
+  });
+
+  it("caps oversized fallback exec timeouts before probing the login shell", () => {
+    const env: NodeJS.ProcessEnv = {};
+    let receivedTimeout: number | undefined;
+    const exec = vi.fn((_shell: string, _args: string[], options: { timeout?: number }) => {
+      receivedTimeout = options.timeout;
+      return Buffer.from("OPENAI_API_KEY=from-shell\0");
+    });
+
+    const res = loadShellEnvFallback({
+      enabled: true,
+      env,
+      expectedKeys: ["OPENAI_API_KEY"],
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+      exec: exec as unknown as Parameters<typeof loadShellEnvFallback>[0]["exec"],
+    });
+
+    expect(res.ok).toBe(true);
+    expect(receivedTimeout).toBe(MAX_TIMER_TIMEOUT_MS);
   });
 
   it("skips when already has all expected keys", () => {
@@ -252,7 +296,6 @@ describe("shell env fallback", () => {
   });
 
   it("reuses the cached login-shell env probe across repeated fallback reads", () => {
-    resetShellPathCacheForTests();
     const env: NodeJS.ProcessEnv = {};
     const exec = vi.fn(() =>
       Buffer.from("OPENAI_API_KEY=from-shell\0ANTHROPIC_API_KEY=from-shell-anthropic\0"),
@@ -286,7 +329,6 @@ describe("shell env fallback", () => {
   });
 
   it("caches login-shell env probe failures for repeated fallback reads", () => {
-    resetShellPathCacheForTests();
     const env: NodeJS.ProcessEnv = {};
     const logger = { warn: vi.fn() };
     const exec = vi.fn(() => {
@@ -361,6 +403,22 @@ describe("shell env fallback", () => {
       error: "boom",
     });
     expect(getShellEnvAppliedKeys()).toStrictEqual([]);
+  });
+
+  it("clears only discarded shell-applied keys", () => {
+    loadShellEnvFallback({
+      enabled: true,
+      env: {},
+      expectedKeys: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+      exec: (() =>
+        Buffer.from(
+          "OPENAI_API_KEY=openai-shell\0ANTHROPIC_API_KEY=anthropic-shell\0",
+        )) as unknown as Parameters<typeof loadShellEnvFallback>[0]["exec"],
+    });
+
+    clearShellEnvAppliedKeys(["OPENAI_API_KEY"]);
+
+    expect(getShellEnvAppliedKeys()).toEqual(["ANTHROPIC_API_KEY"]);
   });
 
   it("resolves PATH via login shell and caches it", () => {
@@ -487,7 +545,6 @@ describe("shell env fallback", () => {
   });
 
   it("sanitizes startup-related env vars before login-shell PATH probe", () => {
-    resetShellPathCacheForTests();
     const env = makeUnsafeStartupEnv();
     let receivedEnv: NodeJS.ProcessEnv | undefined;
     const exec = vi.fn((_shell: string, _args: string[], options: { env: NodeJS.ProcessEnv }) => {

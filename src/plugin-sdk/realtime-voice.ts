@@ -1,3 +1,6 @@
+/**
+ * Public SDK subpath for realtime voice provider types, runtime helpers, and talk events.
+ */
 export type { RealtimeVoiceProviderPlugin } from "../plugins/types.js";
 export type {
   RealtimeVoiceAudioFormat,
@@ -116,6 +119,7 @@ export {
   type RealtimeVoiceAgentConsultTranscriptEntry,
 } from "../talk/agent-consult-tool.js";
 export {
+  assertRealtimeVoiceAgentConsultModelSelectionUnlocked,
   consultRealtimeVoiceAgent,
   type RealtimeVoiceAgentConsultResult,
   type RealtimeVoiceAgentConsultRuntime,

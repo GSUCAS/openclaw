@@ -1,3 +1,5 @@
+// Discord tests cover chunk plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
 import { countLines, hasBalancedFences } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { chunkDiscordText, chunkDiscordTextWithMode } from "./chunk.js";
@@ -12,6 +14,18 @@ describe("chunkDiscordText", () => {
     for (const chunk of chunks) {
       expect(countLines(chunk)).toBeLessThanOrEqual(20);
     }
+  });
+
+  it("uses default chunk limits for non-finite options", () => {
+    const text = "x".repeat(2500);
+    const chunks = chunkDiscordText(text, {
+      maxChars: Number.NaN,
+      maxLines: Number.POSITIVE_INFINITY,
+    });
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.length <= 2000)).toBe(true);
+    expect(chunks.join("")).toBe(text);
   });
 
   it("keeps fenced code blocks balanced across chunks", () => {
@@ -40,6 +54,19 @@ describe("chunkDiscordText", () => {
     expect(chunks).toEqual([text]);
   });
 
+  it("uses default newline chunk limits for non-finite max chars", () => {
+    const text = "x".repeat(2500);
+    const chunks = chunkDiscordTextWithMode(text, {
+      maxChars: Number.NaN,
+      maxLines: 50,
+      chunkMode: "newline",
+    });
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.length <= 2000)).toBe(true);
+    expect(chunks.join("")).toBe(text);
+  });
+
   it("reserves space for closing fences when chunking", () => {
     const body = "a".repeat(120);
     const text = `\`\`\`txt\n${body}\n\`\`\``;
@@ -49,6 +76,17 @@ describe("chunkDiscordText", () => {
     for (const chunk of chunks) {
       expect(chunk.length).toBeLessThanOrEqual(50);
       expect(hasBalancedFences(chunk)).toBe(true);
+    }
+  });
+
+  it("keeps chunks within maxChars when a closing fence line carries trailing text", () => {
+    // A line that both closes the fence and carries a long tail must still reserve closing-fence
+    // space; otherwise a mid-line flush appended "```" and overflowed maxChars (e.g. 2004 > 2000).
+    for (let pad = 1990; pad <= 2000; pad++) {
+      const text = "hi\n```lang\n```" + "z".repeat(pad);
+      for (const chunk of chunkDiscordText(text, { maxChars: 2000, maxLines: 100 })) {
+        expect(chunk.length).toBeLessThanOrEqual(2000);
+      }
     }
   });
 
@@ -111,9 +149,9 @@ describe("chunkDiscordText", () => {
     }
 
     // Ensure italics reopen on subsequent chunks
-    expect(chunks[0]).toContain("_1. line");
+    expect(expectDefined(chunks[0], "first Discord chunk")).toContain("_1. line");
     // Second chunk should reopen italics at the start
-    expect(chunks[1].trimStart().startsWith("_")).toBe(true);
+    expect(expectDefined(chunks[1], "second Discord chunk").trimStart().startsWith("_")).toBe(true);
   });
 
   it("keeps reasoning italics balanced when chunks split by char limit", () => {
@@ -163,7 +201,7 @@ describe("chunkDiscordText", () => {
     const chunks = chunkDiscordText(text, { maxLines: 10, maxChars: 2000 });
     expect(chunks.length).toBeGreaterThan(1);
 
-    const second = chunks[1];
+    const second = expectDefined(chunks[1], "second Discord chunk");
     expect(second.startsWith("_")).toBe(true);
     expect(second).toContain("  11. indented line");
   });

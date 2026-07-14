@@ -1,11 +1,12 @@
+// Agent run control tests cover talk-driven agent pause and resume behavior.
 import { describe, expect, it, vi } from "vitest";
+import type { RealtimeVoiceAgentRunActivity } from "./agent-run-control-shared.js";
 import {
   classifyRealtimeVoiceAgentControlText,
   controlRealtimeVoiceAgentRun,
   parseRealtimeVoiceAgentControlToolArgs,
   resolveRealtimeVoiceAgentControlIntent,
   shouldAutoControlRealtimeVoiceAgentText,
-  type RealtimeVoiceAgentRunActivity,
 } from "./agent-run-control.js";
 import type { TalkEvent } from "./talk-events.js";
 
@@ -17,9 +18,13 @@ function createDeps(options: {
   reason?: "no_active_run" | "not_streaming" | "compacting" | "runtime_rejected";
 }) {
   return {
-    abortEmbeddedPiRun: vi.fn(() => options.abortResult ?? true),
-    queueEmbeddedPiMessageWithOutcomeAsync: vi.fn(
-      async (sessionId: string, _text: string, _options?: { steeringMode?: "all" }) =>
+    abortEmbeddedAgentRun: vi.fn(() => options.abortResult ?? true),
+    queueEmbeddedAgentMessageWithOutcomeAsync: vi.fn(
+      async (
+        sessionId: string,
+        _text: string,
+        _options?: { steeringMode?: "all"; taskSuggestionDeliveryMode?: undefined },
+      ) =>
         options.queued === false
           ? {
               queued: false as const,
@@ -139,10 +144,10 @@ describe("controlRealtimeVoiceAgentRun", () => {
       speak: true,
       suppress: false,
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).toHaveBeenCalledWith(
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).toHaveBeenCalledWith(
       "session-active",
       "use the safer path",
-      { steeringMode: "all", debounceMs: 0 },
+      { steeringMode: "all", debounceMs: 0, taskSuggestionDeliveryMode: undefined },
     );
   });
 
@@ -159,7 +164,7 @@ describe("controlRealtimeVoiceAgentRun", () => {
     );
 
     expect(result).toMatchObject({ ok: true, mode: "followup", speak: true });
-    const queuedText = deps.queueEmbeddedPiMessageWithOutcomeAsync.mock.calls[0]?.[1] ?? "";
+    const queuedText = deps.queueEmbeddedAgentMessageWithOutcomeAsync.mock.calls[0]?.[1] ?? "";
     expect(queuedText).toContain("Spoken follow-up for the current voice call.");
     expect(queuedText).toContain("also check the migration");
   });
@@ -186,8 +191,8 @@ describe("controlRealtimeVoiceAgentRun", () => {
         message: "Cancelled the active OpenClaw run.",
       },
     });
-    expect(deps.abortEmbeddedPiRun).toHaveBeenCalledWith("session-active");
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.abortEmbeddedAgentRun).toHaveBeenCalledWith("session-active");
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
   it("answers status from recent Talk tool events", async () => {
@@ -222,7 +227,7 @@ describe("controlRealtimeVoiceAgentRun", () => {
       active: true,
       message: "OpenClaw is working in read (running).",
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
   it("answers status from diagnostic run activity when Talk events are absent", async () => {
@@ -249,7 +254,7 @@ describe("controlRealtimeVoiceAgentRun", () => {
       active: true,
       message: "OpenClaw is running exec_command.",
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
   it("does not report stale control tool progress after the active run ends", async () => {
@@ -284,7 +289,7 @@ describe("controlRealtimeVoiceAgentRun", () => {
       active: false,
       message: "I'm not working on an active request right now.",
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
   it("skips control tool progress when reporting active run status", async () => {
@@ -330,7 +335,7 @@ describe("controlRealtimeVoiceAgentRun", () => {
       active: true,
       message: "OpenClaw is working in exec_command (running).",
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
   it("returns a structured rejection when no run is active", async () => {
@@ -352,6 +357,6 @@ describe("controlRealtimeVoiceAgentRun", () => {
       queued: false,
       reason: "no_active_run",
     });
-    expect(deps.queueEmbeddedPiMessageWithOutcomeAsync).not.toHaveBeenCalled();
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,5 @@
+import { createChannelConfigUiHints } from "openclaw/plugin-sdk/channel-core";
+// Discord helper module supports config ui hints behavior.
 import type { ChannelConfigUiHint } from "openclaw/plugin-sdk/channel-core";
 
 export const discordChannelConfigUiHints = {
@@ -5,30 +7,25 @@ export const discordChannelConfigUiHints = {
     label: "Discord",
     help: "Discord channel provider configuration for bot auth, retry policy, streaming, thread bindings, and optional voice capabilities. Keep privileged intents and advanced features disabled unless needed.",
   },
-  dmPolicy: {
-    label: "Discord DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.discord.allowFrom=["*"].',
-  },
-  "dm.policy": {
-    label: "Discord DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.discord.allowFrom=["*"] (legacy: channels.discord.dm.allowFrom).',
-  },
-  configWrites: {
-    label: "Discord Config Writes",
-    help: "Allow Discord to write config in response to channel events/commands (default: true).",
-  },
+  ...createChannelConfigUiHints({
+    channelLabel: "Discord",
+    dmPolicy: {
+      channelKey: "discord",
+      includeLegacyNestedPolicy: true,
+      legacyNestedPolicyOrder: "after",
+    },
+    configWrites: true,
+    mentionPatterns: {
+      targetDescription: "Discord channel IDs",
+      policyNote: "Native Discord @mentions still trigger even when regex patterns are denied.",
+      denyNote: "Native @mentions still trigger.",
+    },
+  }),
   proxy: {
     label: "Discord Proxy URL",
     help: "Proxy URL for Discord gateway + API requests (app-id lookup and allowlist resolution). Set per account via channels.discord.accounts.<id>.proxy.",
   },
-  "commands.native": {
-    label: "Discord Native Commands",
-    help: 'Override native commands for Discord (bool or "auto").',
-  },
-  "commands.nativeSkills": {
-    label: "Discord Native Skill Commands",
-    help: 'Override native skill commands for Discord (bool or "auto").',
-  },
+  ...createChannelConfigUiHints({ channelLabel: "Discord", nativeCommands: true }),
   streaming: {
     label: "Discord Streaming Mode",
     help: 'Unified Discord stream preview mode: "off" | "partial" | "block" | "progress". "progress" keeps a single editable progress draft until final delivery. Legacy boolean/streamMode keys are auto-mapped.',
@@ -69,46 +66,11 @@ export const discordChannelConfigUiHints = {
     label: "Discord Draft Command Text",
     help: 'Command/exec detail in preview tool-progress lines: "raw" preserves released behavior; "status" shows only the tool label.',
   },
-  "streaming.progress.label": {
-    label: "Discord Progress Label",
-    help: 'Initial progress draft title. Use "auto" for built-in single-word labels, a custom string, or false to hide the title.',
-  },
-  "streaming.progress.labels": {
-    label: "Discord Progress Label Pool",
-    help: 'Candidate labels for streaming.progress.label="auto". Leave unset to use OpenClaw built-in progress labels.',
-  },
-  "streaming.progress.maxLines": {
-    label: "Discord Progress Max Lines",
-    help: "Maximum number of compact progress lines to keep below the draft label (default: 8).",
-  },
-  "streaming.progress.maxLineChars": {
-    label: "Discord Progress Max Line Chars",
-    help: "Maximum characters per compact progress line before truncation (default: 120). Prose cuts at word boundaries; commands and paths keep useful suffixes.",
-  },
-  "streaming.progress.toolProgress": {
-    label: "Discord Progress Tool Lines",
-    help: "Show compact tool/progress lines in progress draft mode (default: true). Set false to keep only the label until final delivery.",
-  },
-  "streaming.progress.commandText": {
-    label: "Discord Progress Command Text",
-    help: 'Command/exec detail in progress draft lines: "raw" preserves released behavior; "status" shows only the tool label.',
-  },
-  "retry.attempts": {
-    label: "Discord Retry Attempts",
-    help: "Max retry attempts for outbound Discord API calls (default: 3).",
-  },
-  "retry.minDelayMs": {
-    label: "Discord Retry Min Delay (ms)",
-    help: "Minimum retry delay in ms for Discord outbound calls.",
-  },
-  "retry.maxDelayMs": {
-    label: "Discord Retry Max Delay (ms)",
-    help: "Maximum retry delay cap in ms for Discord outbound calls.",
-  },
-  "retry.jitter": {
-    label: "Discord Retry Jitter",
-    help: "Jitter factor (0-1) applied to Discord retry delays.",
-  },
+  ...createChannelConfigUiHints({
+    channelLabel: "Discord",
+    progress: { includeCommentary: true },
+    retry: true,
+  }),
   maxLinesPerMessage: {
     label: "Discord Max Lines Per Message",
     help: "Soft max line count per Discord message (default: 17).",
@@ -191,7 +153,7 @@ export const discordChannelConfigUiHints = {
   },
   "voice.model": {
     label: "Discord Voice Model",
-    help: "Optional LLM model override for Discord voice channel responses and realtime agent consults (for example openai-codex/gpt-5.5). Leave unset to inherit the routed agent model.",
+    help: "Optional LLM model override for Discord voice channel responses and realtime agent consults (for example openai/gpt-5.6-sol). Leave unset to inherit the routed agent model.",
   },
   "voice.mode": {
     label: "Discord Voice Mode",
@@ -219,11 +181,19 @@ export const discordChannelConfigUiHints = {
   },
   "voice.realtime.model": {
     label: "Discord Realtime Model",
-    help: "Provider realtime session model, such as gpt-realtime-2. This is separate from voice.model, which remains the OpenClaw agent brain model.",
+    help: "Provider realtime session model, such as gpt-realtime-2.1. This is separate from voice.model, which remains the OpenClaw agent brain model.",
+  },
+  "voice.realtime.speakerVoice": {
+    label: "Discord Realtime Speaker Voice",
+    help: "Provider realtime output voice name, such as cedar.",
+  },
+  "voice.realtime.speakerVoiceId": {
+    label: "Discord Realtime Speaker Voice ID",
+    help: "Provider realtime output voice id.",
   },
   "voice.realtime.voice": {
     label: "Discord Realtime Voice",
-    help: "Provider realtime output voice, such as cedar.",
+    help: "Deprecated provider realtime output voice. Use voice.realtime.speakerVoice.",
   },
   "voice.realtime.toolPolicy": {
     label: "Discord Realtime Tool Policy",

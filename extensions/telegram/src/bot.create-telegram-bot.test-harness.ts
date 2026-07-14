@@ -1,3 +1,4 @@
+// Telegram plugin module implements bot.create telegram bot harness behavior.
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
@@ -8,19 +9,23 @@ import { beforeEach, vi } from "vitest";
 import type { TelegramBotDeps } from "./bot-deps.js";
 
 type AnyMock = ReturnType<typeof vi.fn>;
-type AnyAsyncMock = ReturnType<typeof vi.fn>;
+type AnyAsyncMock = ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<unknown>>>;
 type GetRuntimeConfigFn =
   typeof import("openclaw/plugin-sdk/runtime-config-snapshot").getRuntimeConfig;
-type LoadSessionStoreFn =
-  typeof import("openclaw/plugin-sdk/session-store-runtime").loadSessionStore;
+type GetSessionEntryFn = typeof import("openclaw/plugin-sdk/session-store-runtime").getSessionEntry;
+type ListSessionEntriesFn =
+  typeof import("openclaw/plugin-sdk/session-store-runtime").listSessionEntries;
 type ResolveStorePathFn =
   typeof import("openclaw/plugin-sdk/session-store-runtime").resolveStorePath;
 type ReadSessionUpdatedAtFn =
   typeof import("openclaw/plugin-sdk/session-store-runtime").readSessionUpdatedAt;
-type SessionStore = ReturnType<LoadSessionStoreFn>;
+type SessionEntry = import("openclaw/plugin-sdk/session-store-runtime").SessionEntry;
+type SessionStore = Record<string, SessionEntry>;
+type LoadSessionStoreFn = (storePath?: string, opts?: unknown) => SessionStore;
 type TelegramBotRuntimeForTest = NonNullable<
   Parameters<typeof import("./bot.js").setTelegramBotRuntimeForTest>[0]
 >;
+type ResolveTelegramApprovalForTest = NonNullable<TelegramBotDeps["resolveApproval"]>;
 type DispatchReplyWithBufferedBlockDispatcherFn =
   typeof import("openclaw/plugin-sdk/reply-dispatch-runtime").dispatchReplyWithBufferedBlockDispatcher;
 type DispatchReplyWithBufferedBlockDispatcherResult = Awaited<
@@ -60,7 +65,9 @@ vi.mock("openclaw/plugin-sdk/web-media", () => ({
 }));
 
 const {
+  getSessionEntryMock,
   getRuntimeConfig,
+  listSessionEntriesMock,
   loadSessionStoreMock,
   readSessionUpdatedAtMock,
   recordInboundSessionMock,
@@ -68,7 +75,9 @@ const {
   sessionStoreEntries,
 } = vi.hoisted(
   (): {
+    getSessionEntryMock: MockFn<GetSessionEntryFn>;
     getRuntimeConfig: MockFn<GetRuntimeConfigFn>;
+    listSessionEntriesMock: MockFn<ListSessionEntriesFn>;
     loadSessionStoreMock: MockFn<LoadSessionStoreFn>;
     readSessionUpdatedAtMock: MockFn<ReadSessionUpdatedAtFn>;
     recordInboundSessionMock: MockFn<NonNullable<TelegramBotDeps["recordInboundSession"]>>;
@@ -76,12 +85,23 @@ const {
     sessionStoreEntries: { value: SessionStore };
   } => ({
     getRuntimeConfig: vi.fn<GetRuntimeConfigFn>(() => ({})),
-    loadSessionStoreMock: vi.fn<LoadSessionStoreFn>(
-      (_storePath, _opts) => sessionStoreEntries.value,
-    ),
     resolveStorePathMock: vi.fn<ResolveStorePathFn>(
       (storePath?: string) => storePath ?? sessionStorePath,
     ),
+    loadSessionStoreMock: vi.fn<LoadSessionStoreFn>(
+      (_storePath, _opts) => sessionStoreEntries.value,
+    ),
+    getSessionEntryMock: vi.fn<GetSessionEntryFn>(({ storePath, sessionKey, agentId }) => {
+      const resolvedStorePath = storePath ?? resolveStorePathMock(undefined, { agentId });
+      return loadSessionStoreMock(resolvedStorePath)[sessionKey];
+    }),
+    listSessionEntriesMock: vi.fn<ListSessionEntriesFn>(({ storePath, agentId } = {}) => {
+      const resolvedStorePath = storePath ?? resolveStorePathMock(undefined, { agentId });
+      return Object.entries(loadSessionStoreMock(resolvedStorePath)).map(([sessionKey, entry]) => ({
+        sessionKey,
+        entry,
+      }));
+    }),
     readSessionUpdatedAtMock: vi.fn<ReadSessionUpdatedAtFn>(() => undefined),
     recordInboundSessionMock: vi.fn(async () => undefined),
     sessionStoreEntries: { value: {} as SessionStore },
@@ -103,7 +123,7 @@ export function setSessionStoreEntriesForTest(entries: SessionStore) {
 const { readChannelAllowFromStore, upsertChannelPairingRequest } = vi.hoisted(
   (): {
     readChannelAllowFromStore: MockFn<TelegramBotDeps["readChannelAllowFromStore"]>;
-    upsertChannelPairingRequest: AnyAsyncMock;
+    upsertChannelPairingRequest: MockFn<TelegramBotDeps["upsertChannelPairingRequest"]>;
   } => ({
     readChannelAllowFromStore: vi.fn(async () => [] as string[]),
     upsertChannelPairingRequest: vi.fn(async () => ({
@@ -113,20 +133,26 @@ const { readChannelAllowFromStore, upsertChannelPairingRequest } = vi.hoisted(
   }),
 );
 
-export function getReadChannelAllowFromStoreMock(): AnyAsyncMock {
+export function getReadChannelAllowFromStoreMock(): MockFn<
+  TelegramBotDeps["readChannelAllowFromStore"]
+> {
   return readChannelAllowFromStore;
 }
 
-export function getUpsertChannelPairingRequestMock(): AnyAsyncMock {
+export function getUpsertChannelPairingRequestMock(): MockFn<
+  TelegramBotDeps["upsertChannelPairingRequest"]
+> {
   return upsertChannelPairingRequest;
 }
 
 const skillCommandListHoisted = vi.hoisted(() => ({
   listSkillCommandsForAgents: vi.fn(() => []),
 }));
-const modelProviderDataHoisted = vi.hoisted(() => ({
-  buildModelsProviderData: vi.fn(),
-}));
+const modelProviderDataHoisted = vi.hoisted(
+  (): { buildModelsProviderData: MockFn<TelegramBotDeps["buildModelsProviderData"]> } => ({
+    buildModelsProviderData: vi.fn(),
+  }),
+);
 const replySpyHoisted = vi.hoisted(() => ({
   replySpy: vi.fn(async (_ctx: MsgContext, opts?: GetReplyOptions) => {
     await opts?.onReplyStart?.();
@@ -163,7 +189,7 @@ async function dispatchHarnessReplies(
       await params.dispatcherOptions.deliver?.(finalPayload, { kind: "final" });
       finalCount += 1;
     } catch (err) {
-      params.dispatcherOptions.onError?.(err, { kind: "final" });
+      void params.dispatcherOptions.onError?.(err, { kind: "final" });
     }
   }
   return {
@@ -265,10 +291,30 @@ const systemEventsHoisted = vi.hoisted(() => ({
 }));
 export const enqueueSystemEventSpy: MockFn<TelegramBotDeps["enqueueSystemEvent"]> =
   systemEventsHoisted.enqueueSystemEventSpy;
-const execApprovalHoisted = vi.hoisted(() => ({
-  resolveExecApprovalSpy: vi.fn(async () => undefined),
-}));
-export const resolveExecApprovalSpy = execApprovalHoisted.resolveExecApprovalSpy;
+const execApprovalHoisted = vi.hoisted(
+  (): { resolveExecApprovalSpy: MockFn<ResolveTelegramApprovalForTest> } => ({
+    resolveExecApprovalSpy: vi.fn<ResolveTelegramApprovalForTest>(async () => ({
+      applied: true,
+      approval: {
+        id: "test-approval",
+        urlPath: "/approve/test-approval",
+        createdAtMs: 1,
+        expiresAtMs: 60_000,
+        resolvedAtMs: 2,
+        reason: "user",
+        status: "allowed",
+        decision: "allow-once",
+        presentation: {
+          kind: "exec",
+          commandText: "echo test",
+          allowedDecisions: ["allow-once", "deny"],
+        },
+      },
+    })),
+  }),
+);
+export const resolveExecApprovalSpy: MockFn<ResolveTelegramApprovalForTest> =
+  execApprovalHoisted.resolveExecApprovalSpy;
 
 const sentMessageCacheHoisted = vi.hoisted(() => ({
   wasSentByBot: vi.fn(() => false),
@@ -297,6 +343,7 @@ const grammySpies = vi.hoisted(() => ({
   sendChatActionSpy: vi.fn(),
   editMessageTextSpy: vi.fn(async () => ({ message_id: 88 })) as AnyAsyncMock,
   editMessageReplyMarkupSpy: vi.fn(async () => ({ message_id: 88 })) as AnyAsyncMock,
+  deleteMessageSpy: vi.fn(async () => true) as AnyAsyncMock,
   setMessageReactionSpy: vi.fn(async () => undefined) as AnyAsyncMock,
   setMyCommandsSpy: vi.fn(async () => undefined) as AnyAsyncMock,
   getMeSpy: vi.fn(async () => ({
@@ -322,14 +369,44 @@ export const answerCallbackQuerySpy: AnyAsyncMock = grammySpies.answerCallbackQu
 export const sendChatActionSpy: AnyMock = grammySpies.sendChatActionSpy;
 export const editMessageTextSpy: AnyAsyncMock = grammySpies.editMessageTextSpy;
 export const editMessageReplyMarkupSpy: AnyAsyncMock = grammySpies.editMessageReplyMarkupSpy;
+export const deleteMessageSpy: AnyAsyncMock = grammySpies.deleteMessageSpy;
 export const setMessageReactionSpy: AnyAsyncMock = grammySpies.setMessageReactionSpy;
 export const setMyCommandsSpy: AnyAsyncMock = grammySpies.setMyCommandsSpy;
-export const getMeSpy: AnyAsyncMock = grammySpies.getMeSpy;
 export const getChatSpy: AnyAsyncMock = grammySpies.getChatSpy;
 export const sendMessageSpy: AnyAsyncMock = grammySpies.sendMessageSpy;
 export const sendAnimationSpy: AnyAsyncMock = grammySpies.sendAnimationSpy;
 export const sendPhotoSpy: AnyAsyncMock = grammySpies.sendPhotoSpy;
 export const getFileSpy: AnyAsyncMock = grammySpies.getFileSpy;
+
+type RichMessageParams = {
+  chat_id?: string | number;
+  message_id?: number;
+  rich_message?: {
+    markdown?: string;
+    html?: string;
+  };
+  [key: string]: unknown;
+};
+
+function getRichMessageText(params: RichMessageParams): string {
+  return params.rich_message?.markdown ?? params.rich_message?.html ?? "";
+}
+
+function toLegacyMessageParams(params: RichMessageParams): Record<string, unknown> {
+  const { chat_id: _chatId, message_id: _messageId, rich_message: _richMessage, ...rest } = params;
+  const replyParameters = rest.reply_parameters;
+  if (
+    replyParameters &&
+    typeof replyParameters === "object" &&
+    !("quote" in replyParameters) &&
+    typeof (replyParameters as { message_id?: unknown }).message_id === "number"
+  ) {
+    rest.reply_to_message_id = (replyParameters as { message_id: number }).message_id;
+    rest.allow_sending_without_reply = true;
+    delete rest.reply_parameters;
+  }
+  return rest;
+}
 
 const runnerHoisted = vi.hoisted(() => ({
   sequentializeMiddleware: vi.fn(async (_ctx: unknown, next?: () => Promise<void>) => {
@@ -351,6 +428,7 @@ export const telegramBotRuntimeForTest: TelegramBotRuntimeForTest = {
       sendChatAction: grammySpies.sendChatActionSpy,
       editMessageText: grammySpies.editMessageTextSpy,
       editMessageReplyMarkup: grammySpies.editMessageReplyMarkupSpy,
+      deleteMessage: grammySpies.deleteMessageSpy,
       setMessageReaction: grammySpies.setMessageReactionSpy,
       setMyCommands: grammySpies.setMyCommandsSpy,
       getMe: grammySpies.getMeSpy,
@@ -359,6 +437,21 @@ export const telegramBotRuntimeForTest: TelegramBotRuntimeForTest = {
       sendAnimation: grammySpies.sendAnimationSpy,
       sendPhoto: grammySpies.sendPhotoSpy,
       getFile: grammySpies.getFileSpy,
+      raw: {
+        sendRichMessage: async (params: RichMessageParams) =>
+          grammySpies.sendMessageSpy(
+            params.chat_id,
+            getRichMessageText(params),
+            toLegacyMessageParams(params),
+          ),
+        editMessageText: async (params: RichMessageParams) =>
+          grammySpies.editMessageTextSpy(
+            params.chat_id,
+            params.message_id,
+            getRichMessageText(params),
+            toLegacyMessageParams(params),
+          ),
+      },
     };
     use = grammySpies.middlewareUseSpy;
     on = grammySpies.onSpy;
@@ -390,7 +483,8 @@ export const telegramBotRuntimeForTest: TelegramBotRuntimeForTest = {
 };
 export const telegramBotDepsForTest: TelegramBotDeps = {
   getRuntimeConfig,
-  loadSessionStore: loadSessionStoreMock as TelegramBotDeps["loadSessionStore"],
+  getSessionEntry: getSessionEntryMock,
+  listSessionEntries: listSessionEntriesMock,
   resolveStorePath: resolveStorePathMock,
   readSessionUpdatedAt: readSessionUpdatedAtMock,
   recordInboundSession: recordInboundSessionMock as TelegramBotDeps["recordInboundSession"],
@@ -411,9 +505,10 @@ export const telegramBotDepsForTest: TelegramBotDeps = {
     listSkillCommandsForAgents as TelegramBotDeps["listSkillCommandsForAgents"],
   syncTelegramMenuCommands: syncTelegramMenuCommands as TelegramBotDeps["syncTelegramMenuCommands"],
   wasSentByBot: wasSentByBot as TelegramBotDeps["wasSentByBot"],
-  resolveExecApproval: resolveExecApprovalSpy as NonNullable<
-    TelegramBotDeps["resolveExecApproval"]
-  >,
+  resolveApproval: resolveExecApprovalSpy,
+  resolveLegacyApproval: async (params) => {
+    await resolveExecApprovalSpy(params);
+  },
 };
 
 vi.doMock("./bot.runtime.js", () => telegramBotRuntimeForTest);
@@ -437,7 +532,7 @@ const DEFAULT_TELEGRAM_TEST_CONFIG: OpenClawConfig = {
   },
 };
 
-export function makeTelegramMessageCtx(params: {
+function makeTelegramMessageCtx(params: {
   chat: {
     id: number;
     type: string;
@@ -510,6 +605,19 @@ beforeEach(() => {
   loadSessionStoreMock.mockImplementation(() => sessionStoreEntries.value);
   resolveStorePathMock.mockReset();
   resolveStorePathMock.mockImplementation((storePath?: string) => storePath ?? sessionStorePath);
+  getSessionEntryMock.mockReset();
+  getSessionEntryMock.mockImplementation(({ storePath, sessionKey, agentId }) => {
+    const resolvedStorePath = storePath ?? resolveStorePathMock(undefined, { agentId });
+    return loadSessionStoreMock(resolvedStorePath)[sessionKey];
+  });
+  listSessionEntriesMock.mockReset();
+  listSessionEntriesMock.mockImplementation(({ storePath, agentId } = {}) => {
+    const resolvedStorePath = storePath ?? resolveStorePathMock(undefined, { agentId });
+    return Object.entries(loadSessionStoreMock(resolvedStorePath)).map(([sessionKey, entry]) => ({
+      sessionKey,
+      entry,
+    }));
+  });
   readSessionUpdatedAtMock.mockReset();
   readSessionUpdatedAtMock.mockReturnValue(undefined);
   recordInboundSessionMock.mockReset();
@@ -529,7 +637,24 @@ beforeEach(() => {
     return undefined;
   });
   resolveExecApprovalSpy.mockReset();
-  resolveExecApprovalSpy.mockResolvedValue(undefined);
+  resolveExecApprovalSpy.mockResolvedValue({
+    applied: true,
+    approval: {
+      id: "test-approval",
+      urlPath: "/approve/test-approval",
+      createdAtMs: 1,
+      expiresAtMs: 60_000,
+      resolvedAtMs: 2,
+      reason: "user",
+      status: "allowed",
+      decision: "allow-once",
+      presentation: {
+        kind: "exec",
+        commandText: "echo test",
+        allowedDecisions: ["allow-once", "deny"],
+      },
+    },
+  });
   dispatchReplyWithBufferedBlockDispatcher.mockReset();
   dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
     async (params: DispatchReplyHarnessParams) =>
@@ -561,8 +686,8 @@ beforeEach(() => {
   setMyCommandsSpy.mockResolvedValue(undefined);
   getChatSpy.mockReset();
   getChatSpy.mockResolvedValue(undefined);
-  getMeSpy.mockReset();
-  getMeSpy.mockResolvedValue({
+  grammySpies.getMeSpy.mockReset();
+  grammySpies.getMeSpy.mockResolvedValue({
     username: "openclaw_bot",
     has_topics_enabled: true,
   });
@@ -570,6 +695,8 @@ beforeEach(() => {
   editMessageTextSpy.mockResolvedValue({ message_id: 88 });
   editMessageReplyMarkupSpy.mockReset();
   editMessageReplyMarkupSpy.mockResolvedValue({ message_id: 88 });
+  deleteMessageSpy.mockReset();
+  deleteMessageSpy.mockResolvedValue(true);
   enqueueSystemEventSpy.mockReset();
   wasSentByBot.mockReset();
   wasSentByBot.mockReturnValue(false);

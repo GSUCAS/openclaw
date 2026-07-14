@@ -1,3 +1,4 @@
+// Discord plugin module implements message media behavior.
 import { StickerFormatType, type APIAttachment, type APIStickerItem } from "discord-api-types/v10";
 import { getFileExtension } from "openclaw/plugin-sdk/media-mime";
 import { saveRemoteMedia, type FetchLike } from "openclaw/plugin-sdk/media-runtime";
@@ -17,7 +18,6 @@ import {
   resolveDiscordReferencedReplyMessage,
   resolveDiscordSnapshotStickers,
 } from "./message-forwarded.js";
-import { mergeAbortSignals } from "./timeouts.js";
 
 const DISCORD_CDN_HOSTNAMES = [
   "cdn.discordapp.com",
@@ -52,7 +52,7 @@ export type DiscordMediaInfo = {
   placeholder: string;
 };
 
-export type DiscordMediaResolveOptions = {
+type DiscordMediaResolveOptions = {
   fetchImpl?: FetchLike;
   ssrfPolicy?: SsrFPolicy;
   readIdleTimeoutMs?: number;
@@ -253,10 +253,12 @@ async function fetchDiscordMedia(params: {
   originalFilename?: string;
 }) {
   const timeoutAbortController = params.totalTimeoutMs ? new AbortController() : undefined;
-  const signal = mergeAbortSignals([params.abortSignal, timeoutAbortController?.signal]);
+  const signal =
+    params.abortSignal && timeoutAbortController
+      ? AbortSignal.any([params.abortSignal, timeoutAbortController.signal])
+      : (params.abortSignal ?? timeoutAbortController?.signal);
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-
   const savePromise = saveRemoteMedia({
     url: params.url,
     filePathHint: params.filePathHint,
@@ -267,13 +269,12 @@ async function fetchDiscordMedia(params: {
     fallbackContentType: params.fallbackContentType,
     originalFilename: params.originalFilename,
     ...(signal ? { requestInit: { signal } } : {}),
-  }).catch((error) => {
+  }).catch((error: unknown) => {
     if (timedOut) {
       return new Promise<never>(() => {});
     }
     throw error;
   });
-
   try {
     if (!params.totalTimeoutMs) {
       return await savePromise;
@@ -365,8 +366,6 @@ function resolveStickerAssetCandidates(sticker: APIStickerItem): DiscordStickerA
           fileName: `${baseName}.json`,
         },
       ];
-    case StickerFormatType.APNG:
-    case StickerFormatType.PNG:
     default:
       return [
         { url: `${DISCORD_STICKER_ASSET_BASE_URL}/${sticker.id}.png`, fileName: `${baseName}.png` },

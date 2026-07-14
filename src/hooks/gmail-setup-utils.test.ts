@@ -1,3 +1,4 @@
+// Gmail setup utility tests cover setup file generation and config handling.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -83,6 +84,7 @@ describe("runGcloud", () => {
         await withEnvAsync(
           {
             CLOUDSDK_PYTHON: path.join(tmp, "evil", "python"),
+            CLOUDSDK_PYTHON_ARGS: "-cprint('attacker')",
             PATH: `${shimDir}${path.delimiter}/usr/bin`,
           },
           async () => {
@@ -108,7 +110,7 @@ describe("runGcloud", () => {
               ["gcloud", "config", "list"],
               {
                 timeoutMs: 120_000,
-                env: { CLOUDSDK_PYTHON: realPython },
+                env: { CLOUDSDK_PYTHON: realPython, CLOUDSDK_PYTHON_ARGS: undefined },
               },
             );
           },
@@ -124,6 +126,7 @@ describe("runGcloud", () => {
     await withEnvAsync(
       {
         CLOUDSDK_PYTHON: "/tmp/attacker-python",
+        CLOUDSDK_PYTHON_ARGS: "-cprint('attacker')",
         PATH: "",
       },
       async () => {
@@ -140,7 +143,7 @@ describe("runGcloud", () => {
         expect(runCommandWithTimeoutMock).toHaveBeenCalledTimes(1);
         expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(["gcloud", "config", "list"], {
           timeoutMs: 120_000,
-          env: { CLOUDSDK_PYTHON: undefined },
+          env: { CLOUDSDK_PYTHON: undefined, CLOUDSDK_PYTHON_ARGS: undefined },
         });
       },
     );

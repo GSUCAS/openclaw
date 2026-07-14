@@ -1,3 +1,7 @@
+/**
+ * Regression coverage for token usage normalization.
+ * Verifies provider usage aliases, OpenAI-compatible output, and prompt-token derivation.
+ */
 import { describe, expect, it } from "vitest";
 import {
   deriveContextPromptTokens,
@@ -9,6 +13,30 @@ import {
 } from "./usage.js";
 
 describe("normalizeUsage", () => {
+  it("preserves only complete context snapshots", () => {
+    expect(
+      normalizeUsage({
+        input: 12,
+        contextUsage: { state: "available", promptTokens: 148_874, totalTokens: 163_978 },
+      }),
+    ).toMatchObject({
+      input: 12,
+      contextUsage: { state: "available", promptTokens: 148_874, totalTokens: 163_978 },
+    });
+    expect(
+      normalizeUsage({
+        input: 12,
+        contextUsage: { state: "available", promptTokens: 163_978, totalTokens: 148_874 },
+      }),
+    ).toEqual({
+      input: 12,
+      output: undefined,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+      total: undefined,
+    });
+  });
+
   it("normalizes cache fields from provider response", () => {
     const usage = normalizeUsage({
       input: 1000,
@@ -126,7 +154,7 @@ describe("normalizeUsage", () => {
   });
 
   it("clamps negative input to zero (pre-subtracted cached_tokens > prompt_tokens)", () => {
-    // pi-ai OpenAI-format providers subtract cached_tokens from prompt_tokens
+    // shared model runtime OpenAI-format providers subtract cached_tokens from prompt_tokens
     // upstream.  When cached_tokens exceeds prompt_tokens the result is negative.
     const usage = normalizeUsage({
       input: -4900,
@@ -264,6 +292,39 @@ describe("toOpenAiChatCompletionsUsage", () => {
       total_tokens: 7,
     });
   });
+
+  it("forwards cached_tokens via prompt_tokens_details when cache was hit", () => {
+    expect(
+      toOpenAiChatCompletionsUsage({
+        input: 594,
+        output: 79,
+        cacheRead: 30848,
+        cacheWrite: 0,
+        total: 31521,
+      }),
+    ).toEqual({
+      prompt_tokens: 31442,
+      completion_tokens: 79,
+      total_tokens: 31521,
+      prompt_tokens_details: { cached_tokens: 30848 },
+    });
+  });
+
+  it("omits prompt_tokens_details when no cache was read", () => {
+    const result = toOpenAiChatCompletionsUsage({
+      input: 1000,
+      output: 50,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 1050,
+    });
+    expect(result).toEqual({
+      prompt_tokens: 1000,
+      completion_tokens: 50,
+      total_tokens: 1050,
+    });
+    expect("prompt_tokens_details" in result).toBe(false);
+  });
 });
 
 describe("hasNonzeroUsage", () => {
@@ -337,6 +398,66 @@ describe("deriveContextPromptTokens", () => {
     ).toBe(81_000);
   });
 
+  it("prefers explicit prompt buckets over total-minus-output fallback", () => {
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: { input: 20, cacheRead: 100, output: 30, total: 250 },
+      }),
+    ).toBe(120);
+  });
+
+  it("prefers an explicit final-iteration context snapshot over aggregate billing usage", () => {
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: {
+          input: 12,
+          output: 15_104,
+          cacheRead: 819_661,
+          cacheWrite: 93_130,
+          contextUsage: {
+            state: "available",
+            promptTokens: 148_874,
+            totalTokens: 163_978,
+          },
+          total: 927_907,
+        },
+      }),
+    ).toBe(148_874);
+  });
+
+  it("does not reconstruct context when the provider snapshot is unavailable", () => {
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: {
+          input: 12,
+          output: 15_104,
+          cacheRead: 819_661,
+          cacheWrite: 93_130,
+          contextUsage: { state: "unavailable" },
+          total: 927_907,
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not treat total-only usage as a prompt snapshot", () => {
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: { input: 1_000, total: 1_200 },
+      }),
+    ).toBe(1_000);
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: { total: 1_200 },
+      }),
+    ).toBeUndefined();
+    expect(
+      deriveContextPromptTokens({
+        lastCallUsage: { output: 200, total: 1_200 },
+      }),
+    ).toBe(1_000);
+  });
+
   it("falls back to accumulated usage when no prompt snapshot exists", () => {
     expect(
       deriveContextPromptTokens({
@@ -344,9 +465,51 @@ describe("deriveContextPromptTokens", () => {
       }),
     ).toBe(100_000);
   });
+
+  it("keeps accumulated usage on its component-based context snapshot", () => {
+    expect(
+      deriveContextPromptTokens({
+        usage: { input: 10_000, cacheRead: 26_000, output: 1_000, total: 36_000 },
+      }),
+    ).toBe(36_000);
+  });
 });
 
 describe("deriveSessionTotalTokens", () => {
+  it("prefers the explicit context snapshot over aggregate billing buckets", () => {
+    expect(
+      deriveSessionTotalTokens({
+        usage: {
+          input: 12,
+          output: 15_104,
+          cacheRead: 819_661,
+          cacheWrite: 93_130,
+          contextUsage: {
+            state: "available",
+            promptTokens: 148_874,
+            totalTokens: 163_978,
+          },
+          total: 927_907,
+        },
+      }),
+    ).toBe(148_874);
+  });
+
+  it("does not store aggregate billing as session context when the snapshot is unavailable", () => {
+    expect(
+      deriveSessionTotalTokens({
+        usage: {
+          input: 12,
+          output: 15_104,
+          cacheRead: 819_661,
+          cacheWrite: 93_130,
+          contextUsage: { state: "unavailable" },
+          total: 927_907,
+        },
+      }),
+    ).toBeUndefined();
+  });
+
   it("includes cache tokens in total calculation", () => {
     const totalTokens = deriveSessionTotalTokens({
       usage: {

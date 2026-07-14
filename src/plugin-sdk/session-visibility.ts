@@ -1,11 +1,12 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { callGateway as defaultCallGateway } from "../gateway/call.js";
-import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
+// Session visibility helpers decide which plugin sessions appear in user-facing lists.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { normalizeTrimmedStringList } from "../shared/string-normalization.js";
+} from "../../packages/normalization-core/src/string-coerce.js";
+import { normalizeTrimmedStringList } from "../../packages/normalization-core/src/string-normalization.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { callGateway as defaultCallGateway } from "../gateway/call.js";
+import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 
 type GatewayCaller = typeof defaultCallGateway;
 
@@ -18,20 +19,25 @@ export const sessionVisibilityGatewayTesting = {
   },
 };
 
+/** Configured visibility mode for session tools and session-related commands. */
 export type SessionToolsVisibility = "self" | "tree" | "agent" | "all";
 
+/** Agent-to-agent access policy compiled from `tools.agentToAgent` config. */
 export type AgentToAgentPolicy = {
   enabled: boolean;
   matchesAllow: (agentId: string) => boolean;
   isAllowed: (requesterAgentId: string, targetAgentId: string) => boolean;
 };
 
+/** Session operation whose visibility error copy should be rendered. */
 export type SessionAccessAction = "history" | "send" | "list" | "status";
 
+/** Result of checking whether one session operation may target a session. */
 export type SessionAccessResult =
   | { allowed: true }
   | { allowed: false; error: string; status: "forbidden" };
 
+/** Minimal session row metadata needed to evaluate ownership and cross-agent access. */
 export type SessionVisibilityRow = {
   key: string;
   agentId?: string;
@@ -40,6 +46,7 @@ export type SessionVisibilityRow = {
   parentSessionKey?: string;
 };
 
+/** List sessions spawned by the requester through the gateway session list method. */
 export async function listSpawnedSessionKeys(params: {
   requesterSessionKey: string;
   limit?: number;
@@ -66,6 +73,7 @@ export async function listSpawnedSessionKeys(params: {
   }
 }
 
+/** Resolve configured session-tool visibility, defaulting invalid or missing values to tree. */
 export function resolveSessionToolsVisibility(cfg: OpenClawConfig): SessionToolsVisibility {
   const raw = (cfg.tools as { sessions?: { visibility?: unknown } } | undefined)?.sessions
     ?.visibility;
@@ -76,6 +84,7 @@ export function resolveSessionToolsVisibility(cfg: OpenClawConfig): SessionTools
   return "tree";
 }
 
+/** Resolve visibility after applying sandbox clamps for spawned-session-only agents. */
 export function resolveEffectiveSessionToolsVisibility(params: {
   cfg: OpenClawConfig;
   sandboxed: boolean;
@@ -91,6 +100,7 @@ export function resolveEffectiveSessionToolsVisibility(params: {
   return visibility;
 }
 
+/** Resolve sandbox-specific session visibility clamp for agent defaults. */
 export function resolveSandboxSessionToolsVisibility(cfg: OpenClawConfig): "spawned" | "all" {
   return cfg.agents?.defaults?.sandbox?.sessionToolsVisibility ?? "spawned";
 }
@@ -159,6 +169,7 @@ function matchesCompiledWildcard(
   return true;
 }
 
+/** Compile agent-to-agent allow rules into reusable matching predicates. */
 export function createAgentToAgentPolicy(cfg: OpenClawConfig): AgentToAgentPolicy {
   const routingA2A = cfg.tools?.agentToAgent;
   const enabled = routingA2A?.enabled === true;
@@ -235,16 +246,18 @@ function a2aDeniedMessage(action: SessionAccessAction): string {
 }
 
 function crossVisibilityMessage(action: SessionAccessAction): string {
+  const suffix =
+    "Set tools.sessions.visibility=all and tools.agentToAgent.enabled=true to allow cross-agent access; use tools.agentToAgent.allow to restrict permitted agent pairs.";
   if (action === "history") {
-    return "Session history visibility is restricted. Set tools.sessions.visibility=all to allow cross-agent access.";
+    return `Session history visibility is restricted. ${suffix}`;
   }
   if (action === "send") {
-    return "Session send visibility is restricted. Set tools.sessions.visibility=all to allow cross-agent access.";
+    return `Session send visibility is restricted. ${suffix}`;
   }
   if (action === "status") {
-    return "Session status visibility is restricted. Set tools.sessions.visibility=all to allow cross-agent access.";
+    return `Session status visibility is restricted. ${suffix}`;
   }
-  return "Session list visibility is restricted. Set tools.sessions.visibility=all to allow cross-agent access.";
+  return `Session list visibility is restricted. ${suffix}`;
 }
 
 function selfVisibilityMessage(action: SessionAccessAction): string {
@@ -255,8 +268,10 @@ function treeVisibilityMessage(action: SessionAccessAction): string {
   return `${actionPrefix(action)} visibility is restricted to the current session tree (tools.sessions.visibility=tree).`;
 }
 
+/** Create a direct session-key visibility checker for one requester/action pair. */
 export function createSessionVisibilityChecker(params: {
   action: SessionAccessAction;
+  requesterAgentId?: string;
   requesterSessionKey: string;
   visibility: SessionToolsVisibility;
   a2aPolicy: AgentToAgentPolicy;
@@ -265,6 +280,7 @@ export function createSessionVisibilityChecker(params: {
   const spawnedKeys = params.spawnedKeys;
   const rowChecker = createSessionVisibilityRowChecker({
     action: params.action,
+    requesterAgentId: params.requesterAgentId,
     requesterSessionKey: params.requesterSessionKey,
     visibility: params.visibility,
     a2aPolicy: params.a2aPolicy,
@@ -289,13 +305,17 @@ function rowOwnedByRequester(row: SessionVisibilityRow, requesterSessionKey: str
   );
 }
 
+/** Create a row-aware visibility checker that can use owner/spawn metadata. */
 export function createSessionVisibilityRowChecker(params: {
   action: SessionAccessAction;
+  requesterAgentId?: string;
   requesterSessionKey: string;
   visibility: SessionToolsVisibility;
   a2aPolicy: AgentToAgentPolicy;
 }): { check: (row: SessionVisibilityRow) => SessionAccessResult } {
-  const requesterAgentId = resolveAgentIdFromSessionKey(params.requesterSessionKey);
+  const requesterAgentId =
+    normalizeLowercaseStringOrEmpty(params.requesterAgentId) ||
+    resolveAgentIdFromSessionKey(params.requesterSessionKey);
 
   const check = (row: SessionVisibilityRow): SessionAccessResult => {
     const targetSessionKey = row.key;
@@ -360,8 +380,10 @@ export function createSessionVisibilityRowChecker(params: {
   return { check };
 }
 
+/** Create a visibility guard, loading spawned-session ownership when direct keys need it. */
 export async function createSessionVisibilityGuard(params: {
   action: SessionAccessAction;
+  requesterAgentId?: string;
   requesterSessionKey: string;
   visibility: SessionToolsVisibility;
   a2aPolicy: AgentToAgentPolicy;
@@ -376,6 +398,7 @@ export async function createSessionVisibilityGuard(params: {
       : null;
   return createSessionVisibilityChecker({
     action: params.action,
+    requesterAgentId: params.requesterAgentId,
     requesterSessionKey: params.requesterSessionKey,
     visibility: params.visibility,
     a2aPolicy: params.a2aPolicy,

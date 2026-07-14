@@ -1,4 +1,5 @@
-import { resolveOutboundSendDep } from "openclaw/plugin-sdk/outbound-send-deps";
+// Imessage plugin module implements channel behavior.
+import { resolveOutboundSendDep } from "openclaw/plugin-sdk/channel-outbound";
 import { resolveIMessageDuplicateSourceOwner, type ResolvedIMessageAccount } from "./accounts.js";
 import { PAIRING_APPROVED_MESSAGE, resolveChannelMediaMaxBytes } from "./channel-api.js";
 import type { ChannelPlugin } from "./channel-api.js";
@@ -16,6 +17,7 @@ export async function sendIMessageOutbound(params: {
   text: string;
   mediaUrl?: string;
   mediaLocalRoots?: readonly string[];
+  audioAsVoice?: boolean;
   accountId?: string;
   deps?: { [channelId: string]: unknown };
   replyToId?: string;
@@ -31,14 +33,21 @@ export async function sendIMessageOutbound(params: {
       cfg.channels?.imessage?.mediaMaxMb,
     accountId: params.accountId,
   });
-  return await send(params.to, params.text, {
+  const result = await send(params.to, params.text, {
     config: params.cfg,
     ...(params.mediaUrl ? { mediaUrl: params.mediaUrl } : {}),
     ...(params.mediaLocalRoots?.length ? { mediaLocalRoots: params.mediaLocalRoots } : {}),
+    ...(params.audioAsVoice ? { audioAsVoice: true } : {}),
     maxBytes,
     accountId: params.accountId ?? undefined,
     replyToId: params.replyToId ?? undefined,
   });
+  const meta = {
+    ...(result as typeof result & { meta?: Record<string, unknown> }).meta,
+    ...(result.guid ? { imessageMessageGuid: result.guid } : {}),
+    ...(result.sentText ? { imessageVisibleText: result.sentText } : {}),
+  };
+  return Object.keys(meta).length > 0 ? { ...result, meta } : result;
 }
 
 export async function notifyIMessageApproval(params: {
@@ -56,6 +65,7 @@ export async function probeIMessageAccount(params?: {
   return await probeIMessage(params?.timeoutMs, {
     cliPath: params?.cliPath,
     dbPath: params?.dbPath,
+    forceRefresh: true,
   });
 }
 

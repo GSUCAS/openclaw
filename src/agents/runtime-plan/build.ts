@@ -1,6 +1,9 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+/**
+ * Builds prepared runtime plans consumed by embedded agent runs. A plan
+ * centralizes provider hooks, auth, tool schema policy, transcript policy,
+ * transport params, delivery, and observability for one attempt.
+ */
 import type { TSchema } from "typebox";
-import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import { isSilentReplyPayloadText, SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 import { projectConfigOntoRuntimeSourceSnapshot } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -18,12 +21,13 @@ import {
   resolveProviderTextTransforms,
   transformProviderSystemPrompt,
 } from "../../plugins/provider-runtime.js";
-import { resolvePreparedExtraParams } from "../pi-embedded-runner/extra-params.js";
-import { classifyEmbeddedPiRunResultForModelFallback } from "../pi-embedded-runner/result-fallback-classifier.js";
+import { resolvePreparedExtraParams } from "../embedded-agent-runner/extra-params.js";
+import { classifyEmbeddedAgentRunResultForModelFallback } from "../embedded-agent-runner/result-fallback-classifier.js";
 import {
   logProviderToolSchemaDiagnostics,
   normalizeProviderToolSchemas,
-} from "../pi-embedded-runner/tool-schema-runtime.js";
+} from "../embedded-agent-runner/tool-schema-runtime.js";
+import type { AgentTool } from "../runtime/index.js";
 import { resolveTranscriptPolicy } from "../transcript-policy.js";
 import { buildAgentRuntimeAuthPlan } from "./auth.js";
 import type {
@@ -50,10 +54,6 @@ function asProviderRuntimeModel(
   return value !== undefined ? (value as ProviderRuntimeModel) : undefined;
 }
 
-function asThinkLevel(value: BuildAgentRuntimePlanParams["thinkingLevel"]): ThinkLevel | undefined {
-  return value !== undefined ? (value as ThinkLevel) : undefined;
-}
-
 function isProviderRuntimePluginHandle(
   value: BuildAgentRuntimePlanParams["providerRuntimeHandle"] | ProviderRuntimePluginHandle,
 ): value is ProviderRuntimePluginHandle {
@@ -62,12 +62,18 @@ function isProviderRuntimePluginHandle(
 
 function resolveProviderRuntimeHandleForPlugins(params: {
   provider: string;
+  modelId?: string;
   config?: OpenClawConfig;
   workspaceDir?: string;
   runtimeHandle?: BuildAgentRuntimePlanParams["providerRuntimeHandle"];
   resolveWhenMissing?: boolean;
 }): ProviderRuntimePluginHandle | undefined {
-  if (isProviderRuntimePluginHandle(params.runtimeHandle)) {
+  if (
+    isProviderRuntimePluginHandle(params.runtimeHandle) &&
+    (params.runtimeHandle.plugin ||
+      !params.modelId ||
+      params.runtimeHandle.modelId === params.modelId)
+  ) {
     return params.runtimeHandle;
   }
   if (!params.runtimeHandle && !params.resolveWhenMissing) {
@@ -75,21 +81,23 @@ function resolveProviderRuntimeHandleForPlugins(params: {
   }
   return resolveProviderRuntimePluginHandle({
     provider: params.runtimeHandle?.provider ?? params.provider,
+    modelId: params.modelId,
     config: asOpenClawConfig(params.runtimeHandle?.config) ?? params.config,
     workspaceDir: params.runtimeHandle?.workspaceDir ?? params.workspaceDir,
     env: params.runtimeHandle?.env ?? process.env,
     applyAutoEnable: params.runtimeHandle?.applyAutoEnable,
-    bundledProviderAllowlistCompat: params.runtimeHandle?.bundledProviderAllowlistCompat,
     bundledProviderVitestCompat: params.runtimeHandle?.bundledProviderVitestCompat,
   });
 }
 
+/** Build delivery-specific runtime decisions for one provider/model. */
 export function buildAgentRuntimeDeliveryPlan(
   params: BuildAgentRuntimeDeliveryPlanParams,
 ): AgentRuntimeDeliveryPlan {
   const config = asOpenClawConfig(params.config);
   const providerRuntimeHandle = resolveProviderRuntimeHandleForPlugins({
     provider: params.provider,
+    modelId: params.modelId,
     config,
     workspaceDir: params.workspaceDir,
     runtimeHandle: params.providerRuntimeHandle,
@@ -124,12 +132,14 @@ export function buildAgentRuntimeDeliveryPlan(
   };
 }
 
+/** Build run-outcome classification hooks for model fallback decisions. */
 export function buildAgentRuntimeOutcomePlan(): AgentRuntimeOutcomePlan {
   return {
-    classifyRunResult: classifyEmbeddedPiRunResultForModelFallback,
+    classifyRunResult: classifyEmbeddedAgentRunResultForModelFallback,
   };
 }
 
+/** Build the complete runtime plan for an embedded agent attempt. */
 export function buildAgentRuntimePlan(params: BuildAgentRuntimePlanParams): AgentRuntimePlan {
   const config = asOpenClawConfig(params.config);
   const model = asProviderRuntimeModel(params.model);
@@ -138,6 +148,8 @@ export function buildAgentRuntimePlan(params: BuildAgentRuntimePlanParams): Agen
   const toolPlanningConfig = config ? projectConfigOntoRuntimeSourceSnapshot(config) : undefined;
   let toolPlanningMetadataSnapshot: PluginMetadataSnapshot | undefined;
   const loadToolPlanningMetadataSnapshot = () => {
+    // Metadata is process-stable for one run; load lazily because many attempts
+    // never need prepared tool planning.
     toolPlanningMetadataSnapshot ??= loadManifestMetadataSnapshot({
       config: toolPlanningConfig,
       ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
@@ -147,23 +159,29 @@ export function buildAgentRuntimePlan(params: BuildAgentRuntimePlanParams): Agen
   };
   const providerRuntimeHandleForPlugins = resolveProviderRuntimeHandleForPlugins({
     provider: params.provider,
+    modelId: params.modelId,
     config,
     workspaceDir: params.workspaceDir,
     runtimeHandle: params.providerRuntimeHandle,
     resolveWhenMissing: true,
   });
-  const auth = buildAgentRuntimeAuthPlan({
-    provider: params.provider,
-    authProfileProvider: params.authProfileProvider,
-    authProfileMode: params.authProfileMode,
-    sessionAuthProfileId: params.sessionAuthProfileId,
-    sessionAuthProfileCandidateIds: params.sessionAuthProfileCandidateIds,
-    config,
-    workspaceDir: params.workspaceDir,
-    harnessId: params.harnessId,
-    harnessRuntime: params.harnessRuntime,
-    allowHarnessAuthProfileForwarding: params.allowHarnessAuthProfileForwarding,
-  });
+  const auth =
+    params.preparedAuthPlan ??
+    buildAgentRuntimeAuthPlan({
+      provider: params.provider,
+      modelId: params.modelId,
+      authProfileProvider: params.authProfileProvider,
+      authProfileMode: params.authProfileMode,
+      sessionAuthProfileId: params.sessionAuthProfileId,
+      sessionAuthProfileSource: params.sessionAuthProfileSource,
+      sessionAuthProfileCandidateIds: params.sessionAuthProfileCandidateIds,
+      modelRoute: params.modelRoute,
+      config,
+      workspaceDir: params.workspaceDir,
+      harnessId: params.harnessId,
+      harnessRuntime: params.harnessRuntime,
+      allowHarnessAuthProfileForwarding: params.allowHarnessAuthProfileForwarding,
+    });
   const resolvedRef = {
     provider: params.provider,
     modelId: params.modelId,
@@ -216,7 +234,7 @@ export function buildAgentRuntimePlan(params: BuildAgentRuntimePlanParams): Agen
       agentDir: params.agentDir,
       workspaceDir: overrides.workspaceDir ?? params.workspaceDir,
       extraParamsOverride: overrides.extraParamsOverride ?? params.extraParamsOverride,
-      thinkingLevel: asThinkLevel(overrides.thinkingLevel ?? params.thinkingLevel),
+      thinkingLevel: overrides.thinkingLevel ?? params.thinkingLevel,
       agentId: overrides.agentId ?? params.agentId,
       model: asProviderRuntimeModel(overrides.model) ?? model,
       resolvedTransport: overrides.resolvedTransport ?? transport,
@@ -225,6 +243,8 @@ export function buildAgentRuntimePlan(params: BuildAgentRuntimePlanParams): Agen
   let memoizedTranscriptPolicy: ReturnType<typeof resolveTranscriptRuntimePolicy> | undefined;
   let memoizedTransportExtraParams: ReturnType<typeof resolveTransportExtraParams> | undefined;
   const resolveDefaultTranscriptPolicy = () => {
+    // Default getters are memoized, while override resolvers remain fresh for
+    // callers that intentionally vary workspace/model details.
     memoizedTranscriptPolicy ??= resolveTranscriptRuntimePolicy();
     return memoizedTranscriptPolicy;
   };

@@ -1,3 +1,8 @@
+/**
+ * agents_list built-in tool.
+ *
+ * Lists configured or allowed agent ids plus model/runtime metadata for subagent spawn decisions.
+ */
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import {
@@ -23,7 +28,15 @@ type AgentListEntry = {
   model?: string;
   agentRuntime?: {
     id: string;
-    source: "env" | "agent" | "defaults" | "model" | "provider" | "implicit" | "session-key";
+    source:
+      | "env"
+      | "agent"
+      | "defaults"
+      | "model"
+      | "provider"
+      | "implicit"
+      | "session"
+      | "session-key";
   };
 };
 
@@ -35,7 +48,7 @@ export function createAgentsListTool(opts?: {
   return {
     label: "Agents",
     name: "agents_list",
-    description: 'List agent ids allowed for `sessions_spawn runtime="subagent"`.',
+    description: 'List ids allowed for `sessions_spawn(runtime:"subagent")`.',
     parameters: AgentsListToolSchema,
     execute: async () => {
       const cfg = getRuntimeConfig();

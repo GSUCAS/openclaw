@@ -1,19 +1,12 @@
 import AppKit
 import Observation
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct DebugSettings: View {
     @Bindable var state: AppState
     private let isPreview = ProcessInfo.processInfo.isPreview
     private let labelColumnWidth: CGFloat = 140
-    @AppStorage(modelCatalogPathKey) private var modelCatalogPath: String = ModelCatalogLoader.defaultPath
-    @AppStorage(modelCatalogReloadKey) private var modelCatalogReloadBump: Int = 0
     @AppStorage(iconOverrideKey) private var iconOverrideRaw: String = IconOverrideSelection.system.rawValue
-    @AppStorage(canvasEnabledKey) private var canvasEnabled: Bool = true
-    @State private var modelsCount: Int?
-    @State private var modelsLoading = false
-    @State private var modelsError: String?
     private let gatewayManager = GatewayProcessManager.shared
     private let healthStore = HealthStore.shared
     @State private var launchAgentWriteDisabled = GatewayLaunchAgentManager.isLaunchAgentWriteDisabled()
@@ -31,7 +24,7 @@ struct DebugSettings: View {
     @State private var tunnelResetStatus: String?
     @State private var pendingKill: DebugActions.PortListener?
     @AppStorage(debugFileLogEnabledKey) private var diagnosticsFileLogEnabled: Bool = false
-    @AppStorage(appLogLevelKey) private var appLogLevelRaw: String = AppLogLevel.default.rawValue
+    @AppStorage(appLogLevelKey) private var appLogLevelRaw: String = Logger.Level.info.rawValue
 
     @State private var canvasSessionKey: String = "main"
     @State private var canvasStatus: String?
@@ -67,7 +60,6 @@ struct DebugSettings: View {
         }
         .task {
             guard !self.isPreview else { return }
-            await self.reloadModels()
             self.loadSessionStorePath()
         }
         .alert(item: self.$pendingKill) { listener in
@@ -283,7 +275,7 @@ struct DebugSettings: View {
                     self.gridLabel("App logging")
                     VStack(alignment: .leading, spacing: 8) {
                         Picker("Verbosity", selection: self.$appLogLevelRaw) {
-                            ForEach(AppLogLevel.allCases) { level in
+                            ForEach(Logger.Level.allCases, id: \.rawValue) { level in
                                 Text(level.title).tag(level.rawValue)
                             }
                         }
@@ -447,45 +439,6 @@ struct DebugSettings: View {
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
-                        }
-                    }
-                    GridRow {
-                        self.gridLabel("Model catalog")
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(self.modelCatalogPath)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                            HStack(spacing: 8) {
-                                Button {
-                                    self.chooseCatalogFile()
-                                } label: {
-                                    Label("Choose models.generated.ts…", systemImage: "folder")
-                                }
-                                .buttonStyle(.bordered)
-
-                                Button {
-                                    Task { await self.reloadModels() }
-                                } label: {
-                                    Label(
-                                        self.modelsLoading ? "Reloading…" : "Reload models",
-                                        systemImage: "arrow.clockwise")
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(self.modelsLoading)
-                            }
-                            if let modelsError {
-                                Text(modelsError)
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            } else if let modelsCount {
-                                Text("Loaded \(modelsCount) models")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text("Local fallback for model picker when gateway models.list is unavailable.")
-                                .font(.footnote)
-                                .foregroundStyle(.tertiary)
                         }
                     }
                 }
@@ -722,37 +675,6 @@ struct DebugSettings: View {
             await self.runPortCheck()
         case let .failure(err):
             self.portKillStatus = "Kill \(pid) failed: \(err.localizedDescription)"
-        }
-    }
-
-    private func chooseCatalogFile() {
-        let panel = NSOpenPanel()
-        panel.title = "Select models.generated.ts"
-        let tsType = UTType(filenameExtension: "ts")
-            ?? UTType(tag: "ts", tagClass: .filenameExtension, conformingTo: .sourceCode)
-            ?? .item
-        panel.allowedContentTypes = [tsType]
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = URL(fileURLWithPath: self.modelCatalogPath).deletingLastPathComponent()
-        if panel.runModal() == .OK, let url = panel.url {
-            self.modelCatalogPath = url.path
-            self.modelCatalogReloadBump += 1
-            Task { await self.reloadModels() }
-        }
-    }
-
-    private func reloadModels() async {
-        guard !self.modelsLoading else { return }
-        self.modelsLoading = true
-        self.modelsError = nil
-        self.modelCatalogReloadBump += 1
-        defer { self.modelsLoading = false }
-        do {
-            let loaded = try await ModelCatalogLoader.load(from: self.modelCatalogPath)
-            self.modelsCount = loaded.count
-        } catch {
-            self.modelsCount = nil
-            self.modelsError = error.localizedDescription
         }
     }
 
@@ -1047,9 +969,6 @@ struct DebugSettings_Previews: PreviewProvider {
 extension DebugSettings {
     static func exerciseForTesting() async {
         let view = DebugSettings(state: .preview)
-        view.modelsCount = 3
-        view.modelsLoading = false
-        view.modelsError = "Failed to load models"
         view.gatewayRootInput = "/tmp/openclaw"
         view.sessionStorePath = "/tmp/sessions.json"
         view.sessionStoreSaveError = "Save failed"
@@ -1092,7 +1011,6 @@ extension DebugSettings {
         _ = view.gridLabel("Test")
 
         view.loadSessionStorePath()
-        await view.reloadModels()
     }
 }
 #endif

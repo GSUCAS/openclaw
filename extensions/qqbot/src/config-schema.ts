@@ -1,5 +1,7 @@
+// Qqbot helper module supports config schema behavior.
 import {
   AllowFromListSchema,
+  ToolPolicySchema,
   buildChannelConfigSchema,
 } from "openclaw/plugin-sdk/channel-config-schema";
 import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
@@ -24,19 +26,16 @@ const QQBotSttSchema = z
   .strict()
   .optional();
 
-/** When `true`, same as `mode: "partial"` and `c2cStreamApi: true` for C2C. Object form kept for legacy configs. */
+// Nested streaming config. Legacy scalar booleans and the `c2cStreamApi` key
+// migrate to this shape via `openclaw doctor --fix`.
 const QQBotStreamingSchema = z
-  .union([
-    z.boolean(),
-    z
-      .object({
-        /** "partial" (default) enables block streaming; "off" disables it. */
-        mode: z.enum(["off", "partial"]).default("partial"),
-        /** @deprecated Prefer `streaming: true`. */
-        c2cStreamApi: z.boolean().optional(),
-      })
-      .passthrough(),
-  ])
+  .object({
+    /** "partial" (default) enables block streaming; "off" disables it. */
+    mode: z.enum(["off", "partial"]).default("partial"),
+    /** Use QQ's official C2C `stream_messages` API for DM replies. */
+    nativeTransport: z.boolean().optional(),
+  })
+  .strict()
   .optional();
 
 const QQBotExecApprovalsSchema = z
@@ -52,6 +51,22 @@ const QQBotExecApprovalsSchema = z
 
 const QQBotDmPolicySchema = z.enum(["open", "allowlist", "disabled"]).optional();
 const QQBotGroupPolicySchema = z.enum(["open", "allowlist", "disabled"]).optional();
+const QQBotGroupCommandLevelSchema = z.enum(["all", "safety", "strict"]).optional();
+
+const QQBotGroupSchema = z
+  .object({
+    requireMention: z.boolean().optional(),
+    commandLevel: QQBotGroupCommandLevelSchema,
+    ignoreOtherMentions: z.boolean().optional(),
+    historyLimit: z.number().optional(),
+    name: z.string().optional(),
+    prompt: z.string().optional(),
+    tools: ToolPolicySchema,
+    toolsBySender: z.record(z.string(), ToolPolicySchema).optional(),
+  })
+  .strict();
+
+const QQBotGroupsSchema = z.record(z.string(), QQBotGroupSchema).optional();
 
 const QQBotAccountSchema = z
   .object({
@@ -73,10 +88,11 @@ const QQBotAccountSchema = z
     upgradeMode: z.enum(["doc", "hot-reload"]).optional(),
     streaming: QQBotStreamingSchema,
     execApprovals: QQBotExecApprovalsSchema,
+    groups: QQBotGroupsSchema,
   })
   .passthrough();
 
-export const QQBotConfigSchema = QQBotAccountSchema.extend({
+const QQBotConfigSchema = QQBotAccountSchema.extend({
   stt: QQBotSttSchema,
   accounts: z.object({}).catchall(QQBotAccountSchema.passthrough()).optional(),
   defaultAccount: z.string().optional(),

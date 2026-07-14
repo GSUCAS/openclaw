@@ -1,8 +1,10 @@
+// Qa Lab plugin module implements crabbox runtime behavior.
 import { spawn, type SpawnOptions } from "node:child_process";
 import path from "node:path";
 import { pathExists } from "openclaw/plugin-sdk/security-runtime";
+import { trimToValue } from "../mantis-options.runtime.js";
 
-export type CommandResult = {
+type CommandResult = {
   stderr: string;
   stdout: string;
 };
@@ -24,11 +26,6 @@ export type CrabboxInspect = {
   sshUser?: string;
   state?: string;
 };
-
-function trimToValue(value: string | undefined) {
-  const trimmed = value?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : undefined;
-}
 
 export async function defaultCommandRunner(
   command: string,
@@ -85,7 +82,7 @@ export async function resolveCrabboxBin(params: {
   return "crabbox";
 }
 
-export function extractLeaseId(output: string) {
+function extractLeaseId(output: string) {
   return output.match(/\b(?:cbx_[a-f0-9]+|tbx_[A-Za-z0-9_-]+)\b/u)?.[0];
 }
 

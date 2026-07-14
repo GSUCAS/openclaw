@@ -50,7 +50,7 @@ async function processTwitchMessage(params: {
   const { message, account, accountId, config, runtime, core, statusSink } = params;
   const cfg = config as OpenClawConfig;
 
-  await core.channel.turn.run({
+  await core.channel.inbound.run({
     channel: "twitch",
     accountId,
     raw: message,
@@ -63,7 +63,7 @@ async function processTwitchMessage(params: {
         textForCommands: incoming.message,
         raw: incoming,
       }),
-      resolveTurn: (input) => {
+      resolveTurn: async (input) => {
         const route = core.channel.routing.resolveAgentRoute({
           cfg,
           channel: "twitch",
@@ -82,7 +82,7 @@ async function processTwitchMessage(params: {
           envelope: core.channel.reply.resolveEnvelopeFormatOptions(cfg),
           body: input.rawText,
         });
-        const ctxPayload = core.channel.turn.buildContext({
+        const ctxPayload = core.channel.inbound.buildContext({
           channel: "twitch",
           accountId,
           messageId: input.id,
@@ -97,10 +97,6 @@ async function processTwitchMessage(params: {
             kind: "group",
             id: message.channel,
             label: message.channel,
-            routePeer: {
-              kind: "group",
-              id: message.channel,
-            },
           },
           route: {
             agentId: route.agentId,
@@ -109,14 +105,12 @@ async function processTwitchMessage(params: {
           },
           reply: {
             to: `twitch:channel:${message.channel}`,
-            originatingTo: `twitch:channel:${message.channel}`,
           },
           message: {
             body,
             rawBody: input.rawText,
             bodyForAgent: input.textForAgent,
             commandBody: input.textForCommands,
-            envelopeFrom: fromLabel,
           },
         });
         const storePath = core.channel.session.resolveStorePath(cfg.session?.store, {
@@ -196,25 +190,24 @@ async function deliverTwitchReply(params: {
       debug: (msg) => runtime.log?.(msg),
     });
 
-    const client = await clientManager.getClient(
-      account,
-      config as Parameters<typeof clientManager.getClient>[1],
-      accountId,
-    );
-    if (!client) {
-      runtime.error?.(`No client available for sending reply`);
-      return { visibleReplySent: false };
-    }
-
-    // Send the reply
     if (!payload.text) {
       runtime.error?.(`No text to send in reply payload`);
       return { visibleReplySent: false };
     }
-
     const textToSend = stripMarkdownForTwitch(payload.text);
-
-    await client.say(channel, textToSend);
+    if (!textToSend) {
+      return { visibleReplySent: false };
+    }
+    const result = await clientManager.sendMessage(
+      account,
+      channel,
+      textToSend,
+      config as Parameters<typeof clientManager.sendMessage>[3],
+      accountId,
+    );
+    if (!result.ok) {
+      throw new Error(result.error ?? "Send failed");
+    }
     return { visibleReplySent: true };
   } catch (err) {
     runtime.error?.(`Failed to send reply: ${String(err)}`);
@@ -295,7 +288,7 @@ export async function monitorTwitchProvider(
         core,
         statusSink,
       });
-    })().catch((err) => {
+    })().catch((err: unknown) => {
       runtime.error?.(`Message processing failed: ${String(err)}`);
     });
   });
@@ -309,3 +302,5 @@ export async function monitorTwitchProvider(
 
   return { stop };
 }
+
+export const testing = { deliverTwitchReply };

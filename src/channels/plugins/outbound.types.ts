@@ -1,3 +1,8 @@
+/**
+ * Channel outbound adapter types.
+ *
+ * Defines text/media/payload/poll contexts, presentation capabilities, and send results.
+ */
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
 import type { ReplyToMode } from "../../config/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -35,6 +40,14 @@ export type ChannelOutboundContext = {
   deps?: OutboundSendDeps;
   silent?: boolean;
   gatewayClientScopes?: readonly string[];
+  /** @internal Opaque durable intent id for exact provider-side send reconciliation. */
+  deliveryQueueId?: string;
+  /** @internal Stable platform-send index within one durable payload. */
+  deliveryPartIndex?: number;
+  /** @internal Refresh durable timing before recipient-visible or finalizing platform I/O. */
+  onPlatformSendDispatch?: () => Promise<void>;
+  /** @internal Report each completed platform sub-send before starting another fallible step. */
+  onDeliveryResult?: (result: OutboundDeliveryResult) => Promise<void> | void;
 };
 
 export type ChannelOutboundPayloadContext = ChannelOutboundContext & {
@@ -52,6 +65,10 @@ export type ChannelPresentationCapabilities = {
   context?: boolean;
   /** Whether the channel can render divider blocks natively. */
   divider?: boolean;
+  /** Whether the channel can render chart blocks natively. */
+  charts?: boolean;
+  /** Whether the channel can render table blocks natively. */
+  tables?: boolean;
   /** Per-channel limits used to adapt portable presentation blocks before rendering. */
   limits?: {
     actions?: {
@@ -135,7 +152,7 @@ export type ChannelOutboundChunkContext = {
   formatting?: OutboundDeliveryFormattingOptions;
 };
 
-export type ChannelOutboundNormalizePayloadParams = {
+type ChannelOutboundNormalizePayloadParams = {
   payload: ReplyPayload;
   cfg: OpenClawConfig;
   accountId?: string | null;
@@ -193,6 +210,7 @@ export type ChannelOutboundAdapter = {
     target: ChannelOutboundTargetRef;
     messageId: string;
     pin: ReplyPayloadDeliveryPin;
+    gatewayClientScopes?: readonly string[];
   }) => Promise<void> | void;
   /**
    * @deprecated Use shouldTreatDeliveredTextAsVisible instead.

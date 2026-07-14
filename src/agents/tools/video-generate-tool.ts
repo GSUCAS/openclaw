@@ -1,3 +1,8 @@
+/**
+ * video_generate built-in tool.
+ *
+ * Validates media references, resolves provider/model capabilities, and schedules video generation.
+ */
 import { Type, type TSchema } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -40,6 +45,7 @@ import {
   recordRecentMediaGenerationTaskStartForSession,
 } from "../media-generation-task-status-shared.js";
 import { getCustomProviderApiKey } from "../model-auth.js";
+import { resolveProviderIdForAuth } from "../provider-auth-aliases.js";
 import { ToolInputError, readNumberParam, readStringParam } from "./common.js";
 import { decodeDataUrl } from "./image-tool.helpers.js";
 import {
@@ -51,6 +57,7 @@ import {
   createDefaultMediaGenerateBackgroundScheduler,
   notifyMediaGenerationAsyncTaskStarted,
   scheduleMediaGenerationTaskCompletion,
+  shouldDetachMediaGenerationTask,
   type MediaGenerateAsyncStartCallback,
   type MediaGenerateBackgroundScheduler,
 } from "./media-generate-background-shared.js";
@@ -177,11 +184,11 @@ const VideoGenerateToolProperties = {
   resolution: Type.Optional(
     Type.String({
       description:
-        "Resolution: 480P, 720P, 768P, 1080P, 4K, or provider value; unsupported normalized/ignored.",
+        "Resolution: 360P, 480P, 540P, 720P, 768P, 1080P, 4K, or provider value; unsupported normalized/ignored.",
     }),
   ),
   durationSeconds: Type.Optional(
-    Type.Number({
+    Type.Integer({
       description: "Target seconds; may round to nearest supported duration.",
       minimum: 1,
     }),
@@ -203,7 +210,7 @@ const VideoGenerateToolProperties = {
     }),
   ),
   timeoutMs: Type.Optional(
-    Type.Number({
+    Type.Integer({
       description: "Provider timeout ms.",
       minimum: 1,
     }),
@@ -240,12 +247,21 @@ function hasExplicitVideoGenerationModelConfig(cfg?: OpenClawConfig): boolean {
   return hasToolModelConfig(coerceToolModelConfig(cfg?.agents?.defaults?.videoGenerationModel));
 }
 
-function collectVideoGenerationModelProviderIds(modelConfig: ToolModelConfig): Set<string> {
+function collectVideoGenerationModelProviderIds(params: {
+  cfg: OpenClawConfig;
+  modelConfig: ToolModelConfig;
+  workspaceDir?: string;
+}): Set<string> {
   const providerIds = new Set<string>();
-  for (const modelRef of [modelConfig.primary, ...(modelConfig.fallbacks ?? [])]) {
+  for (const modelRef of [params.modelConfig.primary, ...(params.modelConfig.fallbacks ?? [])]) {
     const parsed = parseVideoGenerationModelRef(modelRef);
     if (parsed?.provider) {
-      providerIds.add(parsed.provider);
+      providerIds.add(
+        resolveProviderIdForAuth(parsed.provider, {
+          config: params.cfg,
+          ...(params.workspaceDir !== undefined ? { workspaceDir: params.workspaceDir } : {}),
+        }),
+      );
     }
   }
   return providerIds;
@@ -254,6 +270,7 @@ function collectVideoGenerationModelProviderIds(modelConfig: ToolModelConfig): S
 function isVideoGenerationProviderConfigured(params: {
   snapshot: Pick<PluginMetadataSnapshot, "index" | "plugins">;
   cfg: OpenClawConfig;
+  workspaceDir?: string;
   agentDir?: string;
   authStore?: AuthProfileStore;
   providerId: string;
@@ -269,6 +286,8 @@ function isVideoGenerationProviderConfigured(params: {
     }) ||
     hasAuthForProvider({
       provider: params.providerId,
+      cfg: params.cfg,
+      workspaceDir: params.workspaceDir,
       agentDir: params.agentDir,
       authStore: params.authStore,
     })
@@ -287,9 +306,11 @@ function shouldExposeVideoReferenceAudioParams(params: {
   });
   const knownProviderIds = new Set<string>();
   const audioCandidateProviderIds = new Set<string>();
-  const explicitProviderIds = collectVideoGenerationModelProviderIds(
-    coerceToolModelConfig(params.cfg.agents?.defaults?.videoGenerationModel),
-  );
+  const explicitProviderIds = collectVideoGenerationModelProviderIds({
+    cfg: params.cfg,
+    modelConfig: coerceToolModelConfig(params.cfg.agents?.defaults?.videoGenerationModel),
+    ...(params.workspaceDir !== undefined ? { workspaceDir: params.workspaceDir } : {}),
+  });
 
   for (const plugin of snapshot.plugins) {
     if (
@@ -329,6 +350,7 @@ function shouldExposeVideoReferenceAudioParams(params: {
       isVideoGenerationProviderConfigured({
         snapshot,
         cfg: params.cfg,
+        workspaceDir: params.workspaceDir,
         agentDir: params.agentDir,
         authStore: params.authStore,
         providerId,
@@ -952,7 +974,7 @@ export function createVideoGenerateTool(options?: {
     name: "video_generate",
     displaySummary: "Generate videos",
     description:
-      'Create videos. Session chats: background task; do not call video_generate again for same request; wait completion, then send attachments via message tool. "status" checks active task. Duration may round to provider-supported value.',
+      "Create video. Session chat background: call once/request, await, then visible reply + structured media. status checks active task. Duration may round to provider value.",
     parameters: createVideoGenerateToolSchema({ includeAudioReferences }),
     execute: async (_toolCallId, rawArgs) => {
       const args = rawArgs as Record<string, unknown>;
@@ -987,6 +1009,7 @@ export function createVideoGenerateTool(options?: {
 
       const activeDuplicateGuardResult = createVideoGenerateDuplicateGuardResult(
         options?.agentSessionKey,
+        { prompt },
       );
       if (activeDuplicateGuardResult) {
         return activeDuplicateGuardResult;
@@ -998,9 +1021,15 @@ export function createVideoGenerateTool(options?: {
       const aspectRatio = normalizeAspectRatio(readStringParam(args, "aspectRatio"));
       const resolution = normalizeResolution(readStringParam(args, "resolution"));
       const durationSeconds = readNumberParam(args, "durationSeconds", {
-        integer: true,
+        positiveInteger: true,
         strict: true,
       });
+      if (
+        durationSeconds === undefined &&
+        readSnakeCaseParamRaw(args, "durationSeconds") !== undefined
+      ) {
+        throw new ToolInputError("durationSeconds must be a positive integer");
+      }
       const audio = readBooleanToolParam(args, "audio");
       const watermark = readBooleanToolParam(args, "watermark");
       const timeoutMs = readGenerationTimeoutMs(args) ?? videoGenerationModelConfig.timeoutMs;
@@ -1089,7 +1118,7 @@ export function createVideoGenerateTool(options?: {
       });
       const duplicateGuardResult = createVideoGenerateDuplicateGuardResult(
         options?.agentSessionKey,
-        { requestKey },
+        { prompt, requestKey },
       );
       if (duplicateGuardResult) {
         return duplicateGuardResult;
@@ -1104,8 +1133,9 @@ export function createVideoGenerateTool(options?: {
       // Attach roles to the loaded image assets (positional, by index into images[]).
       for (let i = 0; i < loadedReferenceImages.length; i++) {
         const role = imageRoles[i];
-        if (role) {
-          loadedReferenceImages[i].sourceAsset.role = role;
+        const asset = loadedReferenceImages.at(i);
+        if (role && asset) {
+          asset.sourceAsset.role = role;
         }
       }
       const loadedReferenceVideos = await loadReferenceAssets({
@@ -1117,8 +1147,9 @@ export function createVideoGenerateTool(options?: {
       });
       for (let i = 0; i < loadedReferenceVideos.length; i++) {
         const role = videoRoles[i];
-        if (role) {
-          loadedReferenceVideos[i].sourceAsset.role = role;
+        const asset = loadedReferenceVideos.at(i);
+        if (role && asset) {
+          asset.sourceAsset.role = role;
         }
       }
       const loadedReferenceAudios = await loadReferenceAssets({
@@ -1130,8 +1161,9 @@ export function createVideoGenerateTool(options?: {
       });
       for (let i = 0; i < loadedReferenceAudios.length; i++) {
         const role = audioRoles[i];
-        if (role) {
-          loadedReferenceAudios[i].sourceAsset.role = role;
+        const asset = loadedReferenceAudios.at(i);
+        if (role && asset) {
+          asset.sourceAsset.role = role;
         }
       }
       validateVideoGenerationCapabilities({
@@ -1154,7 +1186,9 @@ export function createVideoGenerateTool(options?: {
         prompt,
         providerId: selectedProvider?.id,
       });
-      const shouldDetach = Boolean(taskHandle && options?.agentSessionKey?.trim());
+      const shouldDetach = Boolean(
+        taskHandle && shouldDetachMediaGenerationTask(options?.agentSessionKey),
+      );
 
       if (shouldDetach && taskHandle) {
         recordRecentMediaGenerationTaskStartForSession({

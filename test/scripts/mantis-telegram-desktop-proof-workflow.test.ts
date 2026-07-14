@@ -1,5 +1,5 @@
+// Mantis Telegram Desktop Proof Workflow tests cover mantis telegram desktop proof workflow script behavior.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, normalize } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
@@ -15,6 +15,7 @@ const TELEGRAM_PROOF_SKILL = ".agents/skills/telegram-crabbox-e2e-proof/SKILL.md
 const DOCS = ["docs/help/testing.md", "docs/concepts/qa-e2e-automation.md"];
 
 type WorkflowStep = {
+  if?: string;
   env?: Record<string, string>;
   name?: string;
   run?: string;
@@ -256,18 +257,11 @@ describe("Mantis Telegram Desktop proof workflow", () => {
       "OPENCLAW_TELEGRAM_USER_PROOF_CMD",
     );
     expect(readFileSync(PROOF_SCRIPT, "utf8")).not.toContain("pnpm qa:telegram-user:crabbox");
-    const payloadValidationImport =
-      "../../qa/convex-credential-broker/convex/payload-validation.js";
     expect(readFileSync(CREDENTIAL_SCRIPT, "utf8")).toContain(
       'const TELEGRAM_USER_QA_CREDENTIAL_KIND = "telegram-user";',
     );
-    expect(readFileSync(CREDENTIAL_SCRIPT, "utf8")).toContain(payloadValidationImport);
-    const payloadValidationSource = normalize(
-      `${dirname(CREDENTIAL_SCRIPT)}/${payloadValidationImport.replace(/\.js$/, ".ts")}`,
-    );
-    expect(existsSync(payloadValidationSource)).toBe(true);
     expect(readFileSync(CREDENTIAL_SCRIPT, "utf8")).not.toMatch(
-      /from "\.\.\/qa\/convex-credential-broker\/convex\/payload-validation\.js"/u,
+      /from "\.\.\/qa\/convex-credential-broker\/convex\/payload_validation\.js"/u,
     );
   });
 
@@ -332,17 +326,29 @@ describe("Mantis Telegram Desktop proof workflow", () => {
     );
   });
 
-  it("passes AWS capacity regions to Crabbox warmup", () => {
+  it("pins AWS Crabbox proof runs to the working region", () => {
     const workflow = parse(readFileSync(WORKFLOW, "utf8")) as Workflow;
-    const regions = "eu-west-1,eu-west-2,eu-central-1,us-east-1,us-west-2";
+    const liveWorkflow = parse(readFileSync(LIVE_WORKFLOW, "utf8")) as Workflow;
 
-    expect(workflow.env?.CRABBOX_CAPACITY_REGIONS).toBe(regions);
+    expect(workflow.env?.CRABBOX_AWS_REGION).toBe("us-east-1");
+    expect(workflow.env?.CRABBOX_CAPACITY_REGIONS).toBe("us-east-1");
+    expect(liveWorkflow.env?.CRABBOX_AWS_REGION).toBe("us-east-1");
+    expect(liveWorkflow.env?.CRABBOX_CAPACITY_REGIONS).toBe("us-east-1");
 
     const agent = workflowStep("Run Codex Mantis Telegram agent");
+    expect(agent.env?.CRABBOX_AWS_REGION).toBe("${{ env.CRABBOX_AWS_REGION }}");
     expect(agent.env?.CRABBOX_CAPACITY_REGIONS).toBe("${{ env.CRABBOX_CAPACITY_REGIONS }}");
 
+    const liveRun = jobStep(
+      LIVE_WORKFLOW,
+      "run_telegram_live",
+      "Run Telegram live scenario and capture desktop evidence",
+    );
+    expect(liveRun.env?.CRABBOX_AWS_REGION).toBe("${{ env.CRABBOX_AWS_REGION }}");
+    expect(liveRun.env?.CRABBOX_CAPACITY_REGIONS).toBe("${{ env.CRABBOX_CAPACITY_REGIONS }}");
+
     const prepare = workflowStep("Prepare Codex user");
-    expect(prepare.run).toContain("CRABBOX_PROVIDER CRABBOX_CAPACITY_REGIONS");
+    expect(prepare.run).toContain("CRABBOX_AWS_REGION CRABBOX_CAPACITY_REGIONS");
   });
 
   it("runs the Mantis Codex agent in fast medium-effort mode", () => {
@@ -453,7 +459,7 @@ describe("Mantis Telegram Desktop proof workflow", () => {
     expect(proofScript).toContain('run_setup_step "tdlib clone" "$tdlib_clone_timeout"');
     expect(proofScript).toContain('run_setup_step "tdlib build" "$tdlib_build_timeout"');
     expect(proofScript).not.toContain("curl -fL https://telegram.org/dl/desktop/linux -o");
-    expect(proofScript).not.toContain("curl -fL \"$tdlib_url\" -o");
+    expect(proofScript).not.toContain('curl -fL "$tdlib_url" -o');
   });
 
   it("does not pass the full workflow environment into the local Telegram SUT", () => {

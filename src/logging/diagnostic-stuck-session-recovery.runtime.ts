@@ -1,12 +1,20 @@
-import { resolveEmbeddedSessionLane } from "../agents/pi-embedded-runner/lanes.js";
+// Stuck session recovery runtime helpers inspect embedded sessions for recovery.
+import { resolveEmbeddedSessionLane } from "../agents/embedded-agent-runner/lanes.js";
 import {
-  abortAndDrainEmbeddedPiRun,
-  isEmbeddedPiRunActive,
-  isEmbeddedPiRunHandleActive,
+  abortAndDrainEmbeddedAgentRun,
+  isEmbeddedAgentRunActive,
+  isEmbeddedAgentRunHandleActive,
+  resolveEmbeddedAgentReplyRunPhase,
   resolveActiveEmbeddedRunSessionId,
+  resolveActiveEmbeddedRunSessionIdBySessionFile,
   resolveActiveEmbeddedRunHandleSessionId,
-} from "../agents/pi-embedded-runner/runs.js";
-import { getCommandLaneSnapshot, resetCommandLane } from "../process/command-queue.js";
+  resolveActiveEmbeddedRunHandleSessionIdBySessionFile,
+} from "../agents/embedded-agent-runner/runs.js";
+import {
+  getCommandLaneActiveTaskIds,
+  getCommandLaneSnapshot,
+  resetCommandLane,
+} from "../process/command-queue.js";
 import { getDiagnosticSessionActivitySnapshot } from "./diagnostic-run-activity.js";
 import { diagnosticLogger as diag } from "./diagnostic-runtime.js";
 import {
@@ -15,30 +23,37 @@ import {
 } from "./diagnostic-session-context.js";
 import {
   formatRecoveryOutcome,
+  resolveStuckSessionRecoveryRef,
   type StuckSessionRecoveryOutcome,
   type StuckSessionRecoveryRequest,
 } from "./diagnostic-session-recovery.js";
 import { isDiagnosticSessionStateCurrent } from "./diagnostic-session-state.js";
 
+// Runtime repair path for diagnostic sessions that appear stuck in processing/waiting states.
 const STUCK_SESSION_ABORT_SETTLE_MS = 15_000;
-// Default no-forward-progress age used only when the caller does not carry a
-// resolved `diagnostics.stuckSessionAbortMs`. A run flagged "active" that has made
-// no forward progress (tool/model/chunk events) for at least the resolved window,
-// while queued work waits, is treated as a leaked/dead handle and reclaimed even
-// without an explicit active-abort grant. `lastProgressAgeMs` tracks real progress
-// (not incoming queued messages), so it keeps growing while a lane is wedged.
 const STUCK_SESSION_PROGRESS_STALE_MS = 5 * 60_000;
+// Ownerless lane release shares the no-progress abort floor, then extends for
+// compaction because queued compaction owns the session lane without a run handle.
+const STALE_ACTIVE_LANE_TASK_RELEASE_MS = STUCK_SESSION_PROGRESS_STALE_MS;
+const recoveriesInFlight = new Set<string>();
+
+/** Request parameters accepted by the stuck-session recovery runtime. */
+type StuckSessionRecoveryParams = StuckSessionRecoveryRequest;
 
 function resolveStaleActiveProgressAbortMs(params: StuckSessionRecoveryParams): number {
   const configured = params.staleActiveProgressAbortMs;
-  // Honor the resolved `diagnostics.stuckSessionAbortMs` as-is — an operator can
-  // raise it to protect slow active work (it is the same threshold the existing
-  // `session.stalled` abort uses). It is floored at the warn threshold upstream,
-  // not necessarily 5 min, so we only apply the 5-min default when no value is
-  // carried (e.g. direct callers).
   return typeof configured === "number" && configured > 0
     ? configured
     : STUCK_SESSION_PROGRESS_STALE_MS;
+}
+
+function resolveStaleActiveLaneTaskReleaseMs(params: StuckSessionRecoveryParams): number {
+  const compactionSafetyTimeoutMs = params.compactionSafetyTimeoutMs;
+  const compactionReleaseMs =
+    typeof compactionSafetyTimeoutMs === "number" && compactionSafetyTimeoutMs > 0
+      ? compactionSafetyTimeoutMs + STUCK_SESSION_ABORT_SETTLE_MS
+      : 0;
+  return Math.max(STALE_ACTIVE_LANE_TASK_RELEASE_MS, compactionReleaseMs);
 }
 
 function isActiveRunProgressStale(params: {
@@ -56,13 +71,6 @@ function isActiveRunProgressStale(params: {
   });
   const lastProgressAgeMs = activity.lastProgressAgeMs;
   return typeof lastProgressAgeMs === "number" && lastProgressAgeMs >= params.staleAbortMs;
-}
-const recoveriesInFlight = new Set<string>();
-
-export type StuckSessionRecoveryParams = StuckSessionRecoveryRequest;
-
-function recoveryKey(params: StuckSessionRecoveryParams): string | undefined {
-  return params.sessionKey?.trim() || params.sessionId?.trim() || undefined;
 }
 
 function formatRecoveryContext(
@@ -93,7 +101,7 @@ function formatRecoveryContext(
 export async function recoverStuckDiagnosticSession(
   params: StuckSessionRecoveryParams,
 ): Promise<StuckSessionRecoveryOutcome> {
-  const key = recoveryKey(params);
+  const key = resolveStuckSessionRecoveryRef(params);
   if (!key || recoveriesInFlight.has(key)) {
     return {
       status: "skipped",
@@ -106,6 +114,7 @@ export async function recoverStuckDiagnosticSession(
 
   recoveriesInFlight.add(key);
   try {
+    // Abort only the generation/state that triggered recovery; stale warnings become observe-only.
     if (
       !isDiagnosticSessionStateCurrent({
         sessionId: params.sessionId,
@@ -123,21 +132,34 @@ export async function recoverStuckDiagnosticSession(
       };
     }
     const fallbackActiveSessionId =
-      params.sessionId && isEmbeddedPiRunHandleActive(params.sessionId)
+      params.sessionId && isEmbeddedAgentRunHandleActive(params.sessionId)
         ? params.sessionId
         : undefined;
+    const fileActiveSessionId = params.sessionFile
+      ? resolveActiveEmbeddedRunHandleSessionIdBySessionFile(params.sessionFile)
+      : undefined;
     let activeSessionId = params.sessionKey
-      ? (resolveActiveEmbeddedRunHandleSessionId(params.sessionKey) ?? fallbackActiveSessionId)
-      : fallbackActiveSessionId;
+      ? (resolveActiveEmbeddedRunHandleSessionId(params.sessionKey) ??
+        fileActiveSessionId ??
+        fallbackActiveSessionId)
+      : (fileActiveSessionId ?? fallbackActiveSessionId);
+    const fileActiveWorkSessionId = params.sessionFile
+      ? resolveActiveEmbeddedRunSessionIdBySessionFile(params.sessionFile)
+      : undefined;
     const activeWorkSessionId = params.sessionKey
-      ? (resolveActiveEmbeddedRunSessionId(params.sessionKey) ?? params.sessionId)
-      : params.sessionId;
-    const laneKey = params.sessionKey?.trim() || params.sessionId?.trim();
-    const sessionLane = laneKey ? resolveEmbeddedSessionLane(laneKey) : null;
+      ? (resolveActiveEmbeddedRunSessionId(params.sessionKey) ??
+        fileActiveWorkSessionId ??
+        params.sessionId)
+      : (fileActiveWorkSessionId ?? params.sessionId);
+    const sessionLane = key ? resolveEmbeddedSessionLane(key) : null;
+    const preAbortActiveTaskIds = new Set(
+      sessionLane ? getCommandLaneActiveTaskIds(sessionLane) : [],
+    );
     let aborted = false;
     let drained = true;
     let forceCleared = false;
     const staleActiveProgressAbortMs = resolveStaleActiveProgressAbortMs(params);
+    const staleActiveLaneTaskReleaseMs = resolveStaleActiveLaneTaskReleaseMs(params);
 
     if (activeSessionId) {
       const reclaimStaleActiveRun =
@@ -169,7 +191,9 @@ export async function recoverStuckDiagnosticSession(
           `stuck session recovery reclaiming stale active run: ${formatRecoveryContext(params, { activeSessionId })}`,
         );
       }
-      const result = await abortAndDrainEmbeddedPiRun({
+      // Active embedded runs own their cleanup; registry terminal settle bounds
+      // lane release if the owner never drains after this abort.
+      const result = await abortAndDrainEmbeddedAgentRun({
         sessionId: activeSessionId,
         sessionKey: params.sessionKey,
         settleMs: STUCK_SESSION_ABORT_SETTLE_MS,
@@ -181,7 +205,20 @@ export async function recoverStuckDiagnosticSession(
       forceCleared = result.forceCleared;
     }
 
-    if (!activeSessionId && activeWorkSessionId && isEmbeddedPiRunActive(activeWorkSessionId)) {
+    if (!activeSessionId && activeWorkSessionId && isEmbeddedAgentRunActive(activeWorkSessionId)) {
+      const activeReplyPhase = resolveEmbeddedAgentReplyRunPhase(activeWorkSessionId);
+      if (activeReplyPhase === "waiting_for_deferred_maintenance") {
+        const outcome: StuckSessionRecoveryOutcome = {
+          status: "skipped",
+          action: "keep_lane",
+          reason: "deferred_maintenance_wait",
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          activeSessionId: activeWorkSessionId,
+        };
+        diag.warn(`stuck session recovery outcome: ${formatRecoveryOutcome(outcome)}`);
+        return outcome;
+      }
       const reclaimStaleReplyWork =
         params.allowActiveAbort !== true &&
         isActiveRunProgressStale({
@@ -199,7 +236,7 @@ export async function recoverStuckDiagnosticSession(
             )}`,
           );
         }
-        const result = await abortAndDrainEmbeddedPiRun({
+        const result = await abortAndDrainEmbeddedAgentRun({
           sessionId: activeWorkSessionId,
           sessionKey: params.sessionKey,
           settleMs: STUCK_SESSION_ABORT_SETTLE_MS,
@@ -228,6 +265,26 @@ export async function recoverStuckDiagnosticSession(
     if (!activeSessionId && sessionLane) {
       const laneSnapshot = getCommandLaneSnapshot(sessionLane);
       if (laneSnapshot.activeCount > 0) {
+        const laneStartedFreshTask = getCommandLaneActiveTaskIds(sessionLane).some(
+          (id) => !preAbortActiveTaskIds.has(id),
+        );
+        // Orphaned active lane tasks have no run handle to abort. Release only
+        // after the ownerless-lane window and only if no fresh task appeared.
+        if (!laneStartedFreshTask && params.ageMs >= staleActiveLaneTaskReleaseMs) {
+          const released = resetCommandLane(sessionLane);
+          const outcome: StuckSessionRecoveryOutcome = {
+            status: "released",
+            action: "release_lane",
+            reason: "stale_lane_task",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            lane: sessionLane,
+            released,
+            queuedCount: laneSnapshot.queuedCount,
+          };
+          diag.warn(`stuck session recovery outcome: ${formatRecoveryOutcome(outcome)}`);
+          return outcome;
+        }
         const outcome: StuckSessionRecoveryOutcome = {
           status: "skipped",
           action: "keep_lane",
@@ -244,8 +301,20 @@ export async function recoverStuckDiagnosticSession(
     }
 
     const queuedCount = sessionLane ? getCommandLaneSnapshot(sessionLane).queuedCount : 0;
+    // A task id active now but not before the abort means the lane already
+    // unwedged and pumped fresh work; resetting it would double-run the lane.
+    const laneStartedFreshTask =
+      sessionLane !== null &&
+      getCommandLaneActiveTaskIds(sessionLane).some((id) => !preAbortActiveTaskIds.has(id));
+    // Queued turns ride the session queue (params.queueDepth), not only the lane
+    // queue; without this signal a cleanly aborted wedged lane never resets.
+    const hasQueuedSessionWork = (params.queueDepth ?? 0) > 0;
     const released =
-      sessionLane && (!activeSessionId || !aborted || !drained) ? resetCommandLane(sessionLane) : 0;
+      sessionLane &&
+      !laneStartedFreshTask &&
+      (queuedCount > 0 || hasQueuedSessionWork || !activeSessionId || !aborted || !drained)
+        ? resetCommandLane(sessionLane)
+        : 0;
 
     const clearStaleQueuedSession = !aborted && released === 0 && (params.queueDepth ?? 0) > 0;
 
@@ -318,6 +387,7 @@ export async function recoverStuckDiagnosticSession(
   }
 }
 
+/** Test hooks for clearing in-flight recovery guards. */
 export const testing = {
   resetRecoveriesInFlight(): void {
     recoveriesInFlight.clear();

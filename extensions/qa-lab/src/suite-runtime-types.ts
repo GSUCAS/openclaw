@@ -1,3 +1,4 @@
+// Qa Lab plugin module implements suite runtime types behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { QaProviderMode } from "./model-selection.js";
 import type { QaTransportActionName, QaTransportAdapter } from "./qa-transport.js";
@@ -10,6 +11,7 @@ type QaRuntimeGatewayClient = {
   getProcessCpuMs?: () => number | null;
   getProcessRssBytes?: () => number | null;
   logs?: () => string;
+  restart?: () => Promise<void>;
   restartAfterStateMutation?: (
     mutateState: (context: {
       configPath: string;
@@ -27,11 +29,9 @@ type QaRuntimeGatewayClient = {
   ) => Promise<unknown>;
 };
 
-type QaRuntimeTransport = QaTransportAdapter;
-
 export type QaSuiteRuntimeEnv = {
   gateway: QaRuntimeGatewayClient;
-  transport: QaRuntimeTransport;
+  transport: QaTransportAdapter;
   repoRoot: string;
   providerMode: QaProviderMode;
   primaryModel: string;

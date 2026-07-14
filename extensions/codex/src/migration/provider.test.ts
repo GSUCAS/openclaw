@@ -1,7 +1,13 @@
+// Codex tests cover provider plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  clearRuntimeAuthProfileStoreSnapshots,
+  loadAuthProfileStoreForSecretsRuntime,
+} from "openclaw/plugin-sdk/agent-runtime";
 import type { MigrationProviderContext } from "openclaw/plugin-sdk/plugin-entry";
+import { upsertAuthProfile } from "openclaw/plugin-sdk/provider-auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultCodexAppInventoryCache } from "../app-server/app-inventory-cache.js";
 import { CODEX_PLUGINS_MARKETPLACE_NAME } from "../app-server/config.js";
@@ -41,6 +47,8 @@ function makeContext(params: {
   workspaceDir: string;
   overwrite?: boolean;
   includeSecrets?: boolean;
+  targetAgentId?: string;
+  itemKinds?: readonly string[];
   verifyPluginApps?: boolean;
   providerOptions?: MigrationProviderContext["providerOptions"];
   reportDir?: string;
@@ -61,6 +69,8 @@ function makeContext(params: {
     source: params.source,
     stateDir: params.stateDir,
     includeSecrets: params.includeSecrets,
+    targetAgentId: params.targetAgentId,
+    itemKinds: params.itemKinds,
     overwrite: params.overwrite,
     providerOptions:
       params.providerOptions ?? (params.verifyPluginApps ? { verifyPluginApps: true } : undefined),
@@ -110,6 +120,14 @@ function mockCallArg(mock: ReturnType<typeof vi.fn>, callIndex = 0, argIndex = 0
   return call[argIndex];
 }
 
+function targetAgentDir(fixture: { stateDir: string }): string {
+  return path.join(fixture.stateDir, "agents", "main", "agent");
+}
+
+function loadTargetAuthStore(fixture: { stateDir: string }) {
+  return loadAuthProfileStoreForSecretsRuntime(targetAgentDir(fixture));
+}
+
 async function createCodexFixture(): Promise<{
   root: string;
   homeDir: string;
@@ -123,6 +141,8 @@ async function createCodexFixture(): Promise<{
   const stateDir = path.join(root, "state");
   const workspaceDir = path.join(root, "workspace");
   vi.stubEnv("HOME", homeDir);
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  vi.stubEnv("OPENCLAW_AGENT_DIR", "");
   await writeFile(path.join(codexHome, "skills", "tweet-helper", "SKILL.md"), "# Tweet helper\n");
   await writeFile(path.join(codexHome, "skills", ".system", "system-skill", "SKILL.md"));
   await writeFile(path.join(homeDir, ".agents", "skills", "personal-style", "SKILL.md"));
@@ -151,6 +171,7 @@ function sourceAppCacheKey(fixture: { codexHome: string }): string {
         transport: "stdio",
         command: "codex",
         commandSource: "managed",
+        managedCommandOrder: "desktop-first",
         args: ["app-server", "--listen", "stdio://"],
         headers: {},
         env: {
@@ -165,6 +186,7 @@ function sourceAppCacheKey(fixture: { codexHome: string }): string {
 afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  clearRuntimeAuthProfileStoreSnapshots();
   appServerRequest.mockReset();
   defaultCodexAppInventoryCache.clear();
   for (const root of tempRoots) {
@@ -177,6 +199,139 @@ describe("buildCodexMigrationProvider", () => {
   beforeEach(() => {
     appServerRequest.mockRejectedValue(new Error("codex app-server unavailable"));
   });
+
+  it("plans and imports only consolidated Codex memory into the selected agent", async () => {
+    const fixture = await createCodexFixture();
+    const targetWorkspace = path.join(fixture.root, "workspace-research");
+    const reportDir = path.join(fixture.root, "report");
+    await writeFile(path.join(fixture.codexHome, "memories", "MEMORY.md"), "# Memory\n");
+    await writeFile(path.join(fixture.codexHome, "memories", "memory_summary.md"), "# Summary\n");
+    await writeFile(
+      path.join(fixture.codexHome, "memories", "rollout_summaries", "private.md"),
+      "# Raw rollout\n",
+    );
+    const config = {
+      agents: {
+        defaults: { workspace: fixture.workspaceDir },
+        list: [
+          { id: "main", default: true },
+          { id: "research", workspace: targetWorkspace },
+        ],
+      },
+    } as MigrationProviderContext["config"];
+    const context = makeContext({
+      source: fixture.codexHome,
+      stateDir: fixture.stateDir,
+      workspaceDir: fixture.workspaceDir,
+      reportDir,
+      config,
+      targetAgentId: "research",
+      itemKinds: ["memory"],
+      verifyPluginApps: true,
+    });
+    const provider = buildCodexMigrationProvider();
+
+    const plan = await provider.plan(context);
+
+    expect(appServerRequest).not.toHaveBeenCalled();
+    expect(plan.items.map((item) => item.id)).toEqual([
+      "memory:codex:MEMORY.md",
+      "memory:codex:memory_summary.md",
+    ]);
+    expect(plan.items.every((item) => item.kind === "memory")).toBe(true);
+    expect(plan.items.every((item) => item.target?.startsWith(targetWorkspace))).toBe(true);
+
+    const result = await provider.apply(context, plan);
+
+    expect(result.summary).toMatchObject({ migrated: 2, errors: 0, conflicts: 0 });
+    await expect(
+      fs.readFile(path.join(targetWorkspace, "memory", "imports", "codex", "MEMORY.md"), "utf8"),
+    ).resolves.toBe("# Memory\n");
+    await expect(
+      fs.access(path.join(targetWorkspace, "memory", "imports", "codex", "private.md")),
+    ).rejects.toThrow();
+  });
+
+  it("skips unrelated Codex app-server preparation for memory-only imports", async () => {
+    const fixture = await createCodexFixture();
+    const provider = buildCodexMigrationProvider();
+    const preparation = provider.prepareApply?.(
+      makeContext({
+        source: fixture.codexHome,
+        stateDir: fixture.stateDir,
+        workspaceDir: fixture.workspaceDir,
+        itemKinds: ["memory"],
+      }),
+    );
+
+    expect(preparation).toBeUndefined();
+  });
+
+  it("rejects non-file Codex consolidated memory candidates", async () => {
+    const fixture = await createCodexFixture();
+    await fs.mkdir(path.join(fixture.codexHome, "memories", "MEMORY.md"), {
+      recursive: true,
+    });
+    const provider = buildCodexMigrationProvider();
+
+    await expect(
+      provider.plan(
+        makeContext({
+          source: fixture.codexHome,
+          stateDir: fixture.stateDir,
+          workspaceDir: fixture.workspaceDir,
+          itemKinds: ["memory"],
+        }),
+      ),
+    ).rejects.toThrow("must be a regular file");
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "rejects symlinked Codex consolidated memory candidates",
+    async () => {
+      const fixture = await createCodexFixture();
+      const actualMemory = path.join(fixture.root, "actual-memory.md");
+      const memoryPath = path.join(fixture.codexHome, "memories", "MEMORY.md");
+      await writeFile(actualMemory, "# Memory\n");
+      await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+      await fs.symlink(actualMemory, memoryPath);
+      const provider = buildCodexMigrationProvider();
+
+      await expect(
+        provider.plan(
+          makeContext({
+            source: fixture.codexHome,
+            stateDir: fixture.stateDir,
+            workspaceDir: fixture.workspaceDir,
+            itemKinds: ["memory"],
+          }),
+        ),
+      ).rejects.toThrow("must not be a symbolic link");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects a symlinked import destination that resolves into Codex memory",
+    async () => {
+      const fixture = await createCodexFixture();
+      const memoryDir = path.join(fixture.codexHome, "memories");
+      await writeFile(path.join(memoryDir, "MEMORY.md"), "# Memory\n");
+      await fs.mkdir(fixture.workspaceDir, { recursive: true });
+      await fs.symlink(memoryDir, path.join(fixture.workspaceDir, "memory"));
+      const provider = buildCodexMigrationProvider();
+
+      await expect(
+        provider.plan(
+          makeContext({
+            source: fixture.codexHome,
+            stateDir: fixture.stateDir,
+            workspaceDir: fixture.workspaceDir,
+            itemKinds: ["memory"],
+          }),
+        ),
+      ).rejects.toThrow("destination must stay in the selected workspace");
+    },
+  );
 
   it("plans Codex skills while keeping plugins and native config explicit", async () => {
     const fixture = await createCodexFixture();
@@ -253,6 +408,7 @@ describe("buildCodexMigrationProvider", () => {
     expectRecordFields((mockCallArg(appServerRequest) as { startOptions?: unknown }).startOptions, {
       command: "codex",
       commandSource: "managed",
+      managedCommandOrder: "desktop-first",
       env: {
         CODEX_HOME: fixture.codexHome,
         HOME: path.dirname(fixture.codexHome),
@@ -325,7 +481,7 @@ describe("buildCodexMigrationProvider", () => {
         workspaceDir: fixture.workspaceDir,
       }),
     );
-    expectRecordFields(findItem(skippedPlan.items, "auth:openai-codex"), {
+    expectRecordFields(findItem(skippedPlan.items, "auth:openai"), {
       kind: "auth",
       status: "skipped",
       sensitive: true,
@@ -341,7 +497,7 @@ describe("buildCodexMigrationProvider", () => {
       includeSecrets: true,
     });
     const plan = await provider.plan(ctx);
-    expectRecordFields(findItem(plan.items, "auth:openai-codex"), {
+    expectRecordFields(findItem(plan.items, "auth:openai"), {
       kind: "auth",
       status: "planned",
       sensitive: true,
@@ -349,36 +505,28 @@ describe("buildCodexMigrationProvider", () => {
 
     const result = await provider.apply(ctx, plan);
 
-    expectRecordFields(findItem(result.items, "auth:openai-codex"), { status: "migrated" });
-    const authStore = JSON.parse(
-      await fs.readFile(
-        path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json"),
-        "utf8",
-      ),
-    ) as {
-      profiles?: Record<
-        string,
-        { access?: string; provider?: string; refresh?: string; type?: string }
-      >;
-    };
-    expect(authStore.profiles?.["openai-codex:account-acct_test"]).toEqual(
+    expectRecordFields(findItem(result.items, "auth:openai"), { status: "migrated" });
+    const authStore = loadTargetAuthStore(fixture);
+    expect(authStore.profiles?.["openai:account-acct_test"]).toEqual(
       expect.objectContaining({
         type: "oauth",
-        provider: "openai-codex",
+        provider: "openai",
         access: accessToken,
         refresh: "refresh-test-token",
       }),
     );
-    expect(configState.auth?.profiles?.["openai-codex:account-acct_test"]).toEqual(
+    expect(configState.auth?.profiles?.["openai:account-acct_test"]).toEqual(
       expect.objectContaining({
-        provider: "openai-codex",
+        provider: "openai",
         mode: "oauth",
       }),
     );
     expect(configState.agents?.defaults?.models?.["openai/gpt-5.4-mini"]).toEqual({});
+    expect(configState.agents?.defaults?.models?.["openai/gpt-5.5"]).toEqual({});
+    expect(configState.agents?.defaults?.models?.["openai/gpt-5.6-sol"]).toEqual({});
     expect(configState.agents?.defaults?.model).toEqual({
       fallbacks: [],
-      primary: "openai/gpt-5.5",
+      primary: "openai/gpt-5.6-sol",
     });
   });
 
@@ -412,8 +560,8 @@ describe("buildCodexMigrationProvider", () => {
       },
       auth: {
         profiles: {
-          "openai-codex:account-acct_conflict": {
-            provider: "openai-codex",
+          "openai:account-acct_conflict": {
+            provider: "openai",
             mode: "api_key",
           },
         },
@@ -431,12 +579,12 @@ describe("buildCodexMigrationProvider", () => {
       }),
     );
 
-    expect(findItem(plan.items, "auth:openai-codex")).toEqual(
+    expect(findItem(plan.items, "auth:openai")).toEqual(
       expect.objectContaining({
         status: "conflict",
         reason: "auth profile exists",
         details: expect.objectContaining({
-          profileId: "openai-codex:account-acct_conflict",
+          profileId: "openai:account-acct_conflict",
         }),
       }),
     );
@@ -484,9 +632,7 @@ describe("buildCodexMigrationProvider", () => {
         reason: "auth profile exists",
       }),
     );
-    await expect(
-      fs.access(path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(loadTargetAuthStore(fixture).profiles["openai:codex-import"]).toBeUndefined();
   });
 
   it("skips Codex OAuth import when the source account changes after planning", async () => {
@@ -537,10 +683,10 @@ describe("buildCodexMigrationProvider", () => {
       includeSecrets: true,
     });
     const plan = await provider.plan(ctx);
-    expect(findItem(plan.items, "auth:openai-codex").details).toEqual(
+    expect(findItem(plan.items, "auth:openai").details).toEqual(
       expect.objectContaining({
-        profileId: "openai-codex:account-acct_planned",
-        sourceProfileId: "openai-codex:account-acct_planned",
+        profileId: "openai:account-acct_planned",
+        sourceProfileId: "openai:account-acct_planned",
       }),
     );
     await writeFile(
@@ -557,15 +703,15 @@ describe("buildCodexMigrationProvider", () => {
 
     const result = await provider.apply(ctx, plan);
 
-    expect(findItem(result.items, "auth:openai-codex")).toEqual(
+    expect(findItem(result.items, "auth:openai")).toEqual(
       expect.objectContaining({
         status: "skipped",
         reason: "auth credential no longer present",
       }),
     );
-    await expect(
-      fs.access(path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    const authStore = loadTargetAuthStore(fixture);
+    expect(authStore.profiles["openai:account-acct_planned"]).toBeUndefined();
+    expect(authStore.profiles["openai:account-acct_changed"]).toBeUndefined();
     expect(configState.auth).toBeUndefined();
   });
 
@@ -593,21 +739,19 @@ describe("buildCodexMigrationProvider", () => {
         },
       }),
     );
-    await writeFile(
-      path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json"),
-      JSON.stringify({
-        profiles: {
-          "openai-codex:account-acct_old": {
-            type: "oauth",
-            provider: "openai-codex",
-            access: "old-access-token",
-            refresh: "old-refresh-token",
-            accountId: "acct_old",
-            email: sharedEmail,
-          },
-        },
-      }),
-    );
+    upsertAuthProfile({
+      agentDir: targetAgentDir(fixture),
+      profileId: "openai:account-acct_old",
+      credential: {
+        type: "oauth",
+        provider: "openai",
+        access: "old-access-token",
+        refresh: "old-refresh-token",
+        expires: Date.now() + 60_000,
+        accountId: "acct_old",
+        email: sharedEmail,
+      },
+    });
     const configState: MigrationProviderContext["config"] = {
       agents: {
         defaults: {
@@ -627,34 +771,27 @@ describe("buildCodexMigrationProvider", () => {
     });
 
     const plan = await provider.plan(ctx);
-    expectRecordFields(findItem(plan.items, "auth:openai-codex"), {
+    expectRecordFields(findItem(plan.items, "auth:openai"), {
       status: "planned",
     });
-    expect(findItem(plan.items, "auth:openai-codex").details).toEqual(
+    expect(findItem(plan.items, "auth:openai").details).toEqual(
       expect.objectContaining({
-        profileId: "openai-codex:account-acct_new",
+        profileId: "openai:account-acct_new",
       }),
     );
 
     const result = await provider.apply(ctx, plan);
 
-    expectRecordFields(findItem(result.items, "auth:openai-codex"), { status: "migrated" });
-    const authStore = JSON.parse(
-      await fs.readFile(
-        path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json"),
-        "utf8",
-      ),
-    ) as {
-      profiles?: Record<string, { access?: string; accountId?: string; email?: string }>;
-    };
-    expect(authStore.profiles?.["openai-codex:account-acct_old"]).toEqual(
+    expectRecordFields(findItem(result.items, "auth:openai"), { status: "migrated" });
+    const authStore = loadTargetAuthStore(fixture);
+    expect(authStore.profiles?.["openai:account-acct_old"]).toEqual(
       expect.objectContaining({
         access: "old-access-token",
         accountId: "acct_old",
         email: sharedEmail,
       }),
     );
-    expect(authStore.profiles?.["openai-codex:account-acct_new"]).toEqual(
+    expect(authStore.profiles?.["openai:account-acct_new"]).toEqual(
       expect.objectContaining({
         access: accessToken,
         accountId: "acct_new",
@@ -706,24 +843,17 @@ describe("buildCodexMigrationProvider", () => {
 
     const result = await provider.apply(ctx, plan);
 
-    expectRecordFields(findItem(result.items, "auth:openai-codex"), { status: "migrated" });
-    expect(findItem(result.items, "auth:openai-codex").details).toEqual(
+    expectRecordFields(findItem(result.items, "auth:openai"), { status: "migrated" });
+    expect(findItem(result.items, "auth:openai").details).toEqual(
       expect.objectContaining({
         configUpdated: false,
       }),
     );
-    const authStore = JSON.parse(
-      await fs.readFile(
-        path.join(fixture.stateDir, "agents", "main", "agent", "auth-profiles.json"),
-        "utf8",
-      ),
-    ) as {
-      profiles?: Record<string, { access?: string; provider?: string; refresh?: string }>;
-    };
-    expect(authStore.profiles?.["openai-codex:account-acct_test"]).toEqual(
+    const authStore = loadTargetAuthStore(fixture);
+    expect(authStore.profiles?.["openai:account-acct_test"]).toEqual(
       expect.objectContaining({
         type: "oauth",
-        provider: "openai-codex",
+        provider: "openai",
         access: accessToken,
       }),
     );
@@ -777,13 +907,13 @@ describe("buildCodexMigrationProvider", () => {
 
     const result = await provider.apply(ctx, plan);
 
-    expect(findItem(result.items, "auth:openai-codex").details).toEqual(
+    expect(findItem(result.items, "auth:openai").details).toEqual(
       expect.objectContaining({
         configUpdated: false,
         configPatchReturned: true,
       }),
     );
-    expect(findItem(result.items, "auth:openai-codex:config:auth")).toEqual(
+    expect(findItem(result.items, "auth:openai:config:auth")).toEqual(
       expect.objectContaining({
         kind: "config",
         action: "merge",
@@ -792,8 +922,8 @@ describe("buildCodexMigrationProvider", () => {
           path: ["auth"],
           value: expect.objectContaining({
             profiles: expect.objectContaining({
-              "openai-codex:account-acct_test": expect.objectContaining({
-                provider: "openai-codex",
+              "openai:account-acct_test": expect.objectContaining({
+                provider: "openai",
                 mode: "oauth",
               }),
             }),
@@ -801,7 +931,7 @@ describe("buildCodexMigrationProvider", () => {
         }),
       }),
     );
-    expect(findItem(result.items, "auth:openai-codex:config:agents-defaults")).toEqual(
+    expect(findItem(result.items, "auth:openai:config:agents-defaults")).toEqual(
       expect.objectContaining({
         kind: "config",
         action: "merge",
@@ -809,9 +939,11 @@ describe("buildCodexMigrationProvider", () => {
         details: expect.objectContaining({
           path: ["agents", "defaults"],
           value: expect.objectContaining({
-            model: { primary: "openai/gpt-5.5" },
+            model: { primary: "openai/gpt-5.6-sol" },
             models: expect.objectContaining({
               "openai/gpt-5.4-mini": {},
+              "openai/gpt-5.5": {},
+              "openai/gpt-5.6-sol": {},
             }),
           }),
         }),
@@ -1134,7 +1266,7 @@ describe("buildCodexMigrationProvider", () => {
           },
           auth: {
             order: {
-              "openai-codex": ["openai-codex:target"],
+              openai: ["openai:target"],
             },
           },
         } as MigrationProviderContext["config"],
@@ -1874,6 +2006,7 @@ describe("buildCodexMigrationProvider", () => {
                     enabled: true,
                     marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
                     pluginName: "slack",
+                    allow_destructive_actions: "on-request",
                   },
                 },
               },
@@ -1941,6 +2074,7 @@ describe("buildCodexMigrationProvider", () => {
           enabled: true,
           marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
           pluginName: "slack",
+          allow_destructive_actions: "auto",
         },
       },
       enabled: true,
@@ -2000,7 +2134,6 @@ describe("buildCodexMigrationProvider", () => {
         stateDir: fixture.stateDir,
         workspaceDir: fixture.workspaceDir,
         config: configState,
-        overwrite: true,
       }),
     );
 
@@ -2008,6 +2141,154 @@ describe("buildCodexMigrationProvider", () => {
     expect(configState.plugins?.entries?.codex?.config?.codexPlugins).toEqual({
       enabled: true,
       allow_destructive_actions: true,
+      plugins: {
+        "google-calendar": {
+          enabled: true,
+          marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
+          pluginName: "google-calendar",
+        },
+      },
+    });
+  });
+
+  it("repairs old approval-routed destructive plugin policy during migration", async () => {
+    const fixture = await createCodexFixture();
+    const configState: MigrationProviderContext["config"] = {
+      plugins: {
+        entries: {
+          codex: {
+            enabled: true,
+            config: {
+              codexPlugins: {
+                enabled: true,
+                allow_destructive_actions: "on-request",
+                plugins: {
+                  "google-calendar": {
+                    enabled: true,
+                    marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
+                    pluginName: "google-calendar",
+                    allow_destructive_actions: "on-request",
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      agents: { defaults: { workspace: fixture.workspaceDir } },
+    } as MigrationProviderContext["config"];
+    appServerRequest.mockImplementation(async ({ method }: { method: string }) => {
+      if (method === "plugin/list") {
+        return pluginList([pluginSummary("google-calendar", { installed: true, enabled: true })]);
+      }
+      if (method === "plugin/read") {
+        return pluginRead("google-calendar");
+      }
+      if (method === "plugin/install") {
+        return { authPolicy: "ON_USE", appsNeedingAuth: [] } satisfies v2.PluginInstallResponse;
+      }
+      if (method === "skills/list") {
+        return { data: [] } satisfies v2.SkillsListResponse;
+      }
+      if (method === "hooks/list") {
+        return { data: [] } satisfies v2.HooksListResponse;
+      }
+      if (method === "config/mcpServer/reload") {
+        return {};
+      }
+      if (method === "app/list") {
+        return appsList([]);
+      }
+      throw new Error(`unexpected request ${method}`);
+    });
+    const provider = buildCodexMigrationProvider({
+      runtime: createConfigRuntime(configState),
+    });
+
+    const result = await provider.apply(
+      makeContext({
+        source: fixture.codexHome,
+        stateDir: fixture.stateDir,
+        workspaceDir: fixture.workspaceDir,
+        config: configState,
+      }),
+    );
+
+    expectRecordFields(findItem(result.items, "config:codex-plugins"), { status: "migrated" });
+    expect(configState.plugins?.entries?.codex?.config?.codexPlugins).toEqual({
+      enabled: true,
+      allow_destructive_actions: "auto",
+      plugins: {
+        "google-calendar": {
+          enabled: true,
+          marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
+          pluginName: "google-calendar",
+          allow_destructive_actions: "auto",
+        },
+      },
+    });
+  });
+
+  it("preserves global ask destructive plugin policy during migration", async () => {
+    const fixture = await createCodexFixture();
+    const configState: MigrationProviderContext["config"] = {
+      plugins: {
+        entries: {
+          codex: {
+            enabled: true,
+            config: {
+              codexPlugins: {
+                enabled: true,
+                allow_destructive_actions: "ask",
+                plugins: {},
+              },
+            },
+          },
+        },
+      },
+      agents: { defaults: { workspace: fixture.workspaceDir } },
+    } as MigrationProviderContext["config"];
+    appServerRequest.mockImplementation(async ({ method }: { method: string }) => {
+      if (method === "plugin/list") {
+        return pluginList([pluginSummary("google-calendar", { installed: true, enabled: true })]);
+      }
+      if (method === "plugin/read") {
+        return pluginRead("google-calendar");
+      }
+      if (method === "plugin/install") {
+        return { authPolicy: "ON_USE", appsNeedingAuth: [] } satisfies v2.PluginInstallResponse;
+      }
+      if (method === "skills/list") {
+        return { data: [] } satisfies v2.SkillsListResponse;
+      }
+      if (method === "hooks/list") {
+        return { data: [] } satisfies v2.HooksListResponse;
+      }
+      if (method === "config/mcpServer/reload") {
+        return {};
+      }
+      if (method === "app/list") {
+        return appsList([]);
+      }
+      throw new Error(`unexpected request ${method}`);
+    });
+    const provider = buildCodexMigrationProvider({
+      runtime: createConfigRuntime(configState),
+    });
+
+    const result = await provider.apply(
+      makeContext({
+        source: fixture.codexHome,
+        stateDir: fixture.stateDir,
+        workspaceDir: fixture.workspaceDir,
+        config: configState,
+      }),
+    );
+
+    expectRecordFields(findItem(result.items, "config:codex-plugins"), { status: "migrated" });
+    expect(configState.plugins?.entries?.codex?.config?.codexPlugins).toEqual({
+      enabled: true,
+      allow_destructive_actions: "ask",
       plugins: {
         "google-calendar": {
           enabled: true,

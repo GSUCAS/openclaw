@@ -1,6 +1,8 @@
+// Builds and validates the canonical OpenClaw configuration schema.
 import crypto from "node:crypto";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { CHANNEL_IDS } from "../channels/ids.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { parseConfigPathArrayIndex } from "../shared/path-array-index.js";
 import { GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA } from "./bundled-channel-config-metadata.generated.js";
 import { computeBaseConfigSchemaResponse } from "./schema-base.js";
 import type { ConfigUiHint, ConfigUiHints } from "./schema.hints.js";
@@ -13,9 +15,7 @@ import {
 } from "./schema.shared.js";
 import { applyDerivedTags } from "./schema.tags.js";
 
-export type { ConfigUiHint, ConfigUiHints } from "./schema.hints.js";
-
-export type ConfigSchema = Record<string, unknown>;
+type ConfigSchema = Record<string, unknown>;
 
 type JsonSchemaNode = Record<string, unknown>;
 
@@ -106,7 +106,7 @@ export type ConfigSchemaResponse = {
   generatedAt: string;
 };
 
-export type ConfigSchemaLookupChild = {
+type ConfigSchemaLookupChild = {
   key: string;
   path: string;
   type?: string | string[];
@@ -117,17 +117,17 @@ export type ConfigSchemaLookupChild = {
   hintPath?: string;
 };
 
-export type ConfigSchemaReloadKind = "restart" | "hot" | "none";
+type ConfigSchemaReloadKind = "restart" | "hot" | "none";
 
-export type ConfigSchemaReloadMetadata = {
+type ConfigSchemaReloadMetadata = {
   kind: ConfigSchemaReloadKind;
 };
 
-export type ConfigSchemaReloadMetadataResolver = (
+type ConfigSchemaReloadMetadataResolver = (
   path: string,
 ) => ConfigSchemaReloadMetadata | null | undefined;
 
-export type ConfigSchemaLookupResult = {
+type ConfigSchemaLookupResult = {
   path: string;
   schema: JsonSchemaNode;
   reloadKind?: ConfigSchemaReloadKind;
@@ -659,7 +659,7 @@ function resolveLookupChildSchema(
     return asJsonSchemaObject(properties[segment]);
   }
 
-  const itemIndex = /^\d+$/.test(segment) ? Number.parseInt(segment, 10) : undefined;
+  const itemIndex = parseConfigPathArrayIndex(segment);
   const items = resolveItemsSchema(schema, itemIndex);
   if ((segment === "*" || itemIndex !== undefined) && items) {
     return items;

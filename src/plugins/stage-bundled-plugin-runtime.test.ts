@@ -1,3 +1,4 @@
+// Covers staging bundled plugin runtime files for package output.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -445,6 +446,35 @@ describe("stageBundledPluginRuntime", () => {
     );
     expect(fs.lstatSync(runtimePackagePath).isSymbolicLink()).toBe(false);
     expect(fs.readFileSync(runtimePackagePath, "utf8")).toContain('"extensions": [');
+  });
+
+  it("copies unpacked Chrome extension payloads without wrapping their JavaScript", () => {
+    const repoRoot = makeRepoRoot("openclaw-stage-bundled-runtime-chrome-extension-");
+    createDistPluginDir(repoRoot, "browser");
+    const background = "chrome.runtime.onInstalled.addListener(() => {});\n";
+    const popup = "document.body.dataset.ready = 'true';\n";
+    setupRepoFiles(repoRoot, {
+      [bundledDistPluginFile("browser", "chrome-extension/background.js")]: background,
+      [bundledDistPluginFile("browser", "chrome-extension/popup.js")]: popup,
+      [bundledDistPluginFile("browser", "chrome-extension/manifest.json")]: "{}\n",
+    });
+
+    stageBundledPluginRuntime({ repoRoot });
+
+    const runtimeExtensionDir = path.join(
+      repoRoot,
+      "dist-runtime",
+      "extensions",
+      "browser",
+      "chrome-extension",
+    );
+    expect(fs.readFileSync(path.join(runtimeExtensionDir, "background.js"), "utf8")).toBe(
+      background,
+    );
+    expect(fs.readFileSync(path.join(runtimeExtensionDir, "popup.js"), "utf8")).toBe(popup);
+    expect(fs.lstatSync(path.join(runtimeExtensionDir, "background.js")).isSymbolicLink()).toBe(
+      false,
+    );
   });
 
   it("copies bundled plugin skill trees into the runtime overlay", () => {

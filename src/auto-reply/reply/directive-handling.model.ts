@@ -1,5 +1,11 @@
+// Handles model directives and persists provider/model selections.
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import { resolveAuthStorePathForDisplay } from "../../agents/auth-profiles.js";
-import { resolveAgentHarnessPolicy } from "../../agents/harness/selection.js";
+import type { AuthProfileCredential } from "../../agents/auth-profiles/types.js";
+import { resolveAgentHarnessPolicy } from "../../agents/harness/policy.js";
 import {
   type ModelAliasIndex,
   buildConfiguredModelCatalog,
@@ -9,13 +15,10 @@ import {
   resolveModelRefFromString,
 } from "../../agents/model-selection.js";
 import { buildAgentRuntimeAuthPlan } from "../../agents/runtime-plan/auth.js";
+import { resolveSessionRuntimeOverrideForProvider } from "../../agents/session-runtime-compat.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../../shared/string-coerce.js";
 import { shortenHomePath } from "../../utils.js";
 import { resolveSelectedAndActiveModel } from "../model-runtime.js";
 import type { ReplyPayload } from "../types.js";
@@ -29,7 +32,6 @@ import {
   type ModelPickerCatalogEntry,
   resolveProviderEndpointLabel,
 } from "./directive-handling.model-picker.js";
-export { resolveModelSelectionFromDirective } from "./directive-handling.model-selection.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 
 function isMissingAuthLabel(auth: { label: string; source: string }): boolean {
@@ -39,9 +41,28 @@ function isMissingAuthLabel(auth: { label: string; source: string }): boolean {
 function resolveStatusHarnessRuntime(params: {
   sessionEntry?: Pick<SessionEntry, "agentHarnessId" | "agentRuntimeOverride">;
   defaultRuntime: string;
+  provider: string;
+  cfg: OpenClawConfig;
 }): string {
-  void params.sessionEntry;
+  const sessionRuntime = resolveSessionRuntimeOverrideForProvider({
+    provider: params.provider,
+    entry: params.sessionEntry,
+    cfg: params.cfg,
+  });
+  if (sessionRuntime) {
+    return sessionRuntime;
+  }
   return params.defaultRuntime;
+}
+
+function resolveStatusAcceptedProfileTypes(params: {
+  provider: string;
+  harnessRuntime: string;
+}): readonly AuthProfileCredential["type"][] | undefined {
+  if (normalizeProviderId(params.provider) !== "openai" || params.harnessRuntime === "codex") {
+    return undefined;
+  }
+  return ["api_key"];
 }
 
 async function resolveStatusAuthLabel(params: {
@@ -55,18 +76,6 @@ async function resolveStatusAuthLabel(params: {
   workspaceDir?: string;
   sessionEntry?: Pick<SessionEntry, "agentHarnessId" | "agentRuntimeOverride">;
 }): Promise<string> {
-  const auth = await resolveAuthLabel(
-    params.provider,
-    params.cfg,
-    params.modelsPath,
-    params.agentDir,
-    params.authMode,
-    params.workspaceDir,
-  );
-  if (!isMissingAuthLabel(auth)) {
-    return formatAuthLabel(auth);
-  }
-
   const provider = normalizeProviderId(params.provider);
   const harnessPolicy = resolveAgentHarnessPolicy({
     provider,
@@ -77,7 +86,27 @@ async function resolveStatusAuthLabel(params: {
   const harnessRuntime = resolveStatusHarnessRuntime({
     sessionEntry: params.sessionEntry,
     defaultRuntime: harnessPolicy.runtime,
+    provider,
+    cfg: params.cfg,
   });
+  const auth = await resolveAuthLabel(
+    params.provider,
+    params.cfg,
+    params.modelsPath,
+    params.agentDir,
+    params.authMode,
+    params.workspaceDir,
+    {
+      acceptedProfileTypes: resolveStatusAcceptedProfileTypes({
+        provider,
+        harnessRuntime,
+      }),
+    },
+  );
+  if (!isMissingAuthLabel(auth)) {
+    return formatAuthLabel(auth);
+  }
+
   const runtimeAuthPlan = buildAgentRuntimeAuthPlan({
     provider,
     config: params.cfg,

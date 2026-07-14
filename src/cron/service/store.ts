@@ -1,17 +1,77 @@
-import fs from "node:fs";
+/** Loads, normalizes, quarantines, and persists cron service store state. */
 import { normalizeCronJobIdentityFields } from "../normalize-job-identity.js";
 import { normalizeCronJobInput } from "../normalize.js";
 import { getInvalidPersistedCronJobReason } from "../persisted-shape.js";
 import { cronSchedulingInputsEqual } from "../schedule-identity.js";
 import { isInvalidCronSessionTargetIdError } from "../session-target.js";
 import {
-  loadCronStoreWithConfigJobs,
-  saveCronStore,
-  type PreservedCronConfigJob,
+  loadCronJobsStoreWithConfigJobs,
+  saveCronQuarantineFile,
+  saveCronJobsStore,
+  type QuarantinedCronConfigJob,
 } from "../store.js";
-import type { CronJob } from "../types.js";
+import type { CronJob, CronStoreFile } from "../types.js";
 import { recomputeNextRuns } from "./jobs.js";
-import type { CronServiceState } from "./state.js";
+import { emit, type CronServiceState } from "./state.js";
+
+type PersistOptions = {
+  stateOnly?: boolean;
+  suppressScheduledJobId?: string;
+};
+
+export type CronRollbackSnapshot = {
+  store: CronStoreFile | null;
+  durableNextRunAtMsByJobId: Map<string, number | undefined>;
+  pendingCatchupDeferralJobIds: Set<string>;
+};
+
+function durableNextRunsFromJobs(jobs: readonly CronJob[]) {
+  return new Map(jobs.map((job) => [job.id, job.state.nextRunAtMs] as const));
+}
+
+function publishDurableNextRunChanges(params: {
+  state: CronServiceState;
+  storeJobs: readonly CronJob[];
+  stateOnly: boolean;
+  suppressScheduledJobId?: string;
+}) {
+  const previous = params.state.durableNextRunAtMsByJobId;
+  const next = params.stateOnly ? new Map(previous) : durableNextRunsFromJobs(params.storeJobs);
+
+  if (params.stateOnly) {
+    const currentJobsById = new Map(params.storeJobs.map((job) => [job.id, job] as const));
+    // State-only writes cannot create or delete rows. Preserve durable topology
+    // and update only rows that both snapshots know SQLite already contains.
+    for (const jobId of previous.keys()) {
+      const job = currentJobsById.get(jobId);
+      if (job) {
+        next.set(jobId, job.state.nextRunAtMs);
+      }
+    }
+  }
+
+  const changedJobs = params.storeJobs.filter((job) => {
+    if (!previous.has(job.id) || !next.has(job.id)) {
+      return false;
+    }
+    return previous.get(job.id) !== next.get(job.id);
+  });
+
+  // Advance durable truth before callbacks so re-entrant observers cannot
+  // publish the same committed transition twice.
+  params.state.durableNextRunAtMsByJobId = next;
+  for (const job of changedJobs) {
+    if (job.id === params.suppressScheduledJobId) {
+      continue;
+    }
+    emit(params.state, {
+      jobId: job.id,
+      action: "scheduled",
+      job,
+      nextRunAtMs: job.state.nextRunAtMs,
+    });
+  }
+}
 
 function invalidateStaleNextRunOnScheduleChange(params: {
   previousJobsById: ReadonlyMap<string, CronJob>;
@@ -21,6 +81,8 @@ function invalidateStaleNextRunOnScheduleChange(params: {
   if (!previousJob || cronSchedulingInputsEqual(previousJob, params.hydrated)) {
     return;
   }
+  // Runtime nextRunAtMs belongs to the old schedule identity; clear it so the
+  // current normalized schedule recomputes from the active clock.
   params.hydrated.state ??= {};
   params.hydrated.state.nextRunAtMs = undefined;
 }
@@ -44,34 +106,44 @@ function warnInvalidPersistedCronJob(params: {
       jobIndex: params.index,
       reason: params.reason,
     },
-    "cron: skipped invalid persisted job; run openclaw doctor --fix to repair",
+    "cron: quarantined invalid persisted job and skipped it from runtime",
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasUnsupportedStringPayloadKind(candidate: Record<string, unknown>): boolean {
-  const payload = candidate.payload;
-  if (!isRecord(payload)) {
-    return false;
+async function flushPendingQuarantine(
+  state: CronServiceState,
+  nowMs: number,
+): Promise<string | null> {
+  if (state.pendingQuarantineConfigJobs.length === 0) {
+    return null;
   }
-  const kind = payload.kind;
-  return (
-    typeof kind === "string" && kind.trim() !== "" && kind !== "systemEvent" && kind !== "agentTurn"
-  );
-}
-
-async function getFileMtimeMs(path: string): Promise<number | null> {
   try {
-    const stats = await fs.promises.stat(path);
-    return stats.mtimeMs;
-  } catch {
+    const quarantinePath = await saveCronQuarantineFile({
+      storePath: state.deps.storePath,
+      entries: state.pendingQuarantineConfigJobs,
+      nowMs,
+    });
+    state.pendingQuarantineConfigJobs = [];
+    state.lastQuarantineFailureWarnKey = null;
+    return quarantinePath;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const warnKey = `${state.deps.storePath}\0${errorMessage}`;
+    if (state.lastQuarantineFailureWarnKey !== warnKey) {
+      state.lastQuarantineFailureWarnKey = warnKey;
+      state.deps.log.warn(
+        {
+          storePath: state.deps.storePath,
+          error: errorMessage,
+        },
+        "cron: failed to quarantine malformed persisted jobs; skipping active store sanitization",
+      );
+    }
     return null;
   }
 }
 
+/** Loads and normalizes the cron store, quarantining invalid persisted rows before runtime use. */
 export async function ensureLoaded(
   state: CronServiceState,
   opts?: {
@@ -90,18 +162,20 @@ export async function ensureLoaded(
   for (const job of state.store?.jobs ?? []) {
     previousJobsById.set(job.id, job);
   }
-  // Force reload always re-reads the file to avoid missing cross-service
-  // edits on filesystems with coarse mtime resolution.
-
-  const fileMtimeMs = await getFileMtimeMs(state.deps.storePath);
-  const loaded = await loadCronStoreWithConfigJobs(state.deps.storePath);
-  const loadedJobs = (loaded.store.jobs ?? []) as unknown as CronJob[];
+  const loaded = await loadCronJobsStoreWithConfigJobs(state.deps.storePath);
+  // Persisted cron rows are validated lazily, so treat them as raw records at the
+  // store boundary and only trust the CronJob shape after validation below.
+  const loadedJobs = (loaded.store.jobs ?? []) as unknown as Record<string, unknown>[];
   const jobs: CronJob[] = [];
-  const preservedInvalidPersistedJobs: PreservedCronConfigJob[] = [];
-  for (const [index, job] of loadedJobs.entries()) {
-    const raw = job as unknown as Record<string, unknown>;
+  const durableNextRunAtMsByJobId = new Map<string, number | undefined>();
+  const quarantinedConfigJobs: QuarantinedCronConfigJob[] = [...loaded.invalidConfigRows];
+  for (const [index, raw] of loadedJobs.entries()) {
     const rawConfigJob = loaded.configJobs[index] ?? structuredClone(raw);
-    const { legacyJobIdIssue } = normalizeCronJobIdentityFields(raw);
+    const sourceIndex = loaded.configJobIndexes[index] ?? index;
+    const runtimeEntry = loaded.configJobRuntimeEntries[index];
+    // Accept old `jobId` rows at the raw boundary only; the in-memory store
+    // uses canonical `id` before validation and scheduling.
+    normalizeCronJobIdentityFields(raw);
     let normalized: Record<string, unknown> | null;
     try {
       normalized = normalizeCronJobInput(raw);
@@ -115,83 +189,78 @@ export async function ensureLoaded(
         "cron: job has invalid persisted sessionTarget; run openclaw doctor --fix to repair",
       );
     }
-    const hydrated =
-      normalized && typeof normalized === "object" ? (normalized as unknown as CronJob) : job;
-    const invalidReason = getInvalidPersistedCronJobReason(
-      hydrated as unknown as Record<string, unknown>,
-    );
+    const hydratedRaw = normalized ?? raw;
+    const invalidReason = getInvalidPersistedCronJobReason(hydratedRaw);
     if (invalidReason) {
-      if (invalidReason === "invalid-payload" && hasUnsupportedStringPayloadKind(rawConfigJob)) {
-        preservedInvalidPersistedJobs.push({ index, job: rawConfigJob });
+      const quarantineEntry: QuarantinedCronConfigJob = {
+        sourceIndex,
+        reason: invalidReason,
+        job: rawConfigJob,
+      };
+      const runtimeState = runtimeEntry?.state ?? raw.state;
+      if (runtimeState && typeof runtimeState === "object" && !Array.isArray(runtimeState)) {
+        // Preserve runtime state with the quarantined config so doctor can
+        // repair shape without losing last/next run information.
+        quarantineEntry.state = structuredClone(runtimeState as Record<string, unknown>);
       }
-      warnInvalidPersistedCronJob({ state, raw, index, reason: invalidReason });
+      const updatedAtMs = runtimeEntry?.updatedAtMs ?? raw.updatedAtMs;
+      if (typeof updatedAtMs === "number" && Number.isFinite(updatedAtMs)) {
+        quarantineEntry.updatedAtMs = updatedAtMs;
+      }
+      if (typeof runtimeEntry?.scheduleIdentity === "string") {
+        quarantineEntry.scheduleIdentity = runtimeEntry.scheduleIdentity;
+      }
+      quarantinedConfigJobs.push(quarantineEntry);
+      warnInvalidPersistedCronJob({ state, raw, index: sourceIndex, reason: invalidReason });
       continue;
     }
+    // Validated above, so the raw record is now a trusted CronJob.
+    const hydrated = hydratedRaw as unknown as CronJob;
     jobs.push(hydrated);
-    if (legacyJobIdIssue) {
-      const resolvedId = typeof hydrated.id === "string" ? hydrated.id : undefined;
-      state.deps.log.warn(
-        { storePath: state.deps.storePath, jobId: resolvedId },
-        "cron: job used legacy jobId field; normalized id in memory (run openclaw doctor --fix to persist canonical shape)",
-      );
-    }
-    // Persisted legacy jobs may predate the required `enabled` field.
-    // Keep runtime behavior backward-compatible without rewriting the store.
-    if (typeof hydrated.enabled !== "boolean") {
-      hydrated.enabled = true;
-    }
+    // Capture the value SQLite actually held before schedule-identity repair
+    // mutates the runtime view. A later save can then publish that transition.
+    durableNextRunAtMsByJobId.set(hydrated.id, hydrated.state.nextRunAtMs);
     invalidateStaleNextRunOnScheduleChange({ previousJobsById, hydrated });
-    // Same shape: persisted jobs missing `sessionTarget` crash downstream
-    // on any code path that dereferences `.startsWith` (e.g.
-    // `runIsolatedAgentJob` in `src/gateway/server-cron.ts`). Mirror the
-    // defaulter applied at create time: systemEvent payloads -> "main",
-    // agentTurn -> "isolated". Use `Object.hasOwn` rather than `in` so a
-    // poisoned prototype cannot feed a crafted `kind` into the defaulter.
-    if (typeof hydrated.sessionTarget !== "string") {
-      const payload = hydrated.payload as unknown;
-      const payloadKind =
-        payload &&
-        typeof payload === "object" &&
-        !Array.isArray(payload) &&
-        Object.hasOwn(payload, "kind")
-          ? (payload as { kind?: unknown }).kind
-          : undefined;
-      let defaulted: "main" | "isolated" | undefined;
-      if (payloadKind === "systemEvent") {
-        defaulted = "main";
-      } else if (payloadKind === "agentTurn") {
-        defaulted = "isolated";
-      }
-      if (defaulted) {
-        hydrated.sessionTarget = defaulted;
-        // `ensureLoaded` is called with `forceReload: true` on every tick;
-        // warn once per jobId per process to avoid log spam on repeated
-        // loads of the same still-broken store file.
-        const jobId = typeof hydrated.id === "string" ? hydrated.id : undefined;
-        const dedupeKey = jobId ?? "<unknown>";
-        if (!state.warnedMissingSessionTargetJobIds.has(dedupeKey)) {
-          state.warnedMissingSessionTargetJobIds.add(dedupeKey);
-          state.deps.log.warn(
-            { storePath: state.deps.storePath, jobId, defaulted },
-            "cron: job missing sessionTarget; defaulted in memory (edit jobs.json to persist canonical shape)",
-          );
-        }
-      }
-    }
   }
   state.store = {
     version: 1,
     jobs,
   };
-  state.preservedInvalidPersistedJobs = preservedInvalidPersistedJobs;
+  state.durableNextRunAtMsByJobId = durableNextRunAtMsByJobId;
   state.storeLoadedAtMs = state.deps.nowMs();
-  state.storeFileMtimeMs = fileMtimeMs;
+
+  if (quarantinedConfigJobs.length > 0) {
+    state.pendingQuarantineConfigJobs = quarantinedConfigJobs;
+    const quarantinePath = await flushPendingQuarantine(state, state.storeLoadedAtMs);
+    if (quarantinePath) {
+      try {
+        await persist(state);
+        state.deps.log.warn(
+          {
+            storePath: state.deps.storePath,
+            quarantinePath,
+            quarantinedJobs: quarantinedConfigJobs.length,
+          },
+          "cron: sanitized active cron store after quarantining malformed persisted jobs",
+        );
+      } catch (error) {
+        state.deps.log.warn(
+          {
+            storePath: state.deps.storePath,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "cron: failed to sanitize malformed persisted jobs after quarantine; continuing with quarantined in-memory view",
+        );
+      }
+    }
+  }
 
   if (!opts?.skipRecompute) {
     recomputeNextRuns(state);
   }
 }
 
+/** Emits the cron-disabled warning once per service state. */
 export function warnIfDisabled(state: CronServiceState, action: string) {
   if (state.deps.cronEnabled) {
     return;
@@ -206,17 +275,67 @@ export function warnIfDisabled(state: CronServiceState, action: string) {
   );
 }
 
-export async function persist(
-  state: CronServiceState,
-  opts?: { skipBackup?: boolean; stateOnly?: boolean },
-) {
-  if (!state.store) {
-    return;
+/** Persists the in-memory cron store, flushing pending quarantine records first. */
+export async function persist(state: CronServiceState, opts?: PersistOptions) {
+  const store = state.store;
+  if (!store) {
+    return false;
   }
-  await saveCronStore(state.deps.storePath, state.store, {
-    ...opts,
-    preservedConfigJobs: state.preservedInvalidPersistedJobs,
+  let flushedPendingQuarantine = false;
+  if (state.pendingQuarantineConfigJobs.length > 0) {
+    const quarantinePath = await flushPendingQuarantine(state, state.deps.nowMs());
+    if (!quarantinePath) {
+      return false;
+    }
+    flushedPendingQuarantine = true;
+  }
+  const stateOnly = !flushedPendingQuarantine && opts?.stateOnly === true;
+  await saveCronJobsStore(state.deps.storePath, store, stateOnly ? { stateOnly: true } : undefined);
+  publishDurableNextRunChanges({
+    state,
+    storeJobs: store.jobs,
+    stateOnly,
+    suppressScheduledJobId: opts?.suppressScheduledJobId,
   });
-  // Update file mtime after save to prevent immediate reload
-  state.storeFileMtimeMs = await getFileMtimeMs(state.deps.storePath);
+  return true;
+}
+
+/** Captures the live cron state that must stay aligned with the durable store. */
+export function snapshotStoreForRollback(state: CronServiceState): CronRollbackSnapshot {
+  return {
+    store: state.store ? structuredClone(state.store) : null,
+    durableNextRunAtMsByJobId: new Map(state.durableNextRunAtMsByJobId),
+    pendingCatchupDeferralJobIds: new Set(state.pendingCatchupDeferralJobIds),
+  };
+}
+
+// A failed durable write must not leave readers observing speculative job
+// topology, wake times, or catch-up ownership after the store lock releases.
+export async function persistOrRestore(
+  state: CronServiceState,
+  snapshot: CronRollbackSnapshot,
+  opts: {
+    postPersistAutoDisableNotifications?: Array<() => void>;
+    suppressScheduledJobId?: string;
+  } = {},
+) {
+  try {
+    const persisted = await persist(
+      state,
+      opts.suppressScheduledJobId === undefined
+        ? undefined
+        : { suppressScheduledJobId: opts.suppressScheduledJobId },
+    );
+    if (!persisted) {
+      throw new Error("cron: durable store write did not complete");
+    }
+  } catch (err) {
+    state.store = snapshot.store;
+    state.durableNextRunAtMsByJobId = snapshot.durableNextRunAtMsByJobId;
+    state.pendingCatchupDeferralJobIds = snapshot.pendingCatchupDeferralJobIds;
+    throw err;
+  }
+  for (const notify of opts.postPersistAutoDisableNotifications ?? []) {
+    notify();
+  }
 }

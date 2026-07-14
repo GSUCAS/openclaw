@@ -1,3 +1,4 @@
+// Zalo tests cover monitor.webhook plugin behavior.
 import type { RequestListener } from "node:http";
 import {
   createEmptyPluginRegistry,
@@ -6,7 +7,7 @@ import {
 import { withServer } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime } from "../runtime-api.js";
-import { handleZaloWebhookRequest } from "./monitor.js";
+import { testing as monitorTesting } from "./monitor.js";
 import type { ZaloRuntimeEnv } from "./monitor.types.js";
 import {
   clearZaloWebhookSecurityStateForTest,
@@ -34,14 +35,16 @@ const DEFAULT_ACCOUNT: ResolvedZaloAccount = {
 };
 
 function createWebhookRequestHandler(processUpdate?: ZaloWebhookProcessUpdate): RequestListener {
-  return async (req, res) => {
-    const handled = processUpdate
-      ? await handleZaloWebhookRequestInternal(req, res, processUpdate)
-      : await handleZaloWebhookRequest(req, res);
-    if (!handled) {
-      res.statusCode = 404;
-      res.end("not found");
-    }
+  return (req, res) => {
+    void (async () => {
+      const handled = processUpdate
+        ? await handleZaloWebhookRequestInternal(req, res, processUpdate)
+        : await monitorTesting.handleZaloWebhookRequest(req, res);
+      if (!handled) {
+        res.statusCode = 404;
+        res.end("not found");
+      }
+    })();
   };
 }
 

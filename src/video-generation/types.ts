@@ -1,6 +1,7 @@
+// Video generation types describe requests, providers, and normalized media output.
+import type { MediaNormalizationEntry } from "../../packages/media-generation-core/src/normalization.js";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { MediaNormalizationEntry } from "../media-generation/normalization.types.js";
 
 export type GeneratedVideoAsset = {
   /** Raw video bytes. Required for local delivery; omit when url is provided instead. */
@@ -14,7 +15,14 @@ export type GeneratedVideoAsset = {
   metadata?: Record<string, unknown>;
 };
 
-export type VideoGenerationResolution = "480P" | "720P" | "768P" | "1080P" | (string & {});
+export type VideoGenerationResolution =
+  | "360P"
+  | "480P"
+  | "540P"
+  | "720P"
+  | "768P"
+  | "1080P"
+  | (string & {});
 
 /**
  * Canonical semantic role hints for reference assets. The list covers the
@@ -148,6 +156,12 @@ export type VideoGenerationProviderCapabilities = VideoGenerationModeCapabilitie
   videoToVideo?: VideoGenerationTransformCapabilities;
 };
 
+/** Static catalog metadata that overrides provider defaults for one video model. */
+export type VideoGenerationCatalogModelEntry = {
+  capabilities?: VideoGenerationProviderCapabilities;
+  modes?: readonly VideoGenerationMode[];
+};
+
 export type VideoGenerationNormalization = {
   size?: MediaNormalizationEntry<string>;
   aspectRatio?: MediaNormalizationEntry<string>;
@@ -164,6 +178,7 @@ export type VideoGenerationProvider = {
   defaultTimeoutMs?: number;
   models?: string[];
   capabilities: VideoGenerationProviderCapabilities;
+  catalogByModel?: Readonly<Record<string, VideoGenerationCatalogModelEntry>>;
   isConfigured?: (ctx: VideoGenerationProviderConfiguredContext) => boolean;
   resolveModelCapabilities?: (
     ctx: VideoGenerationModelCapabilitiesContext,

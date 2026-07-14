@@ -1,3 +1,4 @@
+/** Type contracts for plugin-owned CLI backend integrations. */
 import type { CliBackendConfig } from "../config/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ContextEngineHostCapability } from "../context-engine/types.js";
@@ -25,12 +26,20 @@ export type CliBackendPrepareExecutionContext = {
   agentDir?: string;
   provider: string;
   modelId: string;
+  /** Effective OpenClaw context budget selected for this run. */
+  contextTokenBudget?: number;
   authProfileId?: string;
+  executionMode?: CliBackendExecutionMode;
 };
 
 export type CliBackendPreparedExecution = {
   env?: Record<string, string>;
   clearEnv?: string[];
+  /**
+   * Backend-owned staging that must run after the core CLI queue admits the turn.
+   * Use this for mutable per-profile CLI homes that the launched process also owns.
+   */
+  beforeExecution?: () => Promise<void>;
   cleanup?: () => Promise<void>;
 };
 
@@ -44,6 +53,15 @@ export type CliBackendThinkingLevel =
   | "adaptive"
   | "max";
 
+export type CliBackendExecutionMode = "agent" | "side-question";
+
+/** Host-isolated tool grant for a CLI run with every native tool disabled. */
+type CliBackendToolAvailability = {
+  native: readonly [];
+  /** MCP tools already isolated by the host transport that may be auto-approved. */
+  mcp: readonly string[];
+};
+
 export type CliBackendResolveExecutionArgsContext = {
   config?: OpenClawConfig;
   workspaceDir: string;
@@ -51,6 +69,8 @@ export type CliBackendResolveExecutionArgsContext = {
   modelId: string;
   authProfileId?: string;
   thinkingLevel?: CliBackendThinkingLevel;
+  executionMode?: CliBackendExecutionMode;
+  toolAvailability?: CliBackendToolAvailability;
   useResume: boolean;
   baseArgs: readonly string[];
 };
@@ -61,7 +81,9 @@ export type CliBackendResolveExecutionArgs = (
 
 export type CliBackendAuthEpochMode = "combined" | "profile-only";
 
-export type CliBackendNativeToolMode = "none" | "always-on";
+export type CliBackendNativeToolMode = "none" | "always-on" | "selectable";
+
+export type CliBackendSideQuestionToolMode = "disabled";
 
 export type CliBackendNormalizeConfigContext = {
   config?: OpenClawConfig;
@@ -69,10 +91,23 @@ export type CliBackendNormalizeConfigContext = {
   agentId?: string;
 };
 
+/** Backend-owned implementation boundary for script-backed CLI executables. */
+export type CliBackendRuntimeArtifactPolicy = Readonly<{
+  kind: "bundled-package-tree";
+  /** Exact package.json name whose complete installed tree owns inference. */
+  packageName: string;
+  /** Only the command itself may be the package entrypoint. */
+  entrypoint: "command";
+  /** Canonical basenames allowed when this backend ships a self-contained native build. */
+  nativeExecutableNames?: readonly string[];
+}>;
+
 /** Plugin-owned CLI backend defaults used by the text-only CLI runner. */
 export type CliBackendPlugin = {
   /** Provider id used in model refs, for example `claude-cli/opus`. */
   id: string;
+  /** Canonical model provider whose models this CLI backend can execute. */
+  modelProvider?: string;
   /** Default backend config before user overrides from `agents.defaults.cliBackends`. */
   config: CliBackendConfig;
   /**
@@ -80,6 +115,11 @@ export type CliBackendPlugin = {
    * driven through the generic CLI runner.
    */
   contextEngineHostCapabilities?: readonly ContextEngineHostCapability[];
+  /**
+   * Backend-owned compaction for non-harness CLI sessions.
+   * Set only when the backend bounds its own transcript and persists resumable state.
+   */
+  ownsNativeCompaction?: boolean;
   /**
    * Optional live-smoke metadata owned by the backend plugin.
    *
@@ -95,6 +135,8 @@ export type CliBackendPlugin = {
       binaryName?: string;
     };
   };
+  /** Required whenever this backend can become a verified inference owner. */
+  runtimeArtifact?: CliBackendRuntimeArtifactPolicy;
   /**
    * Whether OpenClaw should inject bundle MCP config for this backend.
    *
@@ -159,6 +201,13 @@ export type CliBackendPlugin = {
    */
   authEpochMode?: CliBackendAuthEpochMode;
   /**
+   * Whether `prepareExecution` may auto-select a configured auth profile.
+   *
+   * Defaults to true for auth bridges. Set false for environment/config-only
+   * hooks that do not consume OpenClaw auth profiles.
+   */
+  autoSelectAuthProfile?: boolean;
+  /**
    * Backend-owned execution bridge.
    *
    * Use this on async run paths when the backend needs a generated auth/config
@@ -182,9 +231,17 @@ export type CliBackendPlugin = {
   resolveExecutionArgs?: CliBackendResolveExecutionArgs;
   /**
    * Whether this CLI backend can expose native tools outside OpenClaw's tool
-   * catalog. Backends that cannot provide a true no-tools mode must mark
-   * themselves as `always-on` so callers that require disabled tools fail
-   * closed instead of launching a native harness.
+   * catalog. `selectable` backends must enforce `toolAvailability` through
+   * `resolveExecutionArgs`; `always-on` backends fail closed for restricted
+   * callers.
    */
   nativeToolMode?: CliBackendNativeToolMode;
+  /**
+   * Side-question native tool behavior.
+   *
+   * Set to `disabled` only when `executionMode: "side-question"` reliably
+   * launches the CLI without native tools, even if normal agent turns expose
+   * backend-owned tools.
+   */
+  sideQuestionToolMode?: CliBackendSideQuestionToolMode;
 };

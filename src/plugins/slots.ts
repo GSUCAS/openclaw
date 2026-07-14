@@ -1,3 +1,4 @@
+/** Applies mutually exclusive plugin slot selection for memory and context-engine plugins. */
 import type { OpenClawConfig } from "../config/types.js";
 import type { PluginSlotsConfig } from "../config/types.plugins.js";
 import type { PluginKind } from "./plugin-kind.types.js";
@@ -20,7 +21,7 @@ const DEFAULT_SLOT_BY_KEY: Record<PluginSlotKey, string> = {
 };
 
 /** Normalize a kind field to an array for uniform iteration. */
-export function normalizeKinds(kind?: PluginKind | PluginKind[]): PluginKind[] {
+function normalizeKinds(kind?: PluginKind | PluginKind[]): PluginKind[] {
   if (!kind) {
     return [];
   }
@@ -46,22 +47,24 @@ export function kindsEqual(
 }
 
 /** Return all slot keys that a plugin's kind field maps to. */
-export function slotKeysForPluginKind(kind?: PluginKind | PluginKind[]): PluginSlotKey[] {
+function slotKeysForPluginKind(kind?: PluginKind | PluginKind[]): PluginSlotKey[] {
   return normalizeKinds(kind)
     .map((k) => SLOT_BY_KIND[k])
     .filter((k): k is PluginSlotKey => k != null);
 }
 
+/** Returns the implicit plugin id that owns a slot before config overrides it. */
 export function defaultSlotIdForKey(slotKey: PluginSlotKey): string {
   return DEFAULT_SLOT_BY_KEY[slotKey];
 }
 
-export type SlotSelectionResult = {
+type SlotSelectionResult = {
   config: OpenClawConfig;
   warnings: string[];
   changed: boolean;
 };
 
+/** Updates config so the selected plugin owns all slots implied by its kind. */
 export function applyExclusiveSlotSelection(params: {
   config: OpenClawConfig;
   selectedId: string;

@@ -1,3 +1,4 @@
+// Tests source reply delivery visibility across message tool and visible reply modes.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { CommandTurnContext } from "../command-turn-context.js";
@@ -74,6 +75,96 @@ describe("resolveSourceReplyDeliveryMode", () => {
     ).toBe("message_tool_only");
   });
 
+  it("keeps internal WebChat room events on automatic delivery", () => {
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: automaticGroupReplyConfig,
+        ctx: {
+          ChatType: "direct",
+          InboundEventKind: "room_event",
+          Provider: "webchat",
+          Surface: "webchat",
+        },
+      }),
+    ).toBe("automatic");
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: emptyConfig,
+        ctx: {
+          ChatType: "direct",
+          InboundEventKind: "room_event",
+          Provider: "webchat",
+          Surface: "webchat",
+        },
+        requested: "automatic",
+      }),
+    ).toBe("automatic");
+  });
+
+  it("keeps routed external room events message-tool-only when provider is WebChat", () => {
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: automaticGroupReplyConfig,
+        ctx: {
+          ChatType: "group",
+          InboundEventKind: "room_event",
+          Provider: "webchat",
+          Surface: "telegram",
+        },
+      }),
+    ).toBe("message_tool_only");
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: emptyConfig,
+        ctx: {
+          ChatType: "direct",
+          InboundEventKind: "room_event",
+          Provider: "webchat",
+          Surface: "webchat",
+          ExplicitDeliverRoute: true,
+        },
+        requested: "automatic",
+      }),
+    ).toBe("message_tool_only");
+  });
+
+  it("keeps implicit internal WebChat direct turns automatic", () => {
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: emptyConfig,
+        ctx: {
+          ChatType: "direct",
+          Provider: "webchat",
+          Surface: "webchat",
+        },
+      }),
+    ).toBe("automatic");
+  });
+
+  it("preserves explicit internal WebChat message-tool opt-ins", () => {
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: globalToolOnlyReplyConfig,
+        ctx: {
+          ChatType: "direct",
+          Provider: "webchat",
+          Surface: "webchat",
+        },
+      }),
+    ).toBe("message_tool_only");
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: emptyConfig,
+        ctx: {
+          ChatType: "direct",
+          Provider: "webchat",
+          Surface: "webchat",
+        },
+        requested: "message_tool_only",
+      }),
+    ).toBe("message_tool_only");
+  });
+
   it("allows message-tool-only delivery for any source chat via global config", () => {
     for (const ChatType of ["direct", "group", "channel"] as const) {
       expect(
@@ -131,6 +222,29 @@ describe("resolveSourceReplyDeliveryMode", () => {
         },
       }),
     ).toBe("automatic");
+  });
+
+  it("treats authorized control-command bodies as explicit replies even when CommandSource is missing", () => {
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: globalToolOnlyReplyConfig,
+        ctx: {
+          ChatType: "direct",
+          CommandAuthorized: true,
+          CommandBody: "/reset",
+        },
+      }),
+    ).toBe("automatic");
+    expect(
+      resolveSourceReplyDeliveryMode({
+        cfg: globalToolOnlyReplyConfig,
+        ctx: {
+          ChatType: "direct",
+          CommandAuthorized: true,
+          CommandBody: "hey can you /status please",
+        },
+      }),
+    ).toBe("message_tool_only");
   });
 
   it("keeps unauthorized text slash command turns tool-only under the default group mode", () => {
@@ -300,6 +414,28 @@ describe("resolveSourceReplyVisibilityPolicy", () => {
     );
   });
 
+  it.each([
+    [automaticGroupReplyConfig, "automatic"],
+    [globalToolOnlyReplyConfig, "message_tool_only"],
+  ] as const)(
+    "keeps room-event effective delivery tool-only while session-stable mode follows config",
+    (cfg, expectedStableMode) => {
+      expectPolicyFields(
+        resolveSourceReplyVisibilityPolicy({
+          cfg,
+          ctx: { ChatType: "group", InboundEventKind: "room_event" },
+          sendPolicy: "allow",
+        }),
+        {
+          sourceReplyDeliveryMode: "message_tool_only",
+          sessionStableSourceReplyDeliveryMode: expectedStableMode,
+          suppressAutomaticSourceDelivery: true,
+          suppressDelivery: true,
+        },
+      );
+    },
+  );
+
   it("suppresses automatic source delivery for opted-in message-tool group turns without suppressing typing", () => {
     expectPolicyFields(
       resolveSourceReplyVisibilityPolicy({
@@ -332,12 +468,13 @@ describe("resolveSourceReplyVisibilityPolicy", () => {
     ] as const) {
       expectPolicyFields(
         resolveSourceReplyVisibilityPolicy({
-          cfg: emptyConfig,
+          cfg: globalToolOnlyReplyConfig,
           ctx,
           sendPolicy: "allow",
         }),
         {
           sourceReplyDeliveryMode: "automatic",
+          sessionStableSourceReplyDeliveryMode: "automatic",
           suppressAutomaticSourceDelivery: false,
           suppressDelivery: false,
           suppressHookReplyLifecycle: false,
@@ -356,6 +493,7 @@ describe("resolveSourceReplyVisibilityPolicy", () => {
       }),
       {
         sourceReplyDeliveryMode: "automatic",
+        sessionStableSourceReplyDeliveryMode: "automatic",
         suppressAutomaticSourceDelivery: false,
         suppressDelivery: false,
         suppressHookReplyLifecycle: false,
@@ -374,6 +512,7 @@ describe("resolveSourceReplyVisibilityPolicy", () => {
       }),
       {
         sourceReplyDeliveryMode: "message_tool_only",
+        sessionStableSourceReplyDeliveryMode: "message_tool_only",
         suppressAutomaticSourceDelivery: true,
         suppressDelivery: true,
         suppressHookReplyLifecycle: false,

@@ -1,11 +1,13 @@
+// Whatsapp tests cover group gating.allowlist warn plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./group-activation.js", () => ({
   resolveGroupActivationFor: vi.fn(async () => "mention"),
 }));
 
+import { createTestWebInboundMessage } from "../../inbound/test-message.test-helper.js";
+import type { AdmittedWebInboundMessage } from "../../inbound/types.js";
 import type { MentionConfig } from "../mentions.js";
-import type { WebInboundMsg } from "../types.js";
 import {
   resetGroupDropWarningsForTests,
   applyGroupGating,
@@ -14,27 +16,42 @@ import {
 
 function makeUnregisteredGroupMsg(
   conversationId: string,
-  accountId: string = "default",
-): WebInboundMsg {
-  return {
-    id: `msg-${conversationId}`,
-    from: conversationId,
-    to: "+15550000001",
-    body: "@openclaw hello",
-    chatId: conversationId,
-    chatType: "group",
-    conversationId,
-    timestamp: 1700000000,
-    accountId,
-    sender: { e164: "+15550000002", name: "Alice" },
-  } as WebInboundMsg;
+  accountId = "default",
+): AdmittedWebInboundMessage {
+  return createTestWebInboundMessage({
+    event: {
+      id: `msg-${conversationId}`,
+      timestamp: 1700000000,
+    },
+    payload: {
+      body: "@openclaw hello",
+    },
+    platform: {
+      chatJid: conversationId,
+      recipientJid: "+15550000001",
+      sender: { e164: "+15550000002", name: "Alice" },
+    },
+    admission: {
+      accountId,
+      conversation: {
+        kind: "group",
+        id: conversationId,
+      },
+      sender: {
+        id: "+15550000002",
+      },
+      senderAccess: {
+        reasonCode: "group_policy_allowed",
+      },
+    },
+  });
 }
 
 type WarnLogger = (obj: unknown, msg: string) => void;
 type ApplyGroupGatingParams = Parameters<typeof applyGroupGating>[0];
 
 function makeParams(
-  msg: WebInboundMsg,
+  msg: AdmittedWebInboundMessage,
   warn: WarnLogger,
   cfg: ApplyGroupGatingParams["cfg"] = {
     channels: {
@@ -60,13 +77,16 @@ function makeParams(
     },
   } as never,
 ) {
+  const admission = msg.admission;
+  if (!admission) {
+    throw new Error("Expected admitted WhatsApp test message");
+  }
   return {
     cfg,
     msg,
-    conversationId: msg.conversationId,
-    groupHistoryKey: `whatsapp:group:${msg.conversationId}`,
+    groupHistoryKey: `whatsapp:group:${admission.conversation.id}`,
     agentId: "main",
-    sessionKey: `agent:main:whatsapp:group:${msg.conversationId}`,
+    sessionKey: `agent:main:whatsapp:group:${admission.conversation.id}`,
     baseMentionConfig: { mentionRegexes: [/\bopenclaw\b/i] } satisfies MentionConfig,
     groupHistories: new Map<string, GroupHistoryEntry[]>(),
     groupHistoryLimit: 20,
@@ -183,18 +203,23 @@ describe("applyGroupGating allowlist drop warning", () => {
     expect(warn.mock.calls[1]?.[1]).toContain("b@g.us");
   });
 
-  it("evicts old warning keys instead of growing without bound", async () => {
+  it("bounds warning keys by least-recently-used conversations", async () => {
     const warn = vi.fn<WarnLogger>();
+    const apply = (conversationId: string) =>
+      applyGroupGating(makeParams(makeUnregisteredGroupMsg(conversationId), warn));
 
-    await applyGroupGating(makeParams(makeUnregisteredGroupMsg("evicted@g.us"), warn));
     for (let index = 0; index < 100; index += 1) {
-      await applyGroupGating(makeParams(makeUnregisteredGroupMsg(`overflow-${index}@g.us`), warn));
+      await apply(`${index}@g.us`);
     }
-    await applyGroupGating(makeParams(makeUnregisteredGroupMsg("evicted@g.us"), warn));
+    await apply("0@g.us");
+    await apply("100@g.us");
+    await apply("0@g.us");
+    await apply("1@g.us");
+    await apply("100@g.us");
 
     expect(warn).toHaveBeenCalledTimes(102);
-    expect(warn.mock.calls[0]?.[1]).toContain("evicted@g.us");
-    expect(warn.mock.calls[101]?.[1]).toContain("evicted@g.us");
+    expect(warn.mock.calls[100]?.[1]).toContain("100@g.us");
+    expect(warn.mock.calls[101]?.[1]).toContain("1@g.us");
   });
 
   it("does not warn when the group is registered", async () => {

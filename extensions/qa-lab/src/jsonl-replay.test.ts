@@ -1,15 +1,18 @@
+// Qa Lab tests cover jsonl replay plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMockJsonlReplayCellRunner,
-  extractJsonlReplayUserTurns,
   renderJsonlReplayMarkdownReport,
   runJsonlReplay,
-  type JsonlReplayCellRunner,
 } from "./jsonl-replay.js";
 import type { RuntimeId, RuntimeParityCell, RuntimeParityToolCall } from "./runtime-parity.js";
+
+type JsonlReplayCellRunner = NonNullable<
+  NonNullable<Parameters<typeof runJsonlReplay>[1]>["runCell"]
+>;
 
 const tempRoots: string[] = [];
 
@@ -55,8 +58,10 @@ afterEach(async () => {
 });
 
 describe("jsonl replay", () => {
-  it("extracts user-turn boundaries while ignoring system, tool-only, empty, and malformed rows", () => {
-    const turns = extractJsonlReplayUserTurns(
+  it("extracts user-turn boundaries while ignoring system, tool-only, empty, and malformed rows", async () => {
+    const transcriptDir = await makeTempDir();
+    await fs.writeFile(
+      path.join(transcriptDir, "turns.jsonl"),
       [
         `{"message":{"role":"system","content":"System setup"}}`,
         `{"message":{"role":"tool","content":"tool-only prelude"}}`,
@@ -66,6 +71,21 @@ describe("jsonl replay", () => {
         `{"message":{"role":"user","content":[{"type":"text","text":"Plan the release"},{"type":"tool_result","content":"ignored"}]}}`,
         `{"role":"user","content":[{"type":"input_text","text":"Check the follow-up"}]}`,
       ].join("\n"),
+      "utf8",
+    );
+    let turns: readonly Parameters<JsonlReplayCellRunner>[0]["turn"][] = [];
+    const runCell: JsonlReplayCellRunner = async (params) => {
+      turns = params.turns;
+      return createMockJsonlReplayCellRunner()(params);
+    };
+
+    await runJsonlReplay(
+      {
+        directory: transcriptDir,
+        runtimePair: ["openclaw", "codex"],
+        providerMode: "mock-openai",
+      },
+      { runCell },
     );
 
     expect(turns).toEqual([
@@ -103,7 +123,7 @@ describe("jsonl replay", () => {
         return {
           scenarioStatus: "pass",
           cell: makeCell(runtime, {
-            toolCalls: [makeToolCall(runtime === "pi" ? {} : { argsHash: "args-codex" })],
+            toolCalls: [makeToolCall(runtime === "openclaw" ? {} : { argsHash: "args-codex" })],
           }),
         };
       }
@@ -111,7 +131,7 @@ describe("jsonl replay", () => {
         return {
           scenarioStatus: "pass",
           cell: makeCell(runtime, {
-            finalText: runtime === "pi" ? "pi wording" : "codex wording",
+            finalText: runtime === "openclaw" ? "openclaw wording" : "codex wording",
           }),
         };
       }
@@ -124,7 +144,7 @@ describe("jsonl replay", () => {
     const result = await runJsonlReplay(
       {
         directory: transcriptDir,
-        runtimePair: ["pi", "codex"],
+        runtimePair: ["openclaw", "codex"],
         providerMode: "mock-openai",
       },
       { runCell },
@@ -138,7 +158,7 @@ describe("jsonl replay", () => {
         firstDriftAtTurn: 2,
       }),
     );
-    expect(result.transcripts[0]?.cells.pi).toHaveLength(3);
+    expect(result.transcripts[0]?.cells.openclaw).toHaveLength(3);
     expect(result.transcripts[0]?.cells.codex).toHaveLength(3);
   });
 
@@ -148,7 +168,7 @@ describe("jsonl replay", () => {
     const result = await runJsonlReplay(
       {
         directory: fixtureDir,
-        runtimePair: ["pi", "codex"],
+        runtimePair: ["openclaw", "codex"],
         providerMode: "mock-openai",
       },
       { runCell: createMockJsonlReplayCellRunner() },
@@ -161,7 +181,7 @@ describe("jsonl replay", () => {
       renderJsonlReplayMarkdownReport({
         generatedAt: "2026-05-10T00:00:00.000Z",
         providerMode: "mock-openai",
-        runtimePair: ["pi", "codex"],
+        runtimePair: ["openclaw", "codex"],
         transcripts: result.transcripts,
       }),
     ).toContain("| plan-mode-boundaries.jsonl | 3 |  | none, none, none |");

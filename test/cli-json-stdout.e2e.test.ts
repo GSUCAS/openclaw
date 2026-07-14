@@ -1,3 +1,4 @@
+// CLI JSON stdout E2E tests validate machine-readable CLI output.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -12,7 +13,7 @@ describe("cli json stdout contract", () => {
         await fs.mkdir(legacyDir, { recursive: true });
         await fs.writeFile(path.join(legacyDir, "clawdbot.json"), "{}", "utf8");
 
-        const env = {
+        const env: NodeJS.ProcessEnv = {
           ...process.env,
           HOME: tempHome,
           USERPROFILE: tempHome,

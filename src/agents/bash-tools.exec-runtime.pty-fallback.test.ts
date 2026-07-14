@@ -1,3 +1,8 @@
+/**
+ * PTY fallback runtime tests.
+ * Verifies PTY-requested exec sessions can fall back through the supervisor
+ * path while still emitting diagnostics and registry state.
+ */
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import {
   onInternalDiagnosticEvent,
@@ -5,7 +10,8 @@ import {
   type DiagnosticExecProcessCompletedEvent,
   type DiagnosticEventPayload,
 } from "../infra/diagnostic-events.js";
-import type { ManagedRun, SpawnInput } from "../process/supervisor/index.js";
+import type { ManagedRun } from "../process/supervisor/index.js";
+import type { SpawnInput } from "../process/supervisor/types.js";
 
 let listRunningSessions: typeof import("./bash-process-registry.js").listRunningSessions;
 let resetProcessRegistryForTests: typeof import("./bash-process-registry.js").resetProcessRegistryForTests;
@@ -20,7 +26,6 @@ vi.mock("../process/supervisor/index.js", () => ({
     spawn: supervisorSpawnMock,
     cancel: vi.fn(),
     cancelScope: vi.fn(),
-    reconcileOrphans: vi.fn(),
     getRecord: vi.fn(),
   }),
 }));
@@ -115,7 +120,9 @@ test("exec cleans session state when PTY fallback spawn also fails", async () =>
 });
 
 function flushDiagnosticEvents() {
-  return new Promise<void>((resolve) => setImmediate(resolve));
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 test("exec emits bounded process diagnostics without command text", async () => {

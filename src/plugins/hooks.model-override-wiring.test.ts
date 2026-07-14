@@ -9,7 +9,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { joinPresentTextSegments } from "../shared/text/join-segments.js";
 import { createHookRunner } from "./hooks.js";
-import { addTestHook, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-helpers.js";
+import { addTestHook, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-fixtures.js";
 import { createEmptyPluginRegistry, type PluginRegistry } from "./registry.js";
 import type {
   PluginHookAgentContext,
@@ -90,7 +90,7 @@ describe("model override pipeline wiring", () => {
     catchErrors?: boolean;
   }) {
     const handlerSpy = vi.fn(
-      (eventValue: PluginHookBeforeModelResolveEvent) =>
+      (_eventValue: PluginHookBeforeModelResolveEvent) =>
         ({
           modelOverride: "demo-local-model",
           providerOverride: "demo-local-provider",
@@ -235,7 +235,7 @@ describe("model override pipeline wiring", () => {
         addBeforePromptBuildHook(
           registry,
           "slow-plugin",
-          () => new Promise<PluginHookBeforePromptBuildResult>(() => undefined),
+          () => new Promise<PluginHookBeforePromptBuildResult>(() => {}),
           10,
         );
         addBeforePromptBuildHook(registry, "fast-plugin", () => ({ prependContext: "fast" }), 1);
@@ -272,7 +272,9 @@ describe("model override pipeline wiring", () => {
           registry,
           "active-memory",
           async () => {
-            await new Promise((resolve) => setTimeout(resolve, 20));
+            await new Promise((resolve) => {
+              setTimeout(resolve, 20);
+            });
             return { prependContext: "memory context" };
           },
           10,

@@ -1,3 +1,4 @@
+// Gateway service command registration shared by `gateway` and legacy `daemon` CLIs.
 import type { Command } from "commander";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { inheritOptionFromParent } from "../command-options.js";
@@ -53,6 +54,7 @@ function resolveRestartOptions(cmdOpts: DaemonLifecycleOptions, command?: Comman
   };
 }
 
+/** Attach Gateway service status/install/lifecycle subcommands to a parent command. */
 export function addGatewayServiceCommands(parent: Command, opts?: { statusDescription?: string }) {
   parent
     .command("status")
@@ -82,7 +84,7 @@ export function addGatewayServiceCommands(parent: Command, opts?: { statusDescri
     .command("install")
     .description("Install the Gateway service (launchd/systemd/schtasks)")
     .option("--port <port>", "Gateway port")
-    .option("--runtime <runtime>", "Daemon runtime (node|bun). Default: node")
+    .option("--runtime <runtime>", "Daemon runtime (node). Default: node")
     .option("--token <token>", "Gateway token (token auth)")
     .option("--wrapper <path>", "Executable wrapper for generated service ProgramArguments")
     .option("--force", "Reinstall/overwrite if already installed", false)
@@ -128,11 +130,18 @@ export function addGatewayServiceCommands(parent: Command, opts?: { statusDescri
     .command("restart")
     .description("Restart the Gateway service (launchd/systemd/schtasks)")
     .option("--force", "Restart immediately without waiting for active gateway work", false)
-    .option("--safe", "Request an OpenClaw-aware restart after active work drains", false)
+    .option(
+      "--safe",
+      "Request an OpenClaw-aware restart after active work drains " +
+        "(bounded wait; may force after gateway.reload.deferralTimeoutMs expires; " +
+        "set deferralTimeoutMs=0 for indefinite wait)",
+      false,
+    )
     .option("--skip-deferral", "Bypass the safe-restart deferral gate; requires --safe", false)
     .option(
       "--wait <duration>",
-      "Wait duration before forcing restart (ms, 10s, 5m; 0 waits indefinitely)",
+      "Wait duration before restart (ms, 10s, 5m; 0 waits indefinitely). " +
+        "For non-safe restarts (plain restart); not compatible with --force or --safe",
     )
     .option("--json", "Output JSON", false)
     .action(async (cmdOpts, command) => {

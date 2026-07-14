@@ -1,7 +1,7 @@
+// Tests shared infra error formatting helpers.
 import { describe, expect, it } from "vitest";
 import {
   collectErrorGraphCandidates,
-  detectErrorKind,
   extractErrorCode,
   formatErrorMessage,
   formatUncaughtError,
@@ -90,7 +90,7 @@ describe("error helpers", () => {
 
   it("dedupes repeated cause messages while preserving deeper distinct causes", () => {
     const rootCause = new Error("provider auth lookup failed");
-    const inner = new Error('No API key found for provider "openai-codex".', { cause: rootCause });
+    const inner = new Error('No API key found for provider "openai".', { cause: rootCause });
     const wrapper = new Error(inner.message, { cause: inner });
     expect(formatErrorMessage(wrapper)).toBe(`${inner.message} | ${rootCause.message}`);
   });
@@ -119,35 +119,6 @@ describe("error helpers", () => {
     expect(formatted).toContain("authorization:");
     expect(formatted).not.toContain(appSecret);
     expect(formatted).not.toContain(tenantToken);
-  });
-
-  it.each([
-    {
-      value: new Error("Unhandled stop reason: refusal_policy"),
-      expected: "refusal",
-    },
-    {
-      value: Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" }),
-      expected: "timeout",
-    },
-    {
-      value: Object.assign(new Error("Too many requests"), { code: 429 }),
-      expected: "rate_limit",
-    },
-    {
-      value: new Error("context_window exceeded with too many tokens"),
-      expected: "context_length",
-    },
-    {
-      value: new Error("plain provider failure"),
-      expected: undefined,
-    },
-    {
-      value: undefined,
-      expected: undefined,
-    },
-  ] as const)("detects error kind for case %#", ({ value, expected }) => {
-    expect(detectErrorKind(value)).toBe(expected);
   });
 
   it("uses message-only formatting for INVALID_CONFIG and stack formatting otherwise", () => {

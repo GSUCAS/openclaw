@@ -1,9 +1,10 @@
+// Covers plugin uninstall flows and install-record cleanup.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { toRepoRelativePath } from "../test-utils/repo-files.js";
+import { resolvePluginNpmProjectDir } from "./install-paths.js";
 import { resolvePluginInstallDir } from "./install.js";
 import {
   cleanupTrackedTempDirsAsync,
@@ -14,8 +15,6 @@ import {
   removePluginFromConfig,
   planPluginUninstall,
   resolveUninstallChannelConfigKeys,
-  resolveUninstallDirectoryTarget,
-  uninstallPlugin,
 } from "./uninstall.js";
 
 const runCommandWithTimeoutMock = vi.hoisted(() => vi.fn());
@@ -26,6 +25,21 @@ vi.mock("../process/exec.js", () => ({
 
 type PluginConfig = NonNullable<OpenClawConfig["plugins"]>;
 type PluginInstallRecord = NonNullable<PluginConfig["installs"]>[string];
+
+async function uninstallPlugin(params: Parameters<typeof planPluginUninstall>[0]) {
+  const plan = planPluginUninstall(params);
+  if (!plan.ok) {
+    return plan;
+  }
+  const directory = await applyPluginUninstallDirectoryRemoval(plan.directoryRemoval);
+  return {
+    ok: true as const,
+    config: plan.config,
+    pluginId: plan.pluginId,
+    actions: { ...plan.actions, directory: directory.directoryRemoved },
+    warnings: directory.warnings,
+  };
+}
 
 async function createInstalledNpmPluginFixture(params: {
   baseDir: string;
@@ -717,9 +731,13 @@ describe("uninstallPlugin", () => {
       termination: "exit",
     });
     tempDir = await makeTrackedTempDirAsync("uninstall-test", tempDirs);
+    const globalConfig = path.join(tempDir, "global-npmrc");
+    await fs.writeFile(globalConfig, "", "utf8");
+    vi.stubEnv("NPM_CONFIG_GLOBALCONFIG", globalConfig);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await cleanupTrackedTempDirsAsync(tempDirs);
   });
 
@@ -735,6 +753,36 @@ describe("uninstallPlugin", () => {
     if (!result.ok) {
       expect(result.error).toBe("Plugin not found: nonexistent");
     }
+  });
+
+  it("does not treat inherited prototype names as installed plugins", async () => {
+    const result = await uninstallPlugin({
+      config: createPluginConfig({ entries: {}, installs: {} }),
+      pluginId: "constructor",
+      deleteFiles: false,
+    });
+
+    expect(result).toEqual({ ok: false, error: "Plugin not found: constructor" });
+  });
+
+  it("uninstalls own prototype-named plugin records", async () => {
+    const result = await uninstallPlugin({
+      config: createPluginConfig({
+        entries: {
+          constructor: { enabled: true },
+        },
+        installs: {
+          constructor: createNpmInstallRecord("constructor"),
+        },
+      }),
+      pluginId: "constructor",
+      deleteFiles: false,
+    });
+
+    const successfulResult = expectSuccessfulUninstall(result);
+    expect(successfulResult.config.plugins).toBeUndefined();
+    expect(successfulResult.actions.entry).toBe(true);
+    expect(successfulResult.actions.install).toBe(true);
   });
 
   it("cleans stale policy references even when plugin code and install records are gone", async () => {
@@ -963,6 +1011,71 @@ describe("uninstallPlugin", () => {
     const stateDir = path.join(tempDir, "state");
     const extensionsDir = path.join(stateDir, "extensions");
     const npmRoot = path.join(stateDir, "npm");
+    const pluginDir = path.join(npmRoot, "node_modules", "@openclaw", "kitchen-sink");
+    const hoistedDir = path.join(npmRoot, "node_modules", "is-number");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.mkdir(hoistedDir, { recursive: true });
+    await fs.writeFile(
+      path.join(npmRoot, "package.json"),
+      `${JSON.stringify(
+        {
+          private: true,
+          dependencies: {
+            "@openclaw/kitchen-sink": "1.0.0",
+            "is-number": "7.0.0",
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await fs.writeFile(path.join(pluginDir, "package.json"), "{}");
+    await fs.writeFile(path.join(hoistedDir, "package.json"), "{}");
+
+    const plan = planPluginUninstall({
+      config: createPluginConfig({
+        entries: createSinglePluginEntries("openclaw-kitchen-sink-fixture"),
+        installs: {
+          "openclaw-kitchen-sink-fixture": {
+            source: "npm",
+            spec: "@openclaw/kitchen-sink@1.0.0",
+            installPath: pluginDir,
+          },
+        },
+      }),
+      pluginId: "openclaw-kitchen-sink-fixture",
+      deleteFiles: true,
+      extensionsDir,
+    });
+
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) {
+      throw new Error(plan.error);
+    }
+    expect(plan.directoryRemoval).toEqual({
+      target: pluginDir,
+      cleanup: {
+        kind: "npm",
+        npmRoot,
+        packageName: "@openclaw/kitchen-sink",
+      },
+    });
+
+    const applied = await applyPluginUninstallDirectoryRemoval(plan.directoryRemoval);
+
+    expect(applied).toEqual({ directoryRemoved: true, warnings: [] });
+    expectNpmUninstallCommand({ packageName: "@openclaw/kitchen-sink", npmRoot });
+    await expectPathAccessState(pluginDir, "missing");
+  });
+
+  it("uninstalls per-plugin npm project packages through their project root", async () => {
+    const stateDir = path.join(tempDir, "state");
+    const extensionsDir = path.join(stateDir, "extensions");
+    const npmBaseDir = path.join(stateDir, "npm");
+    const npmRoot = resolvePluginNpmProjectDir({
+      npmDir: npmBaseDir,
+      packageName: "@openclaw/kitchen-sink",
+    });
     const pluginDir = path.join(npmRoot, "node_modules", "@openclaw", "kitchen-sink");
     const hoistedDir = path.join(npmRoot, "node_modules", "is-number");
     await fs.mkdir(pluginDir, { recursive: true });
@@ -1626,198 +1739,5 @@ describe("uninstallPlugin", () => {
     await expect(fs.access(outsideDir)).resolves.toBeUndefined();
     const linkStat = await fs.lstat(installPath);
     expect(linkStat.isSymbolicLink()).toBe(true);
-  });
-});
-
-describe("resolveUninstallDirectoryTarget", () => {
-  it("returns null for linked plugins", () => {
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: {
-          source: "path",
-          sourcePath: "/tmp/my-plugin",
-          installPath: "/tmp/my-plugin",
-        },
-      }),
-    ).toBeNull();
-  });
-
-  it("returns managed install path for copied path installs", () => {
-    const extensionsDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const installPath = resolvePluginInstallDir("my-plugin", extensionsDir);
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: {
-          source: "path",
-          sourcePath: "/tmp/source-plugin",
-          installPath,
-        },
-        extensionsDir,
-      }),
-    ).toBe(installPath);
-  });
-
-  it("falls back to default path when configured installPath is untrusted", () => {
-    const extensionsDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const target = resolveUninstallDirectoryTarget({
-      pluginId: "my-plugin",
-      hasInstall: true,
-      installRecord: {
-        source: "npm",
-        spec: "my-plugin@1.0.0",
-        installPath: "/tmp/not-openclaw-plugin-install/my-plugin",
-      },
-      extensionsDir,
-    });
-
-    expect(target).toBe(resolvePluginInstallDir("my-plugin", extensionsDir));
-  });
-
-  it("uses configured installPath when it stays inside the managed extensions dir", () => {
-    const extensionsDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const installPath = path.join(extensionsDir, "archive-installs", "my-plugin");
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: {
-          source: "archive",
-          sourcePath: "/tmp/my-plugin.zip",
-          installPath,
-        },
-        extensionsDir,
-      }),
-    ).toBe(installPath);
-  });
-
-  it("uses configured installPath when npm installed it under the managed npm root", () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const extensionsDir = path.join(stateDir, "extensions");
-    const installPath = path.join(stateDir, "npm", "node_modules", "@openclaw", "kitchen-sink");
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "openclaw-kitchen-sink-fixture",
-        hasInstall: true,
-        installRecord: {
-          source: "npm",
-          spec: "@openclaw/kitchen-sink@latest",
-          installPath,
-        },
-        extensionsDir,
-      }),
-    ).toBe(installPath);
-  });
-
-  it("uses configured installPath when git installed it under the managed git root", () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const extensionsDir = path.join(stateDir, "extensions");
-    const installPath = path.join(stateDir, "git", "git-abc123", "repo");
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: createGitInstallRecord("my-plugin", installPath),
-        extensionsDir,
-      }),
-    ).toBe(installPath);
-  });
-
-  it("uses configured installPath when ClawHub installed it under the managed extensions root", () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const extensionsDir = path.join(stateDir, "extensions");
-    const installPath = resolvePluginInstallDir("clawpack-demo", extensionsDir);
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "clawpack-demo",
-        hasInstall: true,
-        installRecord: {
-          source: "clawhub",
-          spec: "clawhub:clawpack-demo@2026.5.1-beta.2",
-          installPath,
-          clawhubUrl: "https://clawhub.ai",
-          clawhubPackage: "clawpack-demo",
-          clawhubFamily: "code-plugin",
-          clawhubChannel: "official",
-          artifactKind: "npm-pack",
-          artifactFormat: "tgz",
-          npmIntegrity: "sha512-clawpack",
-          npmShasum: "1".repeat(40),
-          npmTarballName: "clawpack-demo-2026.5.1-beta.2.tgz",
-          clawpackSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          clawpackSpecVersion: 1,
-          clawpackManifestSha256:
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          clawpackSize: 4096,
-        },
-        extensionsDir,
-      }),
-    ).toBe(installPath);
-  });
-
-  it("does not trust git install paths outside the managed git root", () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const extensionsDir = path.join(stateDir, "extensions");
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: createGitInstallRecord(
-          "my-plugin",
-          path.join(os.tmpdir(), "git", "git-abc123", "repo"),
-        ),
-        extensionsDir,
-      }),
-    ).toBe(resolvePluginInstallDir("my-plugin", extensionsDir));
-  });
-
-  it("does not trust npm install paths outside the managed npm root", () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-uninstall-safe");
-    const extensionsDir = path.join(stateDir, "extensions");
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "openclaw-kitchen-sink-fixture",
-        hasInstall: true,
-        installRecord: {
-          source: "npm",
-          spec: "@openclaw/kitchen-sink@latest",
-          installPath: path.join(os.tmpdir(), "npm", "node_modules", "@openclaw", "kitchen-sink"),
-        },
-        extensionsDir,
-      }),
-    ).toBe(resolvePluginInstallDir("openclaw-kitchen-sink-fixture", extensionsDir));
-  });
-
-  it("uses configured installPath when it is under the recorded managed extensions root", () => {
-    const currentExtensionsDir = path.join(os.tmpdir(), "openclaw-uninstall-current", "extensions");
-    const recordedExtensionsDir = path.join(
-      os.tmpdir(),
-      "openclaw-uninstall-recorded",
-      "extensions",
-    );
-    const installPath = resolvePluginInstallDir("my-plugin", recordedExtensionsDir);
-
-    expect(
-      resolveUninstallDirectoryTarget({
-        pluginId: "my-plugin",
-        hasInstall: true,
-        installRecord: {
-          source: "npm",
-          spec: "my-plugin@1.0.0",
-          installPath,
-        },
-        extensionsDir: currentExtensionsDir,
-      }),
-    ).toBe(installPath);
   });
 });

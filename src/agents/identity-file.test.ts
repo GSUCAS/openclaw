@@ -1,3 +1,7 @@
+/**
+ * Regression coverage for IDENTITY.md parsing and merging.
+ * Ensures placeholders are ignored and rich identity fields stay stable.
+ */
 import { describe, expect, it } from "vitest";
 import { mergeIdentityMarkdownContent, parseIdentityMarkdown } from "./identity-file.js";
 
@@ -51,6 +55,11 @@ describe("parseIdentityMarkdown", () => {
   it("still treats code-span-wrapped template placeholders as placeholders", () => {
     const content = "- **Avatar:** `(workspace-relative path, http(s) URL, or data URI)`";
     const parsed = parseIdentityMarkdown(content);
+    expect(parsed).toStrictEqual({});
+  });
+
+  it("ignores an italic not-set placeholder", () => {
+    const parsed = parseIdentityMarkdown("- **Avatar:** *(not set yet)*");
     expect(parsed).toStrictEqual({});
   });
 });

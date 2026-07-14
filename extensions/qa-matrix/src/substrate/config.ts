@@ -1,3 +1,4 @@
+// Qa Matrix helper module supports config behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeStringEntries, uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { MatrixQaProvisionedTopology } from "./topology.js";
@@ -38,6 +39,10 @@ type MatrixQaToolConfigOverrides = {
   allow?: string[];
   deny?: string[];
 };
+
+type MatrixQaAudioConfigOverrides = NonNullable<
+  NonNullable<NonNullable<OpenClawConfig["tools"]>["media"]>["audio"]
+>;
 
 type MatrixQaGroupConfigOverrides = {
   allowBots?: MatrixQaAllowBotsMode;
@@ -90,6 +95,7 @@ export type MatrixQaConfigOverrides = {
   execApprovals?: MatrixQaExecApprovalsConfigOverrides;
   groupAllowFrom?: string[];
   groupAllowRoles?: MatrixQaActorRole[];
+  groupMentionPatterns?: string[];
   groupPolicy?: MatrixQaGroupPolicy;
   configuredBotRoles?: MatrixQaActorRole[];
   groupsByKey?: Record<string, MatrixQaGroupConfigOverrides>;
@@ -99,6 +105,7 @@ export type MatrixQaConfigOverrides = {
   textChunkLimit?: number;
   threadBindings?: MatrixQaThreadBindingsConfigOverrides;
   threadReplies?: MatrixQaThreadRepliesMode;
+  audio?: MatrixQaAudioConfigOverrides;
   toolProfile?: "coding" | "messaging" | "minimal";
 };
 
@@ -123,6 +130,7 @@ export type MatrixQaConfigSnapshot = {
   execApprovals?: MatrixQaExecApprovalsConfigOverrides;
   configuredBotRoles: MatrixQaActorRole[];
   groupAllowFrom: string[];
+  groupMentionPatterns: string[];
   groupPolicy: MatrixQaGroupPolicy;
   groupsByKey: Record<string, MatrixQaGroupSnapshot>;
   replyToMode: MatrixQaReplyToMode;
@@ -432,17 +440,26 @@ function buildMatrixQaChannelAccountConfig(params: {
     params.snapshot.autoJoin === "allowlist" && params.snapshot.autoJoinAllowlist.length > 0
       ? { autoJoinAllowlist: params.snapshot.autoJoinAllowlist }
       : {};
-  const blockStreamingConfig =
-    params.overrides?.blockStreaming !== undefined
-      ? { blockStreaming: params.snapshot.blockStreaming }
-      : {};
-  const chunkModeConfig =
-    params.snapshot.chunkMode !== undefined ? { chunkMode: params.snapshot.chunkMode } : {};
   const execApprovalsConfig = buildMatrixQaAccountExecApprovalsConfig(
     params.snapshot.execApprovals,
   );
+  // Matrix accepts only the nested streaming shape; harness overrides keep
+  // their scalar/boolean vocabulary and normalize here before config write.
+  const streamingSlots = {
+    ...(params.overrides?.streaming !== undefined
+      ? { mode: resolveMatrixQaStreamingMode(params.overrides.streaming) }
+      : {}),
+    ...(isMatrixQaStreamingConfig(params.overrides?.streaming) &&
+    params.overrides.streaming.preview?.toolProgress !== undefined
+      ? { preview: { toolProgress: params.overrides.streaming.preview.toolProgress } }
+      : {}),
+    ...(params.snapshot.chunkMode !== undefined ? { chunkMode: params.snapshot.chunkMode } : {}),
+    ...(params.overrides?.blockStreaming !== undefined
+      ? { block: { enabled: params.snapshot.blockStreaming } }
+      : {}),
+  };
   const streamingConfig =
-    params.overrides?.streaming !== undefined ? { streaming: params.overrides.streaming } : {};
+    Object.keys(streamingSlots).length > 0 ? { streaming: streamingSlots } : {};
   const startupVerificationConfig =
     params.snapshot.startupVerification !== undefined
       ? { startupVerification: params.snapshot.startupVerification }
@@ -480,8 +497,6 @@ function buildMatrixQaChannelAccountConfig(params: {
     userId: params.sutUserId,
     ...autoJoinConfig,
     ...autoJoinAllowlistConfig,
-    ...blockStreamingConfig,
-    ...chunkModeConfig,
     ...(execApprovalsConfig ? { execApprovals: execApprovalsConfig } : {}),
     ...streamingConfig,
     ...textChunkLimitConfig,
@@ -506,6 +521,7 @@ export function buildMatrixQaConfigSnapshot(params: {
     execApprovals: params.overrides?.execApprovals,
     configuredBotRoles: [...(params.overrides?.configuredBotRoles ?? [])],
     groupAllowFrom: resolveMatrixQaGroupAllowFrom(params),
+    groupMentionPatterns: normalizeMatrixQaAllowlist(params.overrides?.groupMentionPatterns),
     groupPolicy: params.overrides?.groupPolicy ?? "allowlist",
     groupsByKey: resolveMatrixQaGroupSnapshots({
       overrides: params.overrides,
@@ -538,6 +554,7 @@ export function summarizeMatrixQaConfigSnapshot(snapshot: MatrixQaConfigSnapshot
     `dm.policy=${snapshot.dm.policy}`,
     `dm.sessionScope=${snapshot.dm.sessionScope}`,
     `dm.threadReplies=${snapshot.dm.threadReplies}`,
+    `groupMentionPatterns=${snapshot.groupMentionPatterns.length > 0 ? snapshot.groupMentionPatterns.join("|") : "<default>"}`,
     `streaming=${snapshot.streaming}`,
     `streaming.preview.toolProgress=${formatMatrixQaBoolean(snapshot.streamingPreviewToolProgress)}`,
     `textChunkLimit=${snapshot.textChunkLimit ?? "<default>"}`,
@@ -615,15 +632,35 @@ export function buildMatrixQaConfig(
         }
       : {};
 
+  const toolsConfig =
+    params.overrides?.toolProfile || params.overrides?.audio
+      ? {
+          ...baseCfg.tools,
+          ...(params.overrides?.toolProfile
+            ? {
+                profile: params.overrides.toolProfile,
+              }
+            : {}),
+          ...(params.overrides?.audio
+            ? {
+                media: {
+                  ...baseCfg.tools?.media,
+                  audio: {
+                    ...baseCfg.tools?.media?.audio,
+                    ...params.overrides.audio,
+                  },
+                },
+              }
+            : {}),
+        }
+      : undefined;
+
   return {
     ...baseCfg,
     ...approvalForwardingConfig,
-    ...(params.overrides?.toolProfile
+    ...(toolsConfig
       ? {
-          tools: {
-            ...baseCfg.tools,
-            profile: params.overrides.toolProfile,
-          },
+          tools: toolsConfig,
         }
       : {}),
     ...(params.overrides?.agentDefaults
@@ -649,6 +686,9 @@ export function buildMatrixQaConfig(
       ...baseCfg.messages,
       groupChat: {
         ...baseCfg.messages?.groupChat,
+        ...(snapshot.groupMentionPatterns.length > 0
+          ? { mentionPatterns: snapshot.groupMentionPatterns }
+          : {}),
         visibleReplies: "automatic",
       },
     },

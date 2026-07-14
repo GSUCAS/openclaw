@@ -1,12 +1,20 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+// Runs Knip unused-file detection and compares results to the allowlist.
 import { fileURLToPath } from "node:url";
+import {
+  compareStringListToAllowlist,
+  isLikelyRepoFilePath,
+  KNIP_MAX_BUFFER_BYTES,
+  runKnip,
+  uniqueSorted,
+} from "./deadcode-knip-runner.mjs";
 import {
   KNIP_OPTIONAL_UNUSED_FILE_ALLOWLIST,
   KNIP_UNUSED_FILE_ALLOWLIST,
 } from "./deadcode-unused-files.allowlist.mjs";
 
-const KNIP_VERSION = "6.8.0";
+export { KNIP_MAX_BUFFER_BYTES };
+
 const KNIP_ARGS = [
   "--config",
   "config/knip.config.ts",
@@ -18,20 +26,7 @@ const KNIP_ARGS = [
   "--no-config-hints",
 ];
 
-function normalizeRepoPath(value) {
-  return value.replaceAll("\\", "/").replace(/^\.\//u, "");
-}
-
-function uniqueSorted(values) {
-  return [...new Set(values.map(normalizeRepoPath))].toSorted((left, right) =>
-    left.localeCompare(right),
-  );
-}
-
-function isLikelyRepoFilePath(value) {
-  return /^(apps|docs|extensions|packages|scripts|src|test|ui)\//u.test(normalizeRepoPath(value));
-}
-
+/** Parses compact Knip output into unused file paths. */
 export function parseKnipCompactUnusedFiles(output) {
   const files = [];
   let inUnusedFilesSection = false;
@@ -48,10 +43,7 @@ export function parseKnipCompactUnusedFiles(output) {
     }
 
     const separatorIndex = line.lastIndexOf(": ");
-    if (separatorIndex === -1) {
-      continue;
-    }
-    if (sawUnusedFilesSection && !inUnusedFilesSection) {
+    if (separatorIndex === -1 || (sawUnusedFilesSection && !inUnusedFilesSection)) {
       continue;
     }
     const file = line.slice(separatorIndex + 2).trim();
@@ -63,29 +55,16 @@ export function parseKnipCompactUnusedFiles(output) {
   return uniqueSorted(files);
 }
 
+/** Compares detected unused files against the checked-in allowlist. */
 export function compareUnusedFilesToAllowlist(
   actualFiles,
   allowlistFiles,
   optionalAllowlistFiles = [],
 ) {
-  const actual = uniqueSorted(actualFiles);
-  const allowed = uniqueSorted(allowlistFiles);
-  const optionalAllowed = uniqueSorted(optionalAllowlistFiles);
-  const allowedOrOptionalSet = new Set([...allowed, ...optionalAllowed]);
-  const actualSet = new Set(actual);
-
-  return {
-    actual,
-    allowed,
-    unexpected: actual.filter((file) => !allowedOrOptionalSet.has(file)),
-    stale: allowed.filter((file) => !actualSet.has(file)),
-    duplicateAllowedCount: allowlistFiles.length - new Set(allowlistFiles).size,
-    allowlistIsSorted:
-      JSON.stringify(allowlistFiles.map(normalizeRepoPath)) === JSON.stringify(allowed),
-  };
+  return compareStringListToAllowlist(actualFiles, allowlistFiles, optionalAllowlistFiles);
 }
 
-export function formatUnusedFileComparison(comparison) {
+function formatUnusedFileComparison(comparison) {
   const lines = [];
   if (!comparison.allowlistIsSorted) {
     lines.push("deadcode unused-file allowlist is not sorted.");
@@ -108,22 +87,12 @@ export function formatUnusedFileComparison(comparison) {
   return lines.join("\n");
 }
 
-export function runKnipUnusedFiles() {
-  const result = spawnSync(
-    "pnpm",
-    ["--config.minimum-release-age=0", "dlx", `knip@${KNIP_VERSION}`, ...KNIP_ARGS],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  return {
-    status: result.status,
-    signal: result.signal,
-    output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
-  };
+/** Runs Knip and returns parsed unused-file results. */
+export async function runKnipUnusedFiles(params = {}) {
+  return await runKnip(KNIP_ARGS, { ...params, scanName: "unused-file scan" });
 }
 
+/** Checks detected unused files against the current allowlist. */
 export function checkUnusedFiles(
   output,
   allowlistFiles = KNIP_UNUSED_FILE_ALLOWLIST,
@@ -142,8 +111,20 @@ export function checkUnusedFiles(
   };
 }
 
-function main() {
-  const result = runKnipUnusedFiles();
+async function main() {
+  const result = await runKnipUnusedFiles();
+  if (result.errorCode || result.status === null) {
+    console.error(
+      `deadcode unused-file scan failed: ${result.errorCode ?? result.signal ?? "unknown"}${
+        result.errorMessage ? `: ${result.errorMessage}` : ""
+      }`,
+    );
+    if (result.output) {
+      console.error(result.output);
+    }
+    process.exitCode = 1;
+    return;
+  }
   const check = checkUnusedFiles(result.output);
   if (!check.ok) {
     if (check.message) {
@@ -159,5 +140,5 @@ function main() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main();
+  await main();
 }

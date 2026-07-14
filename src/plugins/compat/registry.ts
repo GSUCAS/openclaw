@@ -1,3 +1,4 @@
+// Plugin compatibility registry exposes known plugin compatibility metadata to doctor/update flows.
 import type { PluginCompatRecord } from "./types.js";
 
 const CHANNEL_RUNTIME_SDK_SURFACE = ["openclaw/plugin-sdk/channel", "runtime"].join("-");
@@ -6,7 +7,7 @@ const LEGACY_CONFIG_MIGRATE_TEST_PATH = [
   "migrate.test.ts",
 ].join("-");
 
-export const PLUGIN_COMPAT_RECORDS = [
+const PLUGIN_COMPAT_RECORDS = [
   {
     code: "legacy-before-agent-start",
     status: "deprecated",
@@ -40,6 +41,28 @@ export const PLUGIN_COMPAT_RECORDS = [
       '`api.on("deactivate", ...)` remains wired as a deprecated compatibility alias while plugins migrate to `gateway_stop`.',
   },
   {
+    code: "legacy-subagent-spawning-hook",
+    status: "deprecated",
+    owner: "sdk",
+    introduced: "2026-05-30",
+    deprecated: "2026-05-30",
+    warningStarts: "2026-05-30",
+    removeAfter: "2026-08-30",
+    replacement:
+      "`subagent_spawned` for post-launch observation; core session-binding adapters for thread routing",
+    docsPath: "/plugins/hooks#upcoming-deprecations",
+    surfaces: [
+      'api.on("subagent_spawning", ...)',
+      "PluginHookSubagentSpawningEvent",
+      "PluginHookSubagentSpawningResult",
+      "SubagentLifecycleHookRunner.runSubagentSpawning",
+    ],
+    diagnostics: ["plugin runtime compatibility warning"],
+    tests: ["src/plugins/loader.test.ts", "src/plugins/compat/registry.test.ts"],
+    releaseNote:
+      '`api.on("subagent_spawning", ...)` remains wired only for older plugins; core now owns thread-bound subagent routing.',
+  },
+  {
     code: "hook-only-plugin-shape",
     status: "active",
     owner: "sdk",
@@ -49,6 +72,77 @@ export const PLUGIN_COMPAT_RECORDS = [
     surfaces: ["plugin shape inspection", "plugins inspect", "status diagnostics"],
     diagnostics: ["plugin compatibility notice"],
     tests: ["src/plugins/status.test.ts", "src/plugins/contracts/shape.contract.test.ts"],
+  },
+  {
+    code: "deprecated-memory-embedding-provider-api",
+    status: "deprecated",
+    owner: "sdk",
+    introduced: "2026-05-21",
+    deprecated: "2026-05-21",
+    warningStarts: "2026-05-21",
+    removeAfter: "2026-08-21",
+    replacement: "`api.registerEmbeddingProvider(...)` and `contracts.embeddingProviders`",
+    docsPath: "/plugins/sdk-migration#memory-embedding-provider-api",
+    surfaces: [
+      "api.registerMemoryEmbeddingProvider(...)",
+      "contracts.memoryEmbeddingProviders",
+      "openclaw/plugin-sdk/memory-core-host-engine-embeddings registerMemoryEmbeddingProvider",
+      "plugins inspect compatibility notices",
+    ],
+    diagnostics: ["plugin compatibility notice", "plugin SDK package guardrail"],
+    tests: [
+      "src/plugins/status.test.ts",
+      "src/plugins/compat/registry.test.ts",
+      "src/plugins/contracts/plugin-sdk-package-contract-guardrails.test.ts",
+    ],
+    releaseNote:
+      "Memory-specific embedding provider registration remains wired as a deprecated compatibility path while providers migrate to the generic embedding provider contract.",
+  },
+  {
+    code: "deprecated-session-store-beta5-api",
+    status: "deprecated",
+    owner: "sdk",
+    introduced: "2026-05-21",
+    deprecated: "2026-07-12",
+    warningStarts: "2026-07-12",
+    removeAfter: "2026-10-12",
+    replacement:
+      "`getSessionEntry(...)`, `listSessionEntries(...)`, and row-level session mutations",
+    docsPath: "/plugins/sdk-migration#removed-session-and-transcript-file-apis",
+    surfaces: [
+      "openclaw/plugin-sdk/session-store-runtime loadSessionStore",
+      "openclaw/plugin-sdk/session-store-runtime updateSessionStore",
+      "openclaw/plugin-sdk/session-store-runtime resolveSessionFilePath",
+      "openclaw/plugin-sdk/session-store-runtime resolveSessionStoreEntry",
+    ],
+    diagnostics: ["plugin SDK deprecation"],
+    tests: ["src/plugin-sdk/session-store-runtime.test.ts", "src/plugins/compat/registry.test.ts"],
+    releaseNote:
+      "The beta.5 session-store import set remains available for official plugins released with v2026.7.1-beta.5 while they migrate to row-level session access.",
+  },
+  {
+    code: "removed-session-transcript-file-api",
+    status: "removed",
+    owner: "sdk",
+    introduced: "2026-07-01",
+    replacement:
+      "session identity (`sessionKey`/`sessionId`), `SessionTranscriptUpdate.target`, and Gateway/runtime session helpers",
+    docsPath: "/plugins/sdk-migration#removed-session-and-transcript-file-apis",
+    surfaces: [
+      "saveSessionStore",
+      "resolveSessionTranscriptPathInDir",
+      "resolveAndPersistSessionFile",
+      "readLatestAssistantTextFromSessionTranscript",
+      "SessionTranscriptUpdate.sessionFile",
+      "sessionFiles",
+      "transcriptPath",
+      "sessionFile",
+      "plugins inspect compatibility notices",
+    ],
+    diagnostics: ["plugin compatibility notice"],
+    tests: ["src/plugins/status.test.ts", "src/plugins/compat/registry.test.ts"],
+    releaseNote:
+      "Session/transcript file APIs were removed with the SQLite session storage flip; plugins now use session identity and Gateway/runtime session helpers.",
   },
   {
     code: "legacy-root-sdk-import",
@@ -78,7 +172,7 @@ export const PLUGIN_COMPAT_RECORDS = [
     diagnostics: ["hook runner contract probe"],
     tests: [
       "src/plugins/hooks.security.test.ts",
-      "src/agents/pi-tools.before-tool-call.e2e.test.ts",
+      "src/agents/agent-tools.before-tool-call.e2e.test.ts",
     ],
   },
   {
@@ -117,6 +211,48 @@ export const PLUGIN_COMPAT_RECORDS = [
       "src/plugin-sdk/channel-entry-contract.test.ts",
       "src/plugins/captured-registration.test.ts",
     ],
+  },
+  {
+    code: "whatsapp-web-inbound-flat-message-aliases",
+    status: "deprecated",
+    owner: "channel",
+    introduced: "2026-05-30",
+    deprecated: "2026-05-30",
+    warningStarts: "2026-05-30",
+    removeAfter: "2026-08-30",
+    replacement:
+      "WhatsApp `WebInboundCallbackMessage` nested contexts: `event`, `payload`, `quote`, `group`, and `platform`",
+    docsPath: "/plugins/compatibility",
+    surfaces: [
+      "@openclaw/whatsapp WebInboundMessage flat fields",
+      "WhatsApp monitorWebInbox onMessage callback",
+      "WhatsApp monitorWebChannel listenerFactory injected messages",
+    ],
+    diagnostics: ["TypeScript @deprecated WebInboundMessage flat field annotations"],
+    tests: ["src/plugins/compat/registry.test.ts"],
+    releaseNote:
+      "WhatsApp WebInboundMessage flat fields remain wired as deprecated aliases while callbacks migrate to nested inbound contexts.",
+  },
+  {
+    code: "whatsapp-web-inbound-admission-top-level-fields",
+    status: "deprecated",
+    owner: "channel",
+    introduced: "2026-06-14",
+    deprecated: "2026-06-14",
+    warningStarts: "2026-06-14",
+    removeAfter: "2026-08-30",
+    replacement:
+      "WhatsApp `WebInboundMessage.admission` fields: `conversation.id`, `accountId`, `ingress.decision`, and `conversation.kind`",
+    docsPath: "/plugins/compatibility",
+    surfaces: [
+      "@openclaw/whatsapp WebInboundMessage top-level admission fields",
+      "WhatsApp monitorWebInbox onMessage callback",
+      "WhatsApp monitorWebChannel listenerFactory injected messages",
+    ],
+    diagnostics: ["TypeScript @deprecated WebInboundMessage admission field annotations"],
+    tests: ["src/plugins/compat/registry.test.ts"],
+    releaseNote:
+      "WhatsApp WebInboundMessage top-level admission fields remain available while callbacks migrate to the admission envelope.",
   },
   {
     code: "bundled-channel-sdk-compat-facades",
@@ -431,6 +567,29 @@ export const PLUGIN_COMPAT_RECORDS = [
     tests: ["src/plugins/contracts/plugin-sdk-subpaths.test.ts"],
   },
   {
+    code: "embedded-pi-agent-sdk-aliases",
+    status: "deprecated",
+    owner: "agent-runtime",
+    introduced: "2026-05-21",
+    deprecated: "2026-05-21",
+    warningStarts: "2026-05-21",
+    removeAfter: "2026-08-21",
+    replacement: "`runEmbeddedAgent` and `EmbeddedAgent*` SDK/runtime names",
+    docsPath: "/plugins/sdk-runtime",
+    surfaces: [
+      "api.runtime.agent.runEmbeddedPiAgent",
+      "openclaw/extension-api runEmbeddedPiAgent",
+      "openclaw/plugin-sdk/agent-harness-runtime EmbeddedPi* aliases",
+    ],
+    diagnostics: ["plugin SDK compatibility registry"],
+    tests: [
+      "src/plugins/runtime/index.test.ts",
+      "src/plugins/contracts/plugin-sdk-subpaths.test.ts",
+    ],
+    releaseNote:
+      "Legacy `runEmbeddedPiAgent` and `EmbeddedPi*` plugin aliases remain as deprecated SDK compatibility only.",
+  },
+  {
     code: "agent-harness-id-alias",
     status: "deprecated",
     owner: "agent-runtime",
@@ -442,7 +601,10 @@ export const PLUGIN_COMPAT_RECORDS = [
     docsPath: "/plugins/sdk-agent-harness",
     surfaces: ["manifest/catalog execution policy", "runtime selection"],
     diagnostics: ["agent runtime compatibility warning"],
-    tests: ["src/plugins/provider-runtime.test.ts", "src/web/provider-runtime-shared.test.ts"],
+    tests: [
+      "src/plugins/provider-runtime.test.ts",
+      "packages/web-content-core/src/provider-runtime-shared.test.ts",
+    ],
   },
   {
     code: "generated-bundled-channel-config-fallback",
@@ -495,7 +657,7 @@ export const PLUGIN_COMPAT_RECORDS = [
     deprecated: "2026-04-26",
     warningStarts: "2026-04-26",
     removeAfter: "2026-07-26",
-    replacement: "state-managed `plugins/installs.json` install ledger",
+    replacement: "shared SQLite `installed_plugin_index` install ledger",
     docsPath: "/cli/plugins#registry",
     surfaces: ["plugins.installs authored config", "plugin install/update migration"],
     diagnostics: ["config write migration warning", "doctor registry migration"],
@@ -968,7 +1130,7 @@ export const PLUGIN_COMPAT_RECORDS = [
 ] as const satisfies readonly PluginCompatRecord[];
 
 export type PluginCompatCode = (typeof PLUGIN_COMPAT_RECORDS)[number]["code"];
-export type KnownPluginCompatRecord = PluginCompatRecord<PluginCompatCode>;
+type KnownPluginCompatRecord = PluginCompatRecord<PluginCompatCode>;
 
 const pluginCompatRecordByCode = new Map<PluginCompatCode, KnownPluginCompatRecord>(
   PLUGIN_COMPAT_RECORDS.map((record) => [record.code, record]),
@@ -984,14 +1146,4 @@ export function getPluginCompatRecord(code: PluginCompatCode): KnownPluginCompat
     throw new Error(`Unknown plugin compatibility code: ${code}`);
   }
   return record;
-}
-
-export function isPluginCompatCode(code: string): code is PluginCompatCode {
-  return pluginCompatRecordByCode.has(code as PluginCompatCode);
-}
-
-export function listDeprecatedPluginCompatRecords(): readonly KnownPluginCompatRecord[] {
-  return PLUGIN_COMPAT_RECORDS.filter((record) =>
-    (["deprecated", "removal-pending"] as readonly string[]).includes(record.status),
-  );
 }

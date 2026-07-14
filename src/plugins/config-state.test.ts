@@ -1,3 +1,4 @@
+// Covers plugin config state normalization and reset behavior.
 import { describe, expect, it, vi } from "vitest";
 import {
   createPluginActivationSource,
@@ -166,10 +167,10 @@ describe("normalizePluginsConfig", () => {
 
   it("normalizes legacy plugin ids to their merged bundled plugin id", () => {
     const result = normalizePluginsConfig({
-      allow: ["openai-codex", "google-gemini-cli", "minimax-portal-auth"],
-      deny: ["openai-codex", "google-gemini-cli", "minimax-portal-auth"],
+      allow: ["openai", "google-gemini-cli", "minimax-portal-auth"],
+      deny: ["openai", "google-gemini-cli", "minimax-portal-auth"],
       entries: {
-        "openai-codex": {
+        openai: {
           enabled: true,
         },
         "google-gemini-cli": {
@@ -206,6 +207,20 @@ describe("normalizePluginsConfig", () => {
     expect(result.deny).toEqual(["unknown-plugin-three"]);
     expect(result.entries["unknown-plugin-four"]?.enabled).toBe(true);
     expect(discoverPlugins).not.toHaveBeenCalled();
+  });
+
+  it("normalizes unknown plugin ids to lowercase canonical keys", () => {
+    const result = normalizePluginsConfig({
+      allow: [" Demo-Plugin "],
+      deny: [" OTHER-PLUGIN "],
+      entries: {
+        " CODEX ": { enabled: true },
+      },
+    });
+
+    expect(result.allow).toEqual(["demo-plugin"]);
+    expect(result.deny).toEqual(["other-plugin"]);
+    expect(result.entries.codex?.enabled).toBe(true);
   });
 
   it("does not consult discovery or manifests for alias lookup", async () => {

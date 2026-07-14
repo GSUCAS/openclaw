@@ -1,3 +1,4 @@
+// Daemon service tests cover service install, start, stop, and status flows.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -39,9 +40,21 @@ describe("resolveGatewayService", () => {
     expect(service.loadedText).toBe(loadedText);
   });
 
-  it("throws for unsupported platforms", () => {
+  it("returns a read-only unsupported-platform adapter", async () => {
     setPlatform("aix");
-    expect(() => resolveGatewayService()).toThrow("Gateway service install not supported on aix");
+    const service = resolveGatewayService();
+
+    await expect(service.readCommand(process.env)).resolves.toBeNull();
+    await expect(service.isLoaded({ env: process.env })).rejects.toThrow(
+      "Gateway service install not supported on aix",
+    );
+    await expect(service.readRuntime(process.env)).resolves.toEqual({
+      status: "unknown",
+      detail: "Gateway service install not supported on aix",
+    });
+    await expect(service.restart({ env: process.env, stdout: process.stdout })).rejects.toThrow(
+      "Gateway service install not supported on aix",
+    );
   });
 
   it("guards mutating service adapters when config was written by a newer OpenClaw", async () => {
@@ -112,6 +125,33 @@ describe("readGatewayServiceState", () => {
     expect(state.running).toBe(true);
     expect(state.env.OPENCLAW_GATEWAY_PORT).toBe("18789");
   });
+
+  it("keeps the caller-selected service identity when merging persisted env", async () => {
+    const readRuntime = vi.fn(async () => ({ status: "running" }));
+    const service = createService({
+      isLoaded: vi.fn(async () => true),
+      readCommand: vi.fn(async () => ({
+        programArguments: ["openclaw", "gateway", "run"],
+        environment: {
+          OPENCLAW_GATEWAY_PORT: "18789",
+          OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway.service",
+        },
+      })),
+      readRuntime,
+    });
+
+    const state = await readGatewayServiceState(service, {
+      env: { OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway-maintenance.service" },
+    });
+
+    expect(state.env.OPENCLAW_SYSTEMD_UNIT).toBe("openclaw-gateway-maintenance.service");
+    expect(readRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway-maintenance.service",
+      }),
+      { timeoutMs: undefined },
+    );
+  });
 });
 
 describe("startGatewayService", () => {
@@ -180,6 +220,58 @@ describe("startGatewayService", () => {
       );
     }
     expect(service.restart).not.toHaveBeenCalled();
+  });
+
+  it("requests repair before start when the managed port differs from config", async () => {
+    const service = createService({
+      readCommand: vi.fn(async () => ({
+        programArguments: ["openclaw", "gateway", "--port", "18789"],
+        environment: { OPENCLAW_GATEWAY_PORT: "19001" },
+      })),
+      isLoaded: vi.fn(async () => true),
+      readRuntime: vi.fn(async () => ({ status: "running" })),
+    });
+
+    const result = await startGatewayService(
+      service,
+      {
+        env: {},
+        stdout: process.stdout,
+      },
+      19_001,
+    );
+
+    expect(result.outcome).toBe("repair-required");
+    if (result.outcome === "repair-required") {
+      expect(result.issues).toContainEqual({
+        code: "port-mismatch",
+        message: "service port 18789 does not match current gateway config port 19001",
+      });
+    }
+    expect(service.restart).not.toHaveBeenCalled();
+  });
+
+  it("uses the command-line port before a stale managed environment port", async () => {
+    const service = createService({
+      readCommand: vi.fn(async () => ({
+        programArguments: ["openclaw", "gateway", "--port", "19001"],
+        environment: { OPENCLAW_GATEWAY_PORT: "18789" },
+      })),
+      isLoaded: vi.fn(async () => true),
+      readRuntime: vi.fn(async () => ({ status: "running" })),
+    });
+
+    const result = await startGatewayService(
+      service,
+      {
+        env: {},
+        stdout: process.stdout,
+      },
+      19_001,
+    );
+
+    expect(result.outcome).toBe("started");
+    expect(service.restart).toHaveBeenCalledTimes(1);
   });
 
   it("requests repair before start when the loaded service points at temporary install paths", async () => {

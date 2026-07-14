@@ -1,3 +1,4 @@
+// Status command section tests cover footer, health, and report section rendering.
 import { describe, expect, it } from "vitest";
 import type { HealthSummary } from "./health.js";
 import {
@@ -81,7 +82,7 @@ describe("status.command-sections", () => {
           updatedAt: 2,
           age: 7_000,
           model: "gpt-5.5",
-          runtime: "OpenClaw Pi Default",
+          runtime: "OpenClaw Default",
           totalTokens: null,
           totalTokensFresh: false,
           remainingTokens: null,
@@ -116,7 +117,7 @@ describe("status.command-sections", () => {
         Kind: "cron",
         Age: "7000ms",
         Model: "gpt-5.5",
-        Runtime: "OpenClaw Pi Default",
+        Runtime: "OpenClaw Default",
         Tokens: "12k",
         Cache: "cache ok",
       },
@@ -147,7 +148,7 @@ describe("status.command-sections", () => {
           configuredModel: "zhipu/glm-4.5-air",
           selectedModel: "deepseek/deepseek-v4-flash",
           modelSelectionReason: "session override",
-          runtime: "OpenClaw Pi Default",
+          runtime: "OpenClaw Default",
           totalTokens: null,
           totalTokensFresh: false,
           remainingTokens: null,
@@ -166,7 +167,43 @@ describe("status.command-sections", () => {
       "  Configured default: zhipu/glm-4.5-air",
       "  Session selected: deepseek/deepseek-v4-flash",
       "  Reason: session override",
-      "  Clear with: /model zhipu/glm-4.5-air or /reset",
+      "  Clear with: /model default",
+      "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
+    ]);
+  });
+
+  it("shows fallback-specific wording for auto-fallback model mismatches", () => {
+    const lines = buildStatusModelSelectionLines({
+      recent: [
+        {
+          key: "agent:main:telegram:chat-2",
+          kind: "direct",
+          updatedAt: 1,
+          age: 5_000,
+          model: "qwen3.6-blue",
+          configuredModel: "minimax/MiniMax-M3",
+          selectedModel: "ollama/qwen3.6-blue:35b-a3b",
+          modelSelectionReason: "fallback selected",
+          runtime: "OpenClaw Default",
+          totalTokens: null,
+          totalTokensFresh: false,
+          remainingTokens: null,
+          percentUsed: null,
+          contextTokens: null,
+          flags: [],
+        },
+      ],
+      shortenText: (value) => value,
+      warn: (value) => `warn(${value})`,
+      muted: (value) => `muted(${value})`,
+    });
+
+    expect(lines).toEqual([
+      "warn(Session agent:main:telegram:chat-2 is running ollama/qwen3.6-blue:35b-a3b (auto fallback); config primary is minimax/MiniMax-M3.)",
+      "  Configured default: minimax/MiniMax-M3",
+      "  Session selected: ollama/qwen3.6-blue:35b-a3b",
+      "  Reason: fallback selected",
+      "  Action: check provider availability or retry with /model",
       "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
     ]);
   });

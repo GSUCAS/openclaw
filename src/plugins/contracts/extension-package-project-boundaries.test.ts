@@ -1,3 +1,4 @@
+// Extension package boundary tests cover package/project boundaries for bundled extensions.
 import fs from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -51,7 +52,6 @@ const MEMORY_HOST_SDK_EXPORTS = [
   "./engine-storage",
   "./multimodal",
   "./query",
-  "./runtime",
   "./runtime-cli",
   "./runtime-core",
   "./runtime-files",
@@ -117,10 +117,12 @@ function collectCodeFiles(relativeDir: string): string[] {
 }
 
 function collectCoreReferenceFiles(relativeDir: string): string[] {
-  return collectCodeFiles(relativeDir).filter((file) => {
-    const source = fs.readFileSync(resolve(REPO_ROOT, file), "utf8");
-    return source.includes("../../../../src/") || source.includes("../../../src/");
-  });
+  return collectCodeFiles(relativeDir)
+    .filter((file) => !file.endsWith(".test.ts"))
+    .filter((file) => {
+      const source = fs.readFileSync(resolve(REPO_ROOT, file), "utf8");
+      return source.includes("../../../../src/") || source.includes("../../../src/");
+    });
 }
 
 function collectOpenClawRuntimeDirectImportFiles(relativeDir: string): string[] {
@@ -194,6 +196,15 @@ describe("opt-in extension package boundaries", () => {
     expect(tsconfig.compilerOptions?.outDir).toBe("dist");
     expect(tsconfig.compilerOptions?.rootDir).toBe("../..");
     expect(tsconfig.include).toEqual([
+      "../../packages/ai/src/**/*.ts",
+      "../../packages/markdown-core/src/**/*.ts",
+      "../../packages/media-core/src/**/*.ts",
+      "../../packages/media-generation-core/src/**/*.ts",
+      "../../packages/model-catalog-core/src/**/*.ts",
+      "../../packages/normalization-core/src/**/*.ts",
+      "../../packages/retry/src/**/*.ts",
+      "../../packages/acp-core/src/**/*.ts",
+      "../../packages/terminal-core/src/**/*.ts",
       "../../src/plugin-sdk/**/*.ts",
       "../../src/video-generation/dashscope-compatible.ts",
       "../../src/video-generation/types.ts",
@@ -220,6 +231,9 @@ describe("opt-in extension package boundaries", () => {
     expect(packageJson.exports?.["./core"]?.types).toBe("./dist/src/plugin-sdk/core.d.ts");
     expect(packageJson.exports?.["./error-runtime"]?.types).toBe(
       "./dist/src/plugin-sdk/error-runtime.d.ts",
+    );
+    expect(packageJson.exports?.["./exec-approvals-runtime"]?.types).toBe(
+      "./dist/src/plugin-sdk/exec-approvals-runtime.d.ts",
     );
     expect(packageJson.exports?.["./plugin-entry"]?.types).toBe(
       "./dist/src/plugin-sdk/plugin-entry.d.ts",

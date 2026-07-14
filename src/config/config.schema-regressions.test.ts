@@ -1,3 +1,4 @@
+// Regresses known config schema edge cases and compatibility expectations.
 import { describe, expect, it } from "vitest";
 import { validateConfigObject } from "./validation.js";
 
@@ -12,6 +13,29 @@ describe("config schema regressions", () => {
     });
 
     expect(res.ok).toBe(true);
+  });
+
+  it("accepts worktree cleanup limits and rejects negative values", () => {
+    expect(
+      validateConfigObject({
+        worktrees: { cleanup: { maxCount: 25, maxTotalSizeGb: 50 } },
+      }).ok,
+    ).toBe(true);
+    expect(
+      validateConfigObject({
+        worktrees: { cleanup: { maxCount: 0, maxTotalSizeGb: 0 } },
+      }).ok,
+    ).toBe(true);
+    expect(
+      validateConfigObject({
+        worktrees: { cleanup: { maxCount: -1 } },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validateConfigObject({
+        worktrees: { cleanup: { maxTotalSizeGb: -0.5 } },
+      }).ok,
+    ).toBe(false);
   });
 
   it('accepts memorySearch fallback "voyage"', () => {
@@ -144,6 +168,20 @@ describe("config schema regressions", () => {
     });
 
     expect(res.ok).toBe(false);
+  });
+
+  it("accepts 1M-character tool result caps for long-context agents", () => {
+    const res = validateConfigObject({
+      agents: {
+        defaults: {
+          contextLimits: {
+            toolResultMaxChars: 1_000_000,
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
   });
 
   it("accepts agents.defaults and agents.list contextLimits overrides", () => {
@@ -418,5 +456,126 @@ describe("config schema regressions", () => {
     });
 
     expect(res.ok).toBe(true);
+  });
+
+  it("rejects bindings referencing an agentId missing from agents.list (openclaw#84692)", () => {
+    const res = validateConfigObject({
+      agents: {
+        list: [{ id: "alpha", model: "anthropic/claude-3-5-sonnet" }],
+      },
+      bindings: [
+        {
+          type: "route",
+          agentId: "ghost",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.issues.some((iss) => iss.message.includes('Unknown agent id "ghost"'))).toBe(true);
+    }
+  });
+
+  it("accepts bindings whose agentId is present in agents.list", () => {
+    const res = validateConfigObject({
+      agents: {
+        list: [{ id: "alpha", model: "anthropic/claude-3-5-sonnet" }],
+      },
+      bindings: [
+        {
+          type: "route",
+          agentId: "alpha",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("accepts bindings that match normalized agents.list ids", () => {
+    const res = validateConfigObject({
+      agents: {
+        list: [{ id: "Team Ops", model: "anthropic/claude-3-5-sonnet" }],
+      },
+      bindings: [
+        {
+          type: "route",
+          agentId: "team-ops",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("skips binding agentId check when agents.list is empty (legacy passthrough)", () => {
+    const res = validateConfigObject({
+      bindings: [
+        {
+          type: "route",
+          agentId: "alpha",
+          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
+        },
+      ],
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("accepts a microsoft-foundry model entry carrying thinkingLevelMap (openclaw#91011)", () => {
+    // Foundry's writer (buildFoundryThinkingLevelMap) persists this during Entra ID onboarding; the
+    // strict schema used to reject thinkingLevelMap, so updateConfig rolled the whole write back.
+    const res = validateConfigObject({
+      models: {
+        providers: {
+          "microsoft-foundry": {
+            models: [
+              {
+                id: "gpt-5.1-chat",
+                name: "gpt-5.1-chat",
+                api: "openai-responses",
+                reasoning: true,
+                thinkingLevelMap: {
+                  off: "none",
+                  minimal: null,
+                  low: "low",
+                  medium: "medium",
+                  high: "high",
+                  xhigh: null,
+                  max: null,
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects thinkingLevelMap keys outside the model thinking levels", () => {
+    // "adaptive" is a valid agent thinkingDefault but not a ModelThinkingLevel; the map stays strict.
+    const res = validateConfigObject({
+      models: {
+        providers: {
+          "microsoft-foundry": {
+            models: [
+              {
+                id: "gpt-5.1-chat",
+                name: "gpt-5.1-chat",
+                thinkingLevelMap: { adaptive: "high" },
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(res.ok).toBe(false);
   });
 });

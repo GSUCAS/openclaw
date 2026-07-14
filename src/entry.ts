@@ -1,10 +1,17 @@
 #!/usr/bin/env node
+// Boots the OpenClaw CLI entry point under Node.
+// CLI process entrypoint for OpenClaw command execution.
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { getCommandPathWithRootOptions, hasFlag, isRootHelpInvocation } from "./cli/argv.js";
+import { isRootHelpInvocation } from "./cli/argv.js";
 import { parseCliContainerArgs, resolveCliContainerTarget } from "./cli/container-target.js";
+import {
+  tryOutputPrecomputedCommandHelp,
+  type PrecomputedCommandHelpDeps,
+} from "./cli/precomputed-help.js";
 import { applyCliProfileEnv, parseCliProfileArgs } from "./cli/profile.js";
 import type { RootHelpRenderOptions } from "./cli/program/root-help.js";
+import { createGatewayStartupTrace } from "./cli/startup-trace.js";
 import { normalizeWindowsArgv } from "./cli/windows-argv.js";
 import {
   enableOpenClawCompileCache,
@@ -13,7 +20,7 @@ import {
 } from "./entry.compile-cache.js";
 import { buildCliRespawnPlan, runCliRespawnPlan } from "./entry.respawn.js";
 import { tryHandleRootVersionFastPath } from "./entry.version-fast-path.js";
-import { isTruthyEnvValue, normalizeEnv } from "./infra/env.js";
+import { normalizeEnv } from "./infra/env.js";
 import { isMainModule } from "./infra/is-main.js";
 import { ensureOpenClawExecMarkerOnProcess } from "./infra/openclaw-exec-env.js";
 import { installProcessWarningFilter } from "./infra/warning-filter.js";
@@ -23,8 +30,8 @@ const ENTRY_WRAPPER_PAIRS = [
   { wrapperBasename: "openclaw.js", entryBasename: "entry.js" },
 ] as const;
 
-type PrecomputedCommandHelpName = "browser" | "secrets" | "nodes";
-type OutputPrecomputedHelpText = () => boolean;
+const loadRootHelpLiveConfigModule = async () => await import("./cli/root-help-live-config.js");
+const loadRootHelpMetadataModule = async () => await import("./cli/root-help-metadata.js");
 
 function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   const tokens = argv.slice(2).filter((token) => token.length > 0 && !token.startsWith("-"));
@@ -36,40 +43,7 @@ function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   return false;
 }
 
-function createGatewayEntryStartupTrace(argv: string[]) {
-  const enabled =
-    isTruthyEnvValue(process.env.OPENCLAW_GATEWAY_STARTUP_TRACE) &&
-    argv.slice(2).includes("gateway");
-  const started = performance.now();
-  let last = started;
-  const emit = (name: string, durationMs: number, totalMs: number) => {
-    if (!enabled) {
-      return;
-    }
-    process.stderr.write(
-      `[gateway] startup trace: entry.${name} ${durationMs.toFixed(1)}ms total=${totalMs.toFixed(1)}ms\n`,
-    );
-  };
-  return {
-    mark(name: string) {
-      const now = performance.now();
-      emit(name, now - last, now - started);
-      last = now;
-    },
-    async measure<T>(name: string, run: () => Promise<T>): Promise<T> {
-      const before = performance.now();
-      try {
-        return await run();
-      } finally {
-        const now = performance.now();
-        emit(name, now - before, now - started);
-        last = now;
-      }
-    },
-  };
-}
-
-const gatewayEntryStartupTrace = createGatewayEntryStartupTrace(process.argv);
+const gatewayEntryStartupTrace = createGatewayStartupTrace(process.argv, "entry");
 
 // Guard: only run entry-point logic when this file is the main module.
 // The bundler may import entry.js as a shared dependency when dist/index.js
@@ -95,6 +69,8 @@ if (
     ensureOpenClawExecMarkerOnProcess();
     installProcessWarningFilter();
     normalizeEnv();
+    const { assertSupportedRuntime } = await import("./infra/runtime-guard.js");
+    assertSupportedRuntime();
 
     enableOpenClawCompileCache({
       installRoot,
@@ -182,18 +158,17 @@ export async function tryHandleRootHelpFastPath(
         "[openclaw] Failed to display help:",
         error instanceof Error ? (error.stack ?? error.message) : error,
       );
-      process.exitCode = 1;
+      process.exit(1);
     });
   try {
     const loadRootHelpRenderOptionsForConfigSensitivePlugins =
       deps.loadRootHelpRenderOptionsForConfigSensitivePlugins ??
-      (await import("./cli/root-help-live-config.js"))
-        .loadRootHelpRenderOptionsForConfigSensitivePlugins;
+      (await loadRootHelpLiveConfigModule()).loadRootHelpRenderOptionsForConfigSensitivePlugins;
     const liveRootHelpOptions = await loadRootHelpRenderOptionsForConfigSensitivePlugins(deps.env);
     if (!liveRootHelpOptions) {
       const outputPrecomputedRootHelpText =
         deps.outputPrecomputedRootHelpText ??
-        (await import("./cli/root-help-metadata.js")).outputPrecomputedRootHelpText;
+        (await loadRootHelpMetadataModule()).outputPrecomputedRootHelpText;
       if (outputPrecomputedRootHelpText()) {
         return true;
       }
@@ -208,72 +183,17 @@ export async function tryHandleRootHelpFastPath(
   }
 }
 
-function resolvePrecomputedCommandHelpName(argv: string[]): PrecomputedCommandHelpName | null {
-  if (!hasFlag(argv, "--help") && !hasFlag(argv, "-h")) {
-    return null;
-  }
-  const commandPath = getCommandPathWithRootOptions(argv, 2);
-  if (commandPath.length !== 1) {
-    return null;
-  }
-  const [commandName] = commandPath;
-  if (commandName === "browser" || commandName === "secrets" || commandName === "nodes") {
-    return commandName;
-  }
-  return null;
-}
-
 export async function tryHandlePrecomputedCommandHelpFastPath(
   argv: string[],
-  deps: {
-    outputPrecomputedBrowserHelpText?: OutputPrecomputedHelpText;
-    outputPrecomputedSecretsHelpText?: OutputPrecomputedHelpText;
-    outputPrecomputedNodesHelpText?: OutputPrecomputedHelpText;
-    loadRootHelpRenderOptionsForConfigSensitivePlugins?: (
-      env?: NodeJS.ProcessEnv,
-    ) => Promise<RootHelpRenderOptions | null>;
-    env?: NodeJS.ProcessEnv;
-  } = {},
+  deps: PrecomputedCommandHelpDeps = {},
 ): Promise<boolean> {
   const env = deps.env ?? process.env;
-  if (env.OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH === "1") {
-    return false;
-  }
   if (resolveCliContainerTarget(argv, env)) {
-    return false;
-  }
-  const commandName = resolvePrecomputedCommandHelpName(argv);
-  if (!commandName) {
     return false;
   }
 
   try {
-    if (commandName === "nodes") {
-      const loadRootHelpRenderOptionsForConfigSensitivePlugins =
-        deps.loadRootHelpRenderOptionsForConfigSensitivePlugins ??
-        (await import("./cli/root-help-live-config.js"))
-          .loadRootHelpRenderOptionsForConfigSensitivePlugins;
-      const liveRootHelpOptions = await loadRootHelpRenderOptionsForConfigSensitivePlugins(env);
-      if (liveRootHelpOptions) {
-        return false;
-      }
-    }
-    if (commandName === "browser") {
-      const outputPrecomputedBrowserHelpText =
-        deps.outputPrecomputedBrowserHelpText ??
-        (await import("./cli/root-help-metadata.js")).outputPrecomputedBrowserHelpText;
-      return outputPrecomputedBrowserHelpText();
-    }
-    if (commandName === "secrets") {
-      const outputPrecomputedSecretsHelpText =
-        deps.outputPrecomputedSecretsHelpText ??
-        (await import("./cli/root-help-metadata.js")).outputPrecomputedSecretsHelpText;
-      return outputPrecomputedSecretsHelpText();
-    }
-    const outputPrecomputedNodesHelpText =
-      deps.outputPrecomputedNodesHelpText ??
-      (await import("./cli/root-help-metadata.js")).outputPrecomputedNodesHelpText;
-    return outputPrecomputedNodesHelpText();
+    return await tryOutputPrecomputedCommandHelp(argv, { ...deps, env });
   } catch {
     return false;
   }

@@ -1,3 +1,4 @@
+// Zalo plugin module implements lifecycle test support behavior.
 import { request as httpRequest } from "node:http";
 import { createPluginRuntimeMediaMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { expect, vi } from "vitest";
@@ -101,6 +102,7 @@ export function createImageUpdate(params?: {
   displayName?: string;
   chatId?: string;
   photoUrl?: string;
+  caption?: string;
   date?: number;
 }) {
   return {
@@ -108,7 +110,7 @@ export function createImageUpdate(params?: {
     message: {
       date: params?.date ?? 1774086023728,
       chat: { chat_type: "PRIVATE" as const, id: params?.chatId ?? "chat-123" },
-      caption: "",
+      caption: params?.caption ?? "",
       message_id: params?.messageId ?? "msg-123",
       message_type: "CHAT_PHOTO",
       from: {
@@ -172,10 +174,16 @@ export function createImageLifecycleCore() {
     buffer: Buffer.from("image-bytes"),
     contentType: "image/jpeg",
   }));
-  const saveRemoteMediaMock = vi.fn(async () => ({
-    path: "/tmp/zalo-photo.jpg",
-    contentType: "image/jpeg",
-  }));
+  // Keep the mock arity aligned with PluginRuntime.saveRemoteMedia so
+  // mockImplementation callbacks that inspect timeout options typecheck.
+  const saveRemoteMediaMock = vi.fn<PluginRuntime["channel"]["media"]["saveRemoteMedia"]>(
+    async (_params) => ({
+      id: "zalo-photo.jpg",
+      path: "/tmp/zalo-photo.jpg",
+      size: Buffer.byteLength("image-bytes"),
+      contentType: "image/jpeg",
+    }),
+  );
   const saveMediaBufferMock = vi.fn(async () => ({
     path: "/tmp/zalo-photo.jpg",
     contentType: "image/jpeg",
@@ -238,8 +246,8 @@ export function createImageLifecycleCore() {
           async () => undefined,
         ) as unknown as PluginRuntime["channel"]["reply"]["dispatchReplyWithBufferedBlockDispatcher"],
       },
-      turn: {
-        run: vi.fn(async (params: Parameters<PluginRuntime["channel"]["turn"]["run"]>[0]) => {
+      inbound: {
+        run: vi.fn(async (params: Parameters<PluginRuntime["channel"]["inbound"]["run"]>[0]) => {
           const input = await params.adapter.ingest(params.raw);
           if (!input) {
             return {
@@ -294,9 +302,9 @@ export function createImageLifecycleCore() {
             routeSessionKey: resolved.routeSessionKey,
             dispatchResult,
           };
-        }) as unknown as PluginRuntime["channel"]["turn"]["run"],
-        runAssembled: vi.fn(
-          async (params: Parameters<PluginRuntime["channel"]["turn"]["runAssembled"]>[0]) => {
+        }) as unknown as PluginRuntime["channel"]["inbound"]["run"],
+        dispatchReply: vi.fn(
+          async (params: Parameters<PluginRuntime["channel"]["inbound"]["dispatchReply"]>[0]) => {
             await params.recordInboundSession({
               storePath: params.storePath,
               sessionKey: params.ctxPayload.SessionKey ?? params.routeSessionKey,
@@ -327,9 +335,9 @@ export function createImageLifecycleCore() {
               dispatchResult,
             };
           },
-        ) as unknown as PluginRuntime["channel"]["turn"]["runAssembled"],
+        ) as unknown as PluginRuntime["channel"]["inbound"]["dispatchReply"],
         buildContext:
-          buildChannelInboundEventContextMock as unknown as PluginRuntime["channel"]["turn"]["buildContext"],
+          buildChannelInboundEventContextMock as unknown as PluginRuntime["channel"]["inbound"]["buildContext"],
       },
       commands: {
         shouldComputeCommandAuthorized: vi.fn(
@@ -375,6 +383,8 @@ export function expectImageLifecycleDelivery(params: {
   expect(saveRemoteMediaMock).toHaveBeenCalledWith({
     url: photoUrl,
     maxBytes: 5 * 1024 * 1024,
+    responseHeaderTimeoutMs: 120_000,
+    readIdleTimeoutMs: 30_000,
   });
   expect(params.saveMediaBufferMock).not.toHaveBeenCalled();
   expect(params.finalizeInboundContextMock).toHaveBeenCalledWith(
@@ -398,7 +408,9 @@ export function expectImageLifecycleDelivery(params: {
 export async function settleAsyncWork(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
   }
 }
 

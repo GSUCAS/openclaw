@@ -1,3 +1,7 @@
+/**
+ * Regression coverage for plugin tool context and delivery defaults.
+ * Verifies requester metadata, plugin tool wrapping, and default preservation.
+ */
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { resolveOpenClawPluginToolInputs } from "./openclaw-tools.plugin-context.js";
@@ -14,6 +18,54 @@ describe("openclaw plugin tool context", () => {
     });
 
     expect(result.context.requesterSenderId).toBe("trusted-sender");
+  });
+
+  it("forwards the trusted owner bit", () => {
+    const result = resolveOpenClawPluginToolInputs({
+      options: {
+        config: {} as never,
+        senderIsOwner: true,
+      },
+    });
+
+    expect(result.context.senderIsOwner).toBe(true);
+  });
+
+  it("forwards the trusted native conversation id", () => {
+    const result = resolveOpenClawPluginToolInputs({
+      options: {
+        config: {} as never,
+        nativeChannelId: "oc_native_chat",
+      },
+    });
+
+    expect(result.context.nativeChannelId).toBe("oc_native_chat");
+  });
+
+  it("defaults missing and unknown conversation-read origins to delegated", () => {
+    const missing = resolveOpenClawPluginToolInputs({
+      options: { config: {} as never },
+    });
+    const unknown = resolveOpenClawPluginToolInputs({
+      options: {
+        config: {} as never,
+        conversationReadOrigin: "forged" as never,
+      },
+    });
+
+    expect(missing.context.conversationReadOrigin).toBe("delegated");
+    expect(unknown.context.conversationReadOrigin).toBe("delegated");
+  });
+
+  it("preserves a server-owned direct-operator origin", () => {
+    const result = resolveOpenClawPluginToolInputs({
+      options: {
+        config: {} as never,
+        conversationReadOrigin: "direct-operator",
+      },
+    });
+
+    expect(result.context.conversationReadOrigin).toBe("direct-operator");
   });
 
   it("forwards fs policy for plugin tool sandbox enforcement", () => {

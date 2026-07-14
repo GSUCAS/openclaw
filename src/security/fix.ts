@@ -1,6 +1,8 @@
+// Applies safe automatic fixes for supported security audit findings.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { resolveAuthProfileDatabaseFilePaths } from "../agents/auth-profiles/sqlite.js";
 import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import { createConfigIO, replaceConfigFile } from "../config/config.js";
 import { collectIncludePathsRecursive } from "../config/includes-scan.js";
@@ -10,7 +12,7 @@ import { runExec } from "../process/exec.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createIcaclsResetCommand, formatIcaclsResetCommand, type ExecFn } from "./windows-acl.js";
 
-export type SecurityFixChmodAction = {
+type SecurityFixChmodAction = {
   kind: "chmod";
   path: string;
   mode: number;
@@ -19,7 +21,7 @@ export type SecurityFixChmodAction = {
   error?: string;
 };
 
-export type SecurityFixIcaclsAction = {
+type SecurityFixIcaclsAction = {
   kind: "icacls";
   path: string;
   command: string;
@@ -28,9 +30,9 @@ export type SecurityFixIcaclsAction = {
   error?: string;
 };
 
-export type SecurityFixAction = SecurityFixChmodAction | SecurityFixIcaclsAction;
+type SecurityFixAction = SecurityFixChmodAction | SecurityFixIcaclsAction;
 
-export type SecurityFixResult = {
+type SecurityFixResult = {
   ok: boolean;
   stateDir: string;
   configPath: string;
@@ -40,7 +42,7 @@ export type SecurityFixResult = {
   errors: string[];
 };
 
-export type SecurityPermissionTarget = {
+type SecurityPermissionTarget = {
   path: string;
   mode: number;
   require: "dir" | "file";
@@ -362,6 +364,9 @@ export async function collectSecurityPermissionTargets(params: {
     targets.push({ path: agentRoot, mode: 0o700, require: "dir" });
     targets.push({ path: agentDir, mode: 0o700, require: "dir" });
 
+    for (const databasePath of resolveAuthProfileDatabaseFilePaths(agentDir)) {
+      targets.push({ path: databasePath, mode: 0o600, require: "file" });
+    }
     const authPath = path.join(agentDir, "auth-profiles.json");
     targets.push({ path: authPath, mode: 0o600, require: "file" });
 
@@ -444,6 +449,7 @@ export async function fixSecurityFootguns(opts?: {
     includePaths = await collectIncludePathsRecursive({
       configPath: snap.path,
       parsed: snap.parsed,
+      env,
     }).catch(() => []);
   }
 
@@ -453,7 +459,7 @@ export async function fixSecurityFootguns(opts?: {
     configPath,
     cfg: snap.config ?? {},
     includePaths,
-  }).catch((err) => {
+  }).catch((err: unknown) => {
     errors.push(`collectSecurityPermissionTargets failed: ${String(err)}`);
     return [] as SecurityPermissionTarget[];
   });

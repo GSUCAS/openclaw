@@ -1,9 +1,10 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Slack tests cover auth plugin behavior.
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SlackMonitorContext } from "./context.js";
 
 const readChannelIngressStoreAllowFromForDmPolicyMock = vi.hoisted(() => vi.fn());
+let authorizeSlackBotRoomMessage: typeof import("./auth.js").authorizeSlackBotRoomMessage;
 let authorizeSlackSystemEventSender: typeof import("./auth.js").authorizeSlackSystemEventSender;
-let clearSlackAllowFromCacheForTest: typeof import("./auth.js").clearSlackAllowFromCacheForTest;
 let resolveSlackEffectiveAllowFrom: typeof import("./auth.js").resolveSlackEffectiveAllowFrom;
 let resolveSlackCommandIngress: typeof import("./auth.js").resolveSlackCommandIngress;
 
@@ -29,6 +30,7 @@ function makeSlackCtx(allowFrom: string[]): SlackMonitorContext {
 function makeAuthorizeCtx(params?: {
   allowFrom?: string[];
   channelsConfig?: Record<string, { users?: string[] }>;
+  dmPolicy?: SlackMonitorContext["dmPolicy"];
   resolveUserName?: (userId: string) => Promise<{ name?: string }>;
   resolveChannelName?: (
     channelId: string,
@@ -37,7 +39,7 @@ function makeAuthorizeCtx(params?: {
   return {
     allowFrom: params?.allowFrom ?? [],
     accountId: "main",
-    dmPolicy: "open",
+    dmPolicy: params?.dmPolicy ?? "open",
     dmEnabled: true,
     allowNameMatching: false,
     channelsConfig: params?.channelsConfig ?? {},
@@ -55,16 +57,12 @@ function makeAuthorizeCtx(params?: {
 
 describe("resolveSlackEffectiveAllowFrom", () => {
   beforeAll(async () => {
-    ({
-      authorizeSlackSystemEventSender,
-      clearSlackAllowFromCacheForTest,
-      resolveSlackEffectiveAllowFrom,
-    } = await import("./auth.js"));
+    ({ authorizeSlackSystemEventSender, resolveSlackEffectiveAllowFrom } =
+      await import("./auth.js"));
   });
 
   beforeEach(() => {
     readChannelIngressStoreAllowFromForDmPolicyMock.mockReset();
-    clearSlackAllowFromCacheForTest();
   });
 
   it("falls back to channel config allowFrom when pairing store throws", async () => {
@@ -109,12 +107,161 @@ describe("resolveSlackEffectiveAllowFrom", () => {
 
 describe("authorizeSlackSystemEventSender", () => {
   beforeAll(async () => {
-    ({ authorizeSlackSystemEventSender, clearSlackAllowFromCacheForTest } =
-      await import("./auth.js"));
+    ({ authorizeSlackBotRoomMessage, authorizeSlackSystemEventSender } = await import("./auth.js"));
   });
 
   beforeEach(() => {
-    clearSlackAllowFromCacheForTest();
+    readChannelIngressStoreAllowFromForDmPolicyMock.mockReset();
+    delete process.env.OPENCLAW_SLACK_CHANNEL_MEMBERS_CACHE_TTL_MS;
+  });
+
+  afterEach(() => {
+    delete process.env.OPENCLAW_SLACK_CHANNEL_MEMBERS_CACHE_TTL_MS;
+  });
+
+  it("ignores non-decimal channel member cache ttl env values", async () => {
+    process.env.OPENCLAW_SLACK_CHANNEL_MEMBERS_CACHE_TTL_MS = "0x0";
+    const conversationsMembers = vi.fn(async () => ({
+      members: ["UOWNER"],
+      response_metadata: {},
+    }));
+    const ctx = {
+      allowFrom: [],
+      accountId: "main",
+      allowNameMatching: false,
+      app: { client: { conversations: { members: conversationsMembers } } },
+      botToken: "xoxb-test",
+    } as unknown as SlackMonitorContext;
+
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+
+    expect(conversationsMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops cached channel members when the current clock is not a valid date timestamp", async () => {
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(1_700_000_000_000)
+      .mockReturnValueOnce(1_700_000_000_000)
+      .mockReturnValueOnce(Number.NaN)
+      .mockReturnValue(1_700_000_000_000);
+    const conversationsMembers = vi.fn(async () => ({
+      members: ["UOWNER"],
+      response_metadata: {},
+    }));
+    const ctx = {
+      allowFrom: [],
+      accountId: "main",
+      allowNameMatching: false,
+      app: { client: { conversations: { members: conversationsMembers } } },
+      botToken: "xoxb-test",
+    } as unknown as SlackMonitorContext;
+
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+
+    expect(conversationsMembers).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache channel members when the expiry timestamp would exceed the valid date range", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(8_640_000_000_000_000);
+    const conversationsMembers = vi.fn(async () => ({
+      members: ["UOWNER"],
+      response_metadata: {},
+    }));
+    const ctx = {
+      allowFrom: [],
+      accountId: "main",
+      allowNameMatching: false,
+      app: { client: { conversations: { members: conversationsMembers } } },
+      botToken: "xoxb-test",
+    } as unknown as SlackMonitorContext;
+
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      authorizeSlackBotRoomMessage({
+        ctx,
+        channelId: "C1",
+        senderId: "U_BOT",
+        allowFromLower: ["uowner"],
+      }),
+    ).resolves.toBe(true);
+
+    expect(conversationsMembers).toHaveBeenCalledTimes(2);
+  });
+
+  it("still coalesces in-flight channel member lookups when durable cache expiry is invalid", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(8_640_000_000_000_000);
+    let resolveMembers: (value: {
+      members: string[];
+      response_metadata: Record<string, never>;
+    }) => void;
+    const membersPromise = new Promise<{
+      members: string[];
+      response_metadata: Record<string, never>;
+    }>((resolve) => {
+      resolveMembers = resolve;
+    });
+    const conversationsMembers = vi.fn(() => membersPromise);
+    const ctx = {
+      allowFrom: [],
+      accountId: "main",
+      allowNameMatching: false,
+      app: { client: { conversations: { members: conversationsMembers } } },
+      botToken: "xoxb-test",
+    } as unknown as SlackMonitorContext;
+
+    const first = authorizeSlackBotRoomMessage({
+      ctx,
+      channelId: "C1",
+      senderId: "U_BOT",
+      allowFromLower: ["uowner"],
+    });
+    const second = authorizeSlackBotRoomMessage({
+      ctx,
+      channelId: "C1",
+      senderId: "U_BOT",
+      allowFromLower: ["uowner"],
+    });
+    resolveMembers!({ members: ["UOWNER"], response_metadata: {} });
+
+    await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+    expect(conversationsMembers).toHaveBeenCalledTimes(1);
   });
 
   it("keeps non-interactive channel senders open when only global allowFrom is configured", async () => {
@@ -128,6 +275,44 @@ describe("authorizeSlackSystemEventSender", () => {
       allowed: true,
       channelType: "channel",
       channelName: "general",
+    });
+  });
+
+  it("does not use pairing-store allowFrom for MPIM system events", async () => {
+    readChannelIngressStoreAllowFromForDmPolicyMock.mockResolvedValue(["U_ATTACKER"]);
+    const result = await authorizeSlackSystemEventSender({
+      ctx: makeAuthorizeCtx({
+        allowFrom: [],
+        dmPolicy: "pairing",
+        resolveChannelName: async () => ({ name: "group-dm", type: "mpim" }),
+      }),
+      senderId: "U_ATTACKER",
+      channelId: "G_MPIM",
+    });
+
+    expect(result).toEqual({
+      allowed: false,
+      reason: "sender-not-allowlisted",
+      channelType: "mpim",
+      channelName: "group-dm",
+    });
+    expect(readChannelIngressStoreAllowFromForDmPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it("allows MPIM system-event senders in the configured allowFrom", async () => {
+    const result = await authorizeSlackSystemEventSender({
+      ctx: makeAuthorizeCtx({
+        allowFrom: ["U_OWNER"],
+        resolveChannelName: async () => ({ name: "group-dm", type: "mpim" }),
+      }),
+      senderId: "U_OWNER",
+      channelId: "G_MPIM",
+    });
+
+    expect(result).toEqual({
+      allowed: true,
+      channelType: "mpim",
+      channelName: "group-dm",
     });
   });
 
@@ -299,11 +484,7 @@ describe("authorizeSlackSystemEventSender", () => {
 
 describe("resolveSlackCommandIngress", () => {
   beforeAll(async () => {
-    ({ resolveSlackCommandIngress, clearSlackAllowFromCacheForTest } = await import("./auth.js"));
-  });
-
-  beforeEach(() => {
-    clearSlackAllowFromCacheForTest();
+    ({ resolveSlackCommandIngress } = await import("./auth.js"));
   });
 
   it("does not authorize commands when sender denial stops before the command gate", async () => {
@@ -324,16 +505,41 @@ describe("resolveSlackCommandIngress", () => {
     expect(result.commandAccess.authorized).toBe(false);
     expect(result.commandAccess.shouldBlockControlCommand).toBe(false);
   });
+
+  it("blocks MPIM senders outside the configured allowFrom", async () => {
+    const result = await resolveSlackCommandIngress({
+      ctx: makeAuthorizeCtx(),
+      senderId: "U_ATTACKER",
+      channelType: "mpim",
+      channelId: "G_MPIM",
+      ownerAllowFromLower: ["u_owner"],
+      allowTextCommands: false,
+      hasControlCommand: false,
+    });
+
+    expect(result.senderAccess.decision).toBe("block");
+    expect(result.senderAccess.gate?.allowed).toBe(false);
+  });
+
+  it("allows MPIM senders in the configured allowFrom", async () => {
+    const result = await resolveSlackCommandIngress({
+      ctx: makeAuthorizeCtx(),
+      senderId: "U_OWNER",
+      channelType: "mpim",
+      channelId: "G_MPIM",
+      ownerAllowFromLower: ["u_owner"],
+      allowTextCommands: false,
+      hasControlCommand: false,
+    });
+
+    expect(result.senderAccess.decision).toBe("allow");
+    expect(result.senderAccess.gate?.allowed).toBe(true);
+  });
 });
 
 describe("authorizeSlackSystemEventSender interactiveEvent", () => {
   beforeAll(async () => {
-    ({ authorizeSlackSystemEventSender, clearSlackAllowFromCacheForTest } =
-      await import("./auth.js"));
-  });
-
-  beforeEach(() => {
-    clearSlackAllowFromCacheForTest();
+    ({ authorizeSlackSystemEventSender } = await import("./auth.js"));
   });
 
   it("rejects interactive events when expectedSenderId is not provided", async () => {

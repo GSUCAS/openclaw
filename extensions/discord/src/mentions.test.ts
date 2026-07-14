@@ -1,9 +1,14 @@
+// Discord tests cover mentions plugin behavior.
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   resetDiscordDirectoryCacheForTest,
   rememberDiscordDirectoryUser,
 } from "./directory-cache.js";
-import { formatMention, rewriteDiscordKnownMentions } from "./mentions.js";
+import {
+  discordTextHasBroadcastMention,
+  formatMention,
+  rewriteDiscordKnownMentions,
+} from "./mentions.js";
 
 describe("formatMention", () => {
   it("formats user mentions from ids", () => {
@@ -97,6 +102,19 @@ describe("rewriteDiscordKnownMentions", () => {
     expect(rewritten).toBe("inline `@alice` fence ```\n@alice\n``` text <@123456789>");
   });
 
+  it("does not end longer code fences at triple-backtick literals inside the body", () => {
+    rememberDiscordDirectoryUser({
+      accountId: "default",
+      userId: "123456789",
+      handles: ["alice"],
+    });
+    const text = '````ts\nconst fence = "```";\n@alice\n```` text @alice';
+    const rewritten = rewriteDiscordKnownMentions(text, {
+      accountId: "default",
+    });
+    expect(rewritten).toBe('````ts\nconst fence = "```";\n@alice\n```` text <@123456789>');
+  });
+
   it("is account-scoped", () => {
     rememberDiscordDirectoryUser({
       accountId: "ops",
@@ -107,5 +125,17 @@ describe("rewriteDiscordKnownMentions", () => {
     const opsRewrite = rewriteDiscordKnownMentions("@alice", { accountId: "ops" });
     expect(defaultRewrite).toBe("@alice");
     expect(opsRewrite).toBe("<@999888777>");
+  });
+});
+
+describe("discordTextHasBroadcastMention", () => {
+  it("detects @everyone and @here", () => {
+    expect(discordTextHasBroadcastMention("heads up @everyone")).toBe(true);
+    expect(discordTextHasBroadcastMention("@here please")).toBe(true);
+  });
+
+  it("ignores targeted mentions and lookalikes", () => {
+    expect(discordTextHasBroadcastMention("ping <@123>")).toBe(false);
+    expect(discordTextHasBroadcastMention("mail me at a@everyones")).toBe(false);
   });
 });

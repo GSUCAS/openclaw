@@ -1,3 +1,5 @@
+// Media-understanding apply tests cover attachment transcription/description,
+// local binary probing, file text extraction, and context mutation.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -39,6 +41,7 @@ const mockedConvertHeicToJpeg = convertHeicToJpegMock;
 const mockedRunExec = runExecMock;
 
 const TEMP_MEDIA_PREFIX = "openclaw-media-";
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 let suiteTempMediaRootDir = "";
 let tempMediaDirCounter = 0;
 let sharedTempMediaCacheDir = "";
@@ -117,6 +120,14 @@ function getRunExecCall(index = 0) {
   return call;
 }
 
+function getRunExecCallForCommand(command: string) {
+  const call = mockedRunExec.mock.calls.find(([calledCommand]) => calledCommand === command);
+  if (!call) {
+    throw new Error(`expected runExec call for ${command}`);
+  }
+  return call;
+}
+
 function getRunFfmpegArgs(index = 0) {
   const [args] = mockedRunFfmpeg.mock.calls[index] ?? [];
   if (!Array.isArray(args)) {
@@ -160,9 +171,11 @@ function createMediaDisabledConfigWithAllowedMimes(allowedMimes: string[]): Open
 }
 
 async function createTempMediaFile(params: { fileName: string; content: Buffer | string }) {
+  // Many tests reuse identical fixture buffers; cache by content hash to keep
+  // setup cheap while each case still gets a stable local path.
   const normalizedContent =
     typeof params.content === "string" ? Buffer.from(params.content) : params.content;
-  const contentHash = crypto.createHash("sha1").update(normalizedContent).digest("hex");
+  const contentHash = crypto.createHash("sha256").update(normalizedContent).digest("hex");
   const cacheKey = `${params.fileName}:${contentHash}`;
   const cachedPath = tempMediaFileCache.get(cacheKey);
   if (cachedPath) {
@@ -197,7 +210,6 @@ async function withMediaAutoDetectEnv<T>(
       GEMINI_API_KEY: undefined,
       OPENCLAW_ANTIGRAVITY_CLI: undefined,
       OPENCLAW_AGENT_DIR: undefined,
-      PI_CODING_AGENT_DIR: undefined,
       ...env,
     },
     run,
@@ -221,7 +233,7 @@ async function createAudioCtx(params?: {
   } satisfies MsgContext;
 }
 
-async function setupAudioAutoDetectCase(stdout: string): Promise<{
+async function setupAudioAutoDetectCase(stdout?: string): Promise<{
   ctx: MsgContext;
   cfg: OpenClawConfig;
 }> {
@@ -231,11 +243,28 @@ async function setupAudioAutoDetectCase(stdout: string): Promise<{
     content: createSafeAudioFixtureBuffer(2048),
   });
   const cfg: OpenClawConfig = { tools: { media: { audio: {} } } };
-  mockedRunExec.mockResolvedValueOnce({
-    stdout,
-    stderr: "",
-  });
+  if (stdout !== undefined) {
+    mockedRunExec.mockResolvedValueOnce({
+      stdout,
+      stderr: "",
+    });
+  }
   return { ctx, cfg };
+}
+
+function mockWhisperCliTranscript(transcript: string) {
+  mockedRunExec.mockImplementation(async (command, args) => {
+    if (command === "readelf" || command === "otool") {
+      return { stdout: "", stderr: "" };
+    }
+    const outputBaseIndex = args.indexOf("-of");
+    const outputBase = outputBaseIndex >= 0 ? args[outputBaseIndex + 1] : undefined;
+    if (typeof outputBase !== "string") {
+      throw new Error("missing whisper-cli output base");
+    }
+    await fs.writeFile(`${outputBase}.txt`, transcript);
+    return { stdout: "Transcribing with Whisper...\n", stderr: "" };
+  });
 }
 
 async function applyWithDisabledMedia(params: {
@@ -272,13 +301,20 @@ describe("applyMediaUnderstanding", () => {
     vi.doMock("../agents/model-auth.js", () => ({
       resolveApiKeyForProvider: resolveApiKeyForProviderMock,
       hasAvailableAuthForProvider: hasAvailableAuthForProviderMock,
+      isProviderAuthError: (err: unknown, code?: string) =>
+        err instanceof Error &&
+        "code" in err &&
+        (code === undefined || (err as { code?: unknown }).code === code),
       requireApiKey: (auth: { apiKey?: string; mode?: string }, provider: string) => {
         if (auth?.apiKey) {
           return auth.apiKey;
         }
-        throw new Error(
+        const err = new Error(
           `No API key resolved for provider "${provider}" (auth mode: ${auth?.mode}).`,
         );
+        (err as { code?: string; provider?: string }).code = "missing-api-key";
+        (err as { code?: string; provider?: string }).provider = provider;
+        throw err;
       },
     }));
     vi.doMock("../media/fetch.js", () => ({
@@ -359,6 +395,20 @@ describe("applyMediaUnderstanding", () => {
     tempMediaFileCache.clear();
   });
 
+  it("uses SHA-256 content hashes for cached media fixtures", async () => {
+    const mediaPath = await createTempMediaFile({
+      fileName: "fixture.txt",
+      content: "cached fixture",
+    });
+    const cachedPath = await createTempMediaFile({
+      fileName: "fixture.txt",
+      content: "cached fixture",
+    });
+
+    expect(cachedPath).toBe(mediaPath);
+    expect(path.basename(path.dirname(mediaPath))).toMatch(SHA256_HEX_PATTERN);
+  });
+
   it("sets Transcript and replaces Body when audio transcription succeeds", async () => {
     const ctx = await createAudioCtx();
     const result = await applyMediaUnderstanding({
@@ -366,7 +416,6 @@ describe("applyMediaUnderstanding", () => {
       cfg: createGroqAudioConfig(),
       providers: createGroqProviders(),
     });
-
     expect(result.appliedAudio).toBe(true);
     expectTranscriptApplied({
       ctx,
@@ -816,7 +865,8 @@ describe("applyMediaUnderstanding", () => {
     const modelPath = path.join(modelDir, "tiny.bin");
     await fs.writeFile(modelPath, "model");
 
-    const { ctx, cfg } = await setupAudioAutoDetectCase("whisper cpp ok\n");
+    const { ctx, cfg } = await setupAudioAutoDetectCase();
+    mockWhisperCliTranscript("whisper cpp ok\n");
 
     await withMediaAutoDetectEnv(
       {
@@ -830,7 +880,7 @@ describe("applyMediaUnderstanding", () => {
     );
 
     expect(ctx.Transcript).toBe("whisper cpp ok");
-    const [command, args, options] = getRunExecCall();
+    const [command, args, options] = getRunExecCallForCommand("whisper-cli");
     expect(command).toBe("whisper-cli");
     if (!Array.isArray(args)) {
       throw new Error("expected whisper-cli args");
@@ -838,7 +888,17 @@ describe("applyMediaUnderstanding", () => {
     expect(args.slice(0, 4)).toEqual(["-m", modelPath, "-otxt", "-of"]);
     expect(typeof args[4]).toBe("string");
     expect(String(args[4]).endsWith("sample")).toBe(true);
-    expect(args.slice(5)).toEqual(["-np", "-nt", await fs.realpath(ctx.MediaPath ?? "")]);
+    expect(args.slice(5)).toEqual(["-nt", await fs.realpath(ctx.MediaPath ?? "")]);
+    if (process.platform === "linux") {
+      expect(mockedRunExec.mock.calls).toContainEqual([
+        "readelf",
+        ["-d", expect.stringContaining("whisper-cli")],
+        expect.objectContaining({ timeoutMs: 1500 }),
+      ]);
+      expect(mockedRunExec.mock.calls.some(([calledCommand]) => calledCommand === "ldd")).toBe(
+        false,
+      );
+    }
     expectCliRunOptions(options);
   });
 
@@ -865,10 +925,7 @@ describe("applyMediaUnderstanding", () => {
       await fs.writeFile(wavPath, Buffer.from("RIFF"));
       return "";
     });
-    mockedRunExec.mockResolvedValueOnce({
-      stdout: "whisper cpp ogg ok\n",
-      stderr: "",
-    });
+    mockWhisperCliTranscript("whisper cpp ogg ok\n");
 
     await withMediaAutoDetectEnv(
       {
@@ -899,14 +956,14 @@ describe("applyMediaUnderstanding", () => {
     expect(String(ffmpegArgs[11])).toContain("telegram-voice.wav");
     expect(String(ffmpegArgs[11]).endsWith(".part")).toBe(true);
 
-    const [command, args, options] = getRunExecCall();
+    const [command, args, options] = getRunExecCallForCommand("whisper-cli");
     expect(command).toBe("whisper-cli");
     if (!Array.isArray(args)) {
       throw new Error("expected whisper-cli transcode args");
     }
     expect(args.slice(0, 4)).toEqual(["-m", modelPath, "-otxt", "-of"]);
-    expect(args.slice(5, 7)).toEqual(["-np", "-nt"]);
-    expect(String(args[7]).endsWith("telegram-voice.wav")).toBe(true);
+    expect(args[5]).toBe("-nt");
+    expect(String(args[6]).endsWith("telegram-voice.wav")).toBe(true);
     expectCliRunOptions(options);
   });
 
@@ -929,7 +986,6 @@ describe("applyMediaUnderstanding", () => {
       {
         PATH: emptyBinDir,
         OPENCLAW_AGENT_DIR: isolatedAgentDir,
-        PI_CODING_AGENT_DIR: isolatedAgentDir,
       },
       async () => {
         const result = await applyMediaUnderstanding({ ctx, cfg });
@@ -962,7 +1018,6 @@ describe("applyMediaUnderstanding", () => {
       {
         PATH: binDir,
         OPENCLAW_AGENT_DIR: isolatedAgentDir,
-        PI_CODING_AGENT_DIR: isolatedAgentDir,
       },
       async () => {
         const result = await applyMediaUnderstanding({ ctx, cfg });
@@ -1692,6 +1747,28 @@ describe("applyMediaUnderstanding", () => {
 
     expect(result.appliedFile).toBe(true);
     expect(ctx.Body).toContain("hello from utf16 text");
+  });
+
+  it("extracts inbound files above the 5MB OpenResponses default up to the managed-media cap", async () => {
+    // #90096: inbound extraction sizes to the agent media cap (default 20MB),
+    // not the OpenResponses input_file default (5MB). A ~6MB managed document
+    // would previously be skipped at the 5MB cap, leaving locked-down agents
+    // with only an attachment marker; it must now reach the prompt as text.
+    const marker = "LARGE-DOC-MARKER";
+    const largeText = `${marker} `.repeat(360_000); // ~6MB, above the old 5MB cap
+    const filePath = await createTempMediaFile({
+      fileName: "large-report.txt",
+      content: largeText,
+    });
+
+    const { ctx, result } = await applyWithDisabledMedia({
+      body: "<media:document>",
+      mediaPath: filePath,
+      mediaType: "text/plain",
+    });
+
+    expect(result.appliedFile).toBe(true);
+    expect(ctx.Body).toContain(marker);
   });
 
   it("does not reclassify PDF attachments as text/plain", async () => {

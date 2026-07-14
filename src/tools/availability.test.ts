@@ -1,3 +1,4 @@
+// Covers tool availability evaluation and disabled-tool reasons.
 import { describe, expect, it } from "vitest";
 import { evaluateToolAvailability } from "./availability.js";
 import type { ToolDescriptor } from "./types.js";
@@ -9,6 +10,16 @@ const baseDescriptor: ToolDescriptor = {
   owner: { kind: "core" },
   executor: { kind: "core", executorId: "example" },
 };
+
+function descriptorWithAvailability(availability: unknown): ToolDescriptor {
+  return { ...baseDescriptor, availability } as ToolDescriptor;
+}
+
+function sparseArray(): unknown[] {
+  const values: unknown[] = [];
+  values.length = 1;
+  return values;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -233,5 +244,89 @@ describe("evaluateToolAvailability", () => {
         },
       }).map((entry) => entry.reason),
     ).toEqual(["auth-missing", "env-missing", "config-missing", "plugin-disabled"]);
+  });
+
+  it("surfaces an unsupported-signal sibling even when another anyOf branch is available", () => {
+    const descriptor: ToolDescriptor = {
+      ...baseDescriptor,
+      availability: {
+        anyOf: [
+          { kind: "auth", providerId: "openai" },
+          // Empty allOf is a malformed descriptor; its unsupported-signal must not be masked.
+          { allOf: [] },
+        ],
+      },
+    };
+
+    expect(
+      evaluateToolAvailability({
+        descriptor,
+        context: { authProviderIds: new Set(["openai"]) },
+      }).map((entry) => entry.reason),
+    ).toEqual(["unsupported-signal"]);
+  });
+
+  it.each([
+    null,
+    "invalid",
+    [],
+    { kind: "auth" },
+    { kind: "config", path: "plugins.demo" },
+    { kind: "config", path: [1] },
+    { kind: "config", path: [], check: "invalid" },
+    { kind: "context", key: "", equals: {} },
+    { allOf: "invalid" },
+    { anyOf: [null] },
+    { allOf: [], anyOf: [] },
+    { allOf: sparseArray() },
+    { anyOf: sparseArray() },
+    { kind: "config", path: sparseArray() },
+  ])("rejects malformed availability without throwing: %j", (availability) => {
+    expect(
+      evaluateToolAvailability({ descriptor: descriptorWithAvailability(availability) }),
+    ).toStrictEqual([
+      {
+        reason: "unsupported-signal",
+        message: "Unsupported availability expression",
+      },
+    ]);
+  });
+
+  it("rejects cyclic availability expressions without overflowing", () => {
+    const availability: { allOf: unknown[] } = { allOf: [] };
+    availability.allOf.push(availability);
+
+    expect(
+      evaluateToolAvailability({ descriptor: descriptorWithAvailability(availability) }),
+    ).toStrictEqual([
+      {
+        reason: "unsupported-signal",
+        message: "Unsupported availability expression",
+      },
+    ]);
+  });
+
+  it("allows one availability expression to be shared between sibling branches", () => {
+    const signal = { kind: "auth", providerId: "openai" } as const;
+    const descriptor: ToolDescriptor = {
+      ...baseDescriptor,
+      availability: { allOf: [signal, signal] },
+    };
+
+    expect(
+      evaluateToolAvailability({
+        descriptor,
+        context: { authProviderIds: new Set(["openai"]) },
+      }),
+    ).toStrictEqual([]);
+  });
+
+  it.each([
+    [{ allOf: [] }, "Empty availability allOf group"],
+    [{ anyOf: [] }, "Empty availability anyOf group"],
+  ] as const)("preserves precise empty-group diagnostics", (availability, message) => {
+    expect(
+      evaluateToolAvailability({ descriptor: descriptorWithAvailability(availability) }),
+    ).toStrictEqual([{ reason: "unsupported-signal", message }]);
   });
 });

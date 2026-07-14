@@ -1,4 +1,4 @@
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+// Codex plugin module implements event projector behavior.
 import {
   classifyAgentHarnessTerminalOutcome,
   embeddedAgentLog,
@@ -13,6 +13,7 @@ import {
   runAgentHarnessBeforeCompactionHook,
   TOOL_PROGRESS_OUTPUT_MAX_CHARS,
   type AgentMessage,
+  type BeforeToolCallFailureDisposition,
   type EmbeddedRunAttemptParams,
   type EmbeddedRunAttemptResult,
   type HeartbeatToolResponse,
@@ -21,12 +22,17 @@ import {
   type ToolProgressDetailMode,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
-import {
-  asBoolean,
-  asFiniteNumber,
-  normalizeStringEntries,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { generatedImageAssetFromBase64 } from "openclaw/plugin-sdk/image-generation";
+import type { AssistantMessage, Usage } from "openclaw/plugin-sdk/llm";
+import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
+import { asDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
+import { resolveCodexToolAbortTerminalReason } from "./dynamic-tool-execution.js";
 import { resolveCodexLocalRuntimeAttribution } from "./local-runtime-attribution.js";
+import {
+  emitCodexNativePreToolUseFailureDiagnostic,
+  type CodexNativePreToolUseFailure,
+} from "./native-hook-relay.js";
 import {
   readCodexNotificationThreadId,
   readCodexNotificationTurnId,
@@ -41,7 +47,6 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./protocol.js";
-import { readRecentCodexRateLimits, rememberCodexRateLimits } from "./rate-limit-cache.js";
 import { formatCodexUsageLimitErrorMessage } from "./rate-limits.js";
 import { readCodexMirroredSessionHistoryMessages } from "./session-history.js";
 import {
@@ -50,10 +55,12 @@ import {
   sanitizeCodexToolArguments,
 } from "./tool-progress-normalization.js";
 import type { CodexTrajectoryRecorder } from "./trajectory.js";
-import { attachCodexMirrorIdentity, buildCodexUserPromptMessage } from "./transcript-mirror.js";
+import { attachCodexMirrorIdentity } from "./upstream-prompt-provenance.js";
+import { promptSnapshot } from "./user-prompt-message.js";
 
-export type CodexAppServerToolTelemetry = {
+type CodexAppServerToolTelemetry = {
   didSendViaMessagingTool: boolean;
+  didDeliverSourceReplyViaMessageTool?: boolean;
   messagingToolSentTexts: string[];
   messagingToolSentMediaUrls: string[];
   messagingToolSentTargets: MessagingToolSend[];
@@ -64,9 +71,371 @@ export type CodexAppServerToolTelemetry = {
   successfulCronAdds?: number;
 };
 
-export type CodexAppServerEventProjectorOptions = {
+type CodexAppServerEventProjectorOptions = {
   nativePostToolUseRelayEnabled?: boolean;
+  onNativeToolResultRecorded?: () => void | Promise<void>;
+  readRecentRateLimits?: () => JsonValue | undefined;
+  runAbortSignal?: AbortSignal;
   trajectoryRecorder?: CodexTrajectoryRecorder | null;
+  onContextCompacted?: () => void;
+  upstreamUserText?: string;
+};
+
+type CodexNativeToolLifecycleContext = Pick<
+  EmbeddedRunAttemptParams,
+  "agentId" | "runId" | "sessionId" | "sessionKey"
+>;
+
+type CodexNativeToolLifecycleProjectorOptions = {
+  runAbortSignal?: AbortSignal;
+};
+
+type CodexNativeToolAuditStatus = ReturnType<typeof itemStatus> | "cancelled" | "unknown";
+type CodexNativeToolUnfinishedStatus = Extract<CodexNativeToolAuditStatus, "failed" | "unknown">;
+type CodexNativePreToolUseFailureRecord = {
+  failure: CodexNativePreToolUseFailure;
+  terminalReason: CodexNativePreToolUseFailure["disposition"];
+};
+
+/** Projects metadata-only lifecycle diagnostics for native tool items. */
+export class CodexNativeToolLifecycleProjector {
+  private readonly startedAtByItem = new Map<string, number>();
+  private readonly activeItems = new Map<
+    string,
+    { toolName: string; unfinishedStatus: CodexNativeToolUnfinishedStatus }
+  >();
+  private readonly webSearchCompletionByItem = new Map<
+    string,
+    { runWasAborted: boolean; sourceTimestampMs?: number }
+  >();
+  private readonly completedItemIds = new Set<string>();
+  private readonly approvalFailureDispositionByItem = new Map<
+    string,
+    Exclude<BeforeToolCallFailureDisposition, "blocked">
+  >();
+  private readonly preToolUseFailureByItem = new Map<string, CodexNativePreToolUseFailureRecord>();
+  private finalized = false;
+
+  constructor(
+    private readonly context: CodexNativeToolLifecycleContext,
+    private readonly threadId: string,
+    private readonly turnId: string,
+    private readonly options: CodexNativeToolLifecycleProjectorOptions = {},
+  ) {}
+
+  handleNotification(notification: CodexServerNotification): void {
+    const params = isJsonObject(notification.params) ? notification.params : undefined;
+    if (
+      !params ||
+      readCodexNotificationThreadId(params) !== this.threadId ||
+      readCodexNotificationTurnId(params) !== this.turnId
+    ) {
+      return;
+    }
+    if (notification.method === "turn/completed") {
+      const turn = readCodexTurn(params.turn);
+      if (!turn || turn.id !== this.turnId) {
+        return;
+      }
+      for (const item of turn.items ?? []) {
+        this.recordSnapshotItem(item);
+      }
+      return;
+    }
+    if (notification.method === "rawResponseItem/completed") {
+      const item = isJsonObject(params.item) ? params.item : undefined;
+      if (item) {
+        this.recordRawWebSearchResult(item);
+      }
+      return;
+    }
+    if (notification.method !== "item/started" && notification.method !== "item/completed") {
+      return;
+    }
+    const item = readItem(params.item);
+    if (!item) {
+      return;
+    }
+    this.recordItem({
+      phase: notification.method === "item/started" ? "start" : "result",
+      item,
+      sourceTimestampMs: asDateTimestampMs(
+        notification.method === "item/started" ? params.startedAtMs : params.completedAtMs,
+      ),
+    });
+  }
+
+  recordItem(params: {
+    phase: "start" | "result";
+    item: CodexThreadItem;
+    sourceTimestampMs?: number;
+  }): void {
+    const toolName = auditNativeToolName(params.item);
+    if (!toolName || this.completedItemIds.has(params.item.id)) {
+      return;
+    }
+    if (params.phase === "start") {
+      this.recordStarted(
+        params.item.id,
+        toolName,
+        auditNativeToolUnfinishedStatus(params.item),
+        params.sourceTimestampMs,
+      );
+      return;
+    }
+    if (params.item.type === "webSearch") {
+      // Warm resumes retain raw-event delivery, while cold resumes expose no
+      // capability bit. Wait through the drain; finalization closes misses unknown.
+      this.webSearchCompletionByItem.set(params.item.id, {
+        runWasAborted: this.options.runAbortSignal?.aborted === true,
+        sourceTimestampMs: params.sourceTimestampMs,
+      });
+      return;
+    }
+
+    const itemDurationMs =
+      typeof params.item.durationMs === "number" ? params.item.durationMs : undefined;
+    this.recordTerminal(params.item.id, toolName, auditNativeToolTerminalStatus(params.item), {
+      itemDurationMs,
+      sourceTimestampMs: params.sourceTimestampMs,
+    });
+  }
+
+  recordApprovalFailureDisposition(
+    toolCallId: string,
+    disposition: Exclude<BeforeToolCallFailureDisposition, "blocked">,
+  ): void {
+    if (!this.completedItemIds.has(toolCallId)) {
+      this.approvalFailureDispositionByItem.set(toolCallId, disposition);
+    }
+  }
+
+  recordPreToolUseFailure(
+    failure: CodexNativePreToolUseFailure,
+    runWasAborted = this.options.runAbortSignal?.aborted === true,
+  ): void {
+    if (this.completedItemIds.has(failure.toolCallId)) {
+      return;
+    }
+    const record: CodexNativePreToolUseFailureRecord = {
+      failure,
+      terminalReason:
+        runWasAborted && this.options.runAbortSignal
+          ? resolveCodexToolAbortTerminalReason(this.options.runAbortSignal)
+          : failure.disposition,
+    };
+    if (this.finalized) {
+      // Relay subprocesses can settle after result construction. Emit the
+      // item-less fallback here because no later notification drain remains.
+      this.completedItemIds.add(failure.toolCallId);
+      this.emitPreToolUseFailure(record, failure.toolName, failure.durationMs);
+      return;
+    }
+    this.preToolUseFailureByItem.set(failure.toolCallId, record);
+  }
+
+  private recordRawWebSearchResult(item: JsonObject): void {
+    if (readString(item, "type") !== "web_search_call") {
+      return;
+    }
+    const toolCallId = readString(item, "id");
+    if (!toolCallId || this.completedItemIds.has(toolCallId)) {
+      return;
+    }
+    const toolName = "web_search";
+    this.recordStarted(toolCallId, toolName, "unknown");
+    const rawStatus = readString(item, "status");
+    if (rawStatus === "in_progress" || rawStatus === "running") {
+      return;
+    }
+    const status: CodexNativeToolAuditStatus =
+      rawStatus === "completed"
+        ? "completed"
+        : rawStatus === "cancelled"
+          ? "cancelled"
+          : rawStatus === "failed" || rawStatus === "error" || rawStatus === "incomplete"
+            ? "failed"
+            : "unknown";
+    this.recordTerminal(toolCallId, toolName, status, {
+      sourceTimestampMs: this.webSearchCompletionByItem.get(toolCallId)?.sourceTimestampMs,
+    });
+  }
+
+  private recordTerminal(
+    toolCallId: string,
+    toolName: string,
+    status: CodexNativeToolAuditStatus,
+    options: {
+      itemDurationMs?: number;
+      sourceTimestampMs?: number;
+      runWasAborted?: boolean;
+    } = {},
+  ): void {
+    const runWasAborted = options.runWasAborted ?? this.options.runAbortSignal?.aborted === true;
+    const preToolUseFailure = this.preToolUseFailureByItem.get(toolCallId);
+    this.preToolUseFailureByItem.delete(toolCallId);
+    const approvalFailureDisposition = this.approvalFailureDispositionByItem.get(toolCallId);
+    this.approvalFailureDispositionByItem.delete(toolCallId);
+    this.completedItemIds.add(toolCallId);
+    this.activeItems.delete(toolCallId);
+    this.webSearchCompletionByItem.delete(toolCallId);
+    const startedAt = this.startedAtByItem.get(toolCallId);
+    this.startedAtByItem.delete(toolCallId);
+    const endedAt = options.sourceTimestampMs ?? Date.now();
+    const durationMs =
+      options.itemDurationMs ?? (startedAt === undefined ? 0 : Math.max(0, endedAt - startedAt));
+    if (preToolUseFailure) {
+      this.emitPreToolUseFailure(
+        preToolUseFailure,
+        toolName,
+        durationMs,
+        options.sourceTimestampMs,
+      );
+      return;
+    }
+    const terminalEvent = approvalFailureDisposition
+      ? {
+          type: "tool.execution.error" as const,
+          durationMs,
+          errorCategory: "codex_native_tool_approval",
+          terminalReason: approvalFailureDisposition,
+        }
+      : status === "blocked"
+        ? {
+            type: "tool.execution.blocked" as const,
+            reason: "codex_native_tool_blocked",
+            deniedReason: "codex_native_tool_blocked",
+          }
+        : status === "failed" || status === "cancelled" || status === "unknown"
+          ? {
+              type: "tool.execution.error" as const,
+              durationMs,
+              errorCategory:
+                status === "unknown"
+                  ? "codex_native_tool_outcome_unknown"
+                  : status === "cancelled"
+                    ? "aborted"
+                    : "codex_native_tool_error",
+              ...(status === "unknown" ? { errorCode: "tool_outcome_unknown" } : {}),
+              terminalReason:
+                // An enclosing abort explains unfinished work, but cannot classify
+                // a native terminal whose status is absent or unrecognized.
+                status === "unknown"
+                  ? ("failed" as const)
+                  : runWasAborted && this.options.runAbortSignal
+                    ? resolveCodexToolAbortTerminalReason(this.options.runAbortSignal)
+                    : status === "cancelled"
+                      ? ("cancelled" as const)
+                      : ("failed" as const),
+            }
+          : {
+              type: "tool.execution.completed" as const,
+              durationMs,
+            };
+    emitTrustedDiagnosticEvent({
+      ...this.buildBase(toolCallId, toolName),
+      ...terminalEvent,
+      ...(options.sourceTimestampMs !== undefined
+        ? { sourceTimestampMs: options.sourceTimestampMs }
+        : {}),
+    });
+  }
+
+  finalizeActive(runWasAborted = this.options.runAbortSignal?.aborted === true): void {
+    this.finalized = true;
+    for (const [toolCallId, { toolName, unfinishedStatus }] of this.activeItems) {
+      const webSearchCompletion = this.webSearchCompletionByItem.get(toolCallId);
+      const itemRunWasAborted = webSearchCompletion
+        ? webSearchCompletion.runWasAborted
+        : runWasAborted;
+      this.recordTerminal(toolCallId, toolName, unfinishedStatus, {
+        runWasAborted: itemRunWasAborted,
+        sourceTimestampMs: webSearchCompletion?.sourceTimestampMs,
+      });
+    }
+    for (const [toolCallId, record] of this.preToolUseFailureByItem) {
+      if (!this.completedItemIds.has(toolCallId)) {
+        this.recordTerminal(toolCallId, record.failure.toolName, "failed", {
+          itemDurationMs: record.failure.durationMs,
+        });
+      }
+    }
+    this.activeItems.clear();
+    this.webSearchCompletionByItem.clear();
+    this.approvalFailureDispositionByItem.clear();
+    this.preToolUseFailureByItem.clear();
+  }
+
+  private emitPreToolUseFailure(
+    record: CodexNativePreToolUseFailureRecord,
+    toolName: string,
+    durationMs: number,
+    sourceTimestampMs?: number,
+  ): void {
+    emitCodexNativePreToolUseFailureDiagnostic({
+      agentId: this.context.agentId,
+      sessionId: this.context.sessionId,
+      sessionKey: this.context.sessionKey,
+      runId: this.context.runId,
+      failure: { ...record.failure, toolName, durationMs },
+      terminalReason: record.terminalReason,
+      sourceTimestampMs,
+    });
+  }
+
+  private recordSnapshotItem(item: CodexThreadItem): void {
+    if (
+      !auditNativeToolName(item) ||
+      this.completedItemIds.has(item.id) ||
+      itemStatus(item) === "running"
+    ) {
+      return;
+    }
+    const toolName = auditNativeToolName(item);
+    if (!toolName) {
+      return;
+    }
+    this.recordStarted(item.id, toolName, auditNativeToolUnfinishedStatus(item));
+    this.recordItem({ phase: "result", item });
+  }
+
+  private recordStarted(
+    toolCallId: string,
+    toolName: string,
+    unfinishedStatus: CodexNativeToolUnfinishedStatus,
+    sourceTimestampMs?: number,
+  ): void {
+    if (this.activeItems.has(toolCallId)) {
+      return;
+    }
+    this.startedAtByItem.set(toolCallId, sourceTimestampMs ?? Date.now());
+    this.activeItems.set(toolCallId, { toolName, unfinishedStatus });
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.started",
+      ...this.buildBase(toolCallId, toolName),
+      ...(sourceTimestampMs !== undefined ? { sourceTimestampMs } : {}),
+    });
+  }
+
+  private buildBase(toolCallId: string, toolName: string) {
+    return {
+      agentId: this.context.agentId,
+      runId: this.context.runId,
+      sessionId: this.context.sessionId,
+      sessionKey: this.context.sessionKey,
+      toolName,
+      toolCallId,
+    };
+  }
+}
+
+type ReasoningDeltaMethod = "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta";
+
+type ReasoningTextGroup = {
+  itemId: string;
+  method: ReasoningDeltaMethod;
+  index: number;
+  text: string;
 };
 
 const ZERO_USAGE: Usage = {
@@ -84,24 +453,19 @@ const ZERO_USAGE: Usage = {
   },
 };
 
-const CURRENT_TOKEN_USAGE_KEYS = [
-  "last",
-  "current",
-  "lastCall",
-  "lastCallUsage",
-  "lastTokenUsage",
-  "last_token_usage",
-] as const;
-
-const CODEX_PROMPT_TOTAL_INPUT_KEYS = [
-  "inputTokens",
-  "input_tokens",
-  "promptTokens",
-  "prompt_tokens",
-] as const;
-
 const MAX_TOOL_OUTPUT_DELTA_MESSAGES_PER_ITEM = 20;
-const TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS = 12_000;
+const TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS = 10_000;
+const TOOL_PROGRESS_ECHO_PREFIX_MIN_CHARS = 1_024;
+// FIFO holds genuinely distinct emitted shapes (summary/chunk/final/aggregate). Stream
+// accumulation owns a dedicated slot and does not consume FIFO capacity.
+const TOOL_PROGRESS_ECHO_SIGNATURE_CAP = MAX_TOOL_OUTPUT_DELTA_MESSAGES_PER_ITEM + 4;
+const TOOL_OUTPUT_TRUNCATION_NOTICE_PREFIX = "...(OpenClaw truncated Codex native tool output";
+const MISSING_TOOL_RESULT_ERROR =
+  "OpenClaw recorded a native Codex tool.call without a matching tool.result before the turn completed.";
+const GENERATED_IMAGE_MEDIA_SUBDIR = "tool-image-generation";
+const BYTES_PER_MB = 1024 * 1024;
+// Match OpenClaw's default image media cap for generated image tool outputs.
+const DEFAULT_GENERATED_IMAGE_MAX_BYTES = 6 * BYTES_PER_MB;
 const TRANSCRIPT_PROGRESS_SUPPRESSED_TOOL_NAMES = new Set([
   "message",
   "messages",
@@ -130,17 +494,53 @@ type ToolTranscriptResultInput = {
   isError: boolean;
 };
 
+type ToolProgressRawSignature = {
+  length: number;
+  prefix: string;
+};
+
+type ToolProgressEchoState = {
+  displayTexts: string[];
+  // Single slot for handleOutputDelta accumulation; replaced per delta (not appended).
+  streamedDisplayText?: string;
+  // One logical stream shape; replaced per delta (not pushed into rawSignatures FIFO).
+  streamedRawSignature?: ToolProgressRawSignature;
+  rawSignatures: ToolProgressRawSignature[];
+};
+
+type ToolOutputTrimState = {
+  totalLength: number;
+  leadingWhitespaceLength: number;
+  trailingWhitespaceLength: number;
+  sawNonWhitespace: boolean;
+};
+
 export class CodexAppServerEventProjector {
   private readonly assistantTextByItem = new Map<string, string>();
   private readonly assistantItemOrder: string[] = [];
   private readonly assistantPhaseByItem = new Map<string, string>();
+  private latestCompletedItemId: string | undefined;
+  private latestCompletedTerminalAssistantItemId: string | undefined;
+  private latestTerminalAssistantCandidateItemId: string | undefined;
+  private latestTerminalAssistantCandidateSuperseded = false;
+  private latestTerminalAssistantCandidateCanReleaseAfterToolHandoff = false;
+  private terminalAssistantCandidateEarlierActiveItemIds = new Set<string>();
+  private pendingRawTerminalAssistantEchoItemId: string | undefined;
   private readonly lastCommentaryProgressTextByItem = new Map<string, string>();
-  private readonly reasoningTextByItem = new Map<string, string>();
+  // Codex emits each typed item completion before its matching raw response item.
+  // Pair by protocol order because contributors may rewrite only the typed text.
+  private pendingRawCommentaryEchoes = 0;
+  private readonly reasoningTextByGroup = new Map<string, ReasoningTextGroup>();
+  private readonly reasoningItemOrder = new Map<string, number>();
   private readonly planTextByItem = new Map<string, string>();
   private readonly activeItemIds = new Set<string>();
   private readonly completedItemIds = new Set<string>();
   private readonly activeCompactionItemIds = new Set<string>();
-  private readonly toolProgressTexts = new Set<string>();
+  private readonly toolProgressEchoesByItem = new Map<string, ToolProgressEchoState>();
+  // Raw lane re-emissions are the echo channel; typed agentMessage completions are deliberate
+  // finals (codex-rs userShell injects as user-role, never assistant). Filtering typed items
+  // would drop legitimate verbatim answers ("reply with exactly the command output").
+  private readonly rawPromotedAssistantItemIds = new Set<string>();
   private readonly toolResultSummaryItemIds = new Set<string>();
   private readonly toolResultOutputItemIds = new Set<string>();
   private readonly toolResultOutputStreamedItemIds = new Set<string>();
@@ -150,42 +550,145 @@ export class CodexAppServerEventProjector {
     string,
     { chars: number; messages: number; truncated: boolean }
   >();
+  private readonly toolResultOutputPrefixByItem = new Map<string, string>();
   private readonly toolResultOutputTextByItem = new Map<string, string>();
-  private readonly toolMetas = new Map<
-    string,
-    { toolName: string; meta?: string; asyncStarted?: boolean }
-  >();
+  private readonly toolResultOutputTextOriginalLengthByItem = new Map<string, number>();
+  private readonly toolResultOutputTextNormalizedLengthByItem = new Map<string, number>();
+  private readonly toolResultOutputTextTrimStateByItem = new Map<string, ToolOutputTrimState>();
+  // Once an output delta crosses the transcript cap, later deltas must not fill
+  // UTF-16 capacity recovered by backing up over a split surrogate pair.
+  private readonly toolResultOutputTextTruncatedItemIds = new Set<string>();
+  private readonly toolMetas = new Map<string, EmbeddedRunAttemptResult["toolMetas"][number]>();
+  private readonly terminalPresentationClearedItemIds = new Set<string>();
+  private readonly nativeToolOutcomeOrdinals = new Map<string, number>();
   private readonly sideEffectingToolItemIds = new Set<string>();
   private readonly sideEffectingDynamicToolCallIds = new Set<string>();
   private readonly toolTranscriptMessages: AgentMessage[] = [];
   private readonly toolTranscriptCallIds = new Set<string>();
   private readonly toolTranscriptResultIds = new Set<string>();
+  private readonly toolTranscriptNamesById = new Map<string, string>();
+  private readonly toolTrajectoryCallIds = new Set<string>();
+  private readonly toolTrajectoryResultIds = new Set<string>();
+  private readonly toolTrajectoryNamesById = new Map<string, string>();
+  private readonly toolTrajectoryItemsById = new Map<string, CodexThreadItem>();
   private readonly transcriptToolProgressCallIds = new Set<string>();
   private lastNativeToolError: EmbeddedRunAttemptResult["lastToolError"];
-  private readonly nativeGeneratedMediaUrls = new Set<string>();
-  private readonly diagnosticToolStartedAtByItem = new Map<string, number>();
+  private readonly nativeGeneratedMediaItemIds = new Set<string>();
+  private readonly nativeGeneratedMediaUrlsByItemId = new Map<string, string>();
+  private readonly nativeToolLifecycleProjector: CodexNativeToolLifecycleProjector;
   private readonly afterToolCallObservedItemIds = new Set<string>();
   private assistantStarted = false;
   private reasoningStarted = false;
   private reasoningEnded = false;
+  private streamedPartialAssistantItemId: string | undefined;
+  private streamedPartialAssistantItemReplaceable = false;
   private completedTurn: CodexTurn | undefined;
   private promptError: unknown;
   private promptErrorSource: EmbeddedRunAttemptResult["promptErrorSource"] = null;
+  private synthesizedMissingToolResultError: string | null = null;
   private aborted = false;
   private tokenUsage: ReturnType<typeof normalizeUsage>;
   private guardianReviewCount = 0;
   private completedCompactionCount = 0;
-  private latestRateLimits: JsonValue | undefined;
 
   constructor(
     private readonly params: EmbeddedRunAttemptParams,
     private readonly threadId: string,
     private readonly turnId: string,
     private readonly options: CodexAppServerEventProjectorOptions = {},
-  ) {}
+  ) {
+    this.nativeToolLifecycleProjector = new CodexNativeToolLifecycleProjector(
+      params,
+      threadId,
+      turnId,
+      {
+        runAbortSignal: options.runAbortSignal,
+      },
+    );
+  }
 
   getCompletedTurnStatus(): CodexTurn["status"] | undefined {
     return this.completedTurn?.status;
+  }
+
+  hasCompletedTerminalAssistantText(): boolean {
+    const latestCompletedItemId = this.latestCompletedTerminalAssistantItemId;
+    if (!latestCompletedItemId) {
+      return false;
+    }
+    const finalItem = this.resolveFinalAssistantTextItem();
+    return (
+      this.latestCompletedItemId === latestCompletedItemId &&
+      finalItem?.itemId === latestCompletedItemId &&
+      this.completedItemIds.has(latestCompletedItemId)
+    );
+  }
+
+  getLatestTerminalAssistantCandidate(): { itemId: string; hasText: boolean } | undefined {
+    const itemId = this.latestTerminalAssistantCandidateItemId;
+    if (!itemId) {
+      return undefined;
+    }
+    const text = this.assistantTextByItem.get(itemId)?.trim();
+    return {
+      itemId,
+      hasText: Boolean(text && !this.isToolProgressEchoText(itemId, text)),
+    };
+  }
+
+  hasLatestTerminalAssistantCandidateText(): boolean {
+    return (
+      !this.latestTerminalAssistantCandidateSuperseded &&
+      this.getLatestTerminalAssistantCandidate()?.hasText === true
+    );
+  }
+
+  canReleaseLatestTerminalAssistantAfterToolHandoff(): boolean {
+    return (
+      this.latestTerminalAssistantCandidateCanReleaseAfterToolHandoff &&
+      this.hasLatestTerminalAssistantCandidateText()
+    );
+  }
+
+  /** Restores a completed final item after only the enclosing turn timeout fired. */
+  recoverCompletedTerminalAssistantAfterTurnWatchTimeout(): boolean {
+    if (
+      !this.aborted ||
+      this.promptError !== "codex app-server attempt timed out" ||
+      !this.hasCompletedTerminalAssistantText()
+    ) {
+      return false;
+    }
+    this.aborted = false;
+    this.promptError = undefined;
+    this.promptErrorSource = null;
+    return true;
+  }
+
+  /** Resolves the shared model-order position for a native tool item. */
+  recordNativeToolOutcome(item: CodexThreadItem | undefined): void {
+    if (
+      !item ||
+      this.nativeToolOutcomeOrdinals.has(item.id) ||
+      !shouldClearTerminalPresentationForNativeItem(item)
+    ) {
+      return;
+    }
+    const ordinal = this.params.allocateToolOutcomeOrdinal?.(item.id);
+    if (ordinal !== undefined) {
+      this.nativeToolOutcomeOrdinals.set(item.id, ordinal);
+    }
+  }
+
+  recordNativeToolApprovalFailure(
+    toolCallId: string,
+    disposition: Exclude<BeforeToolCallFailureDisposition, "blocked">,
+  ): void {
+    this.nativeToolLifecycleProjector.recordApprovalFailureDisposition(toolCallId, disposition);
+  }
+
+  recordNativeToolPreToolUseFailure(failure: CodexNativePreToolUseFailure): void {
+    this.nativeToolLifecycleProjector.recordPreToolUseFailure(failure);
   }
 
   async handleNotification(notification: CodexServerNotification): Promise<void> {
@@ -193,18 +696,19 @@ export class CodexAppServerEventProjector {
     if (!params) {
       return;
     }
-    if (notification.method === "account/rateLimits/updated") {
-      this.latestRateLimits = params;
-      rememberCodexRateLimits(params);
-      return;
-    }
     if (isHookNotificationMethod(notification.method)) {
       if (!this.isHookNotificationForCurrentThread(params)) {
+        return;
+      }
+    } else if (notification.method === "guardianWarning") {
+      // Codex guardian warnings are thread-scoped and carry no turn id.
+      if (readCodexNotificationThreadId(params) !== this.threadId) {
         return;
       }
     } else if (!this.isNotificationForTurn(params)) {
       return;
     }
+    this.nativeToolLifecycleProjector.handleNotification(notification);
 
     switch (notification.method) {
       case "item/agentMessage/delta":
@@ -212,7 +716,7 @@ export class CodexAppServerEventProjector {
         break;
       case "item/reasoning/summaryTextDelta":
       case "item/reasoning/textDelta":
-        await this.handleReasoningDelta(params);
+        await this.handleReasoningDelta(notification.method, params);
         break;
       case "item/plan/delta":
         this.handlePlanDelta(params);
@@ -229,12 +733,12 @@ export class CodexAppServerEventProjector {
       case "item/commandExecution/outputDelta":
         this.handleOutputDelta(params, "bash");
         break;
-      case "item/fileChange/outputDelta":
-        this.handleOutputDelta(params, "apply_patch");
-        break;
       case "item/autoApprovalReview/started":
       case "item/autoApprovalReview/completed":
         this.handleGuardianReviewNotification(notification.method, params);
+        break;
+      case "guardianWarning":
+        this.handleGuardianWarning(params);
         break;
       case "hook/started":
       case "hook/completed":
@@ -247,10 +751,10 @@ export class CodexAppServerEventProjector {
         await this.handleTurnCompleted(params);
         break;
       case "rawResponseItem/completed":
-        this.handleRawResponseItemCompleted(params);
+        await this.handleRawResponseItemCompleted(params);
         break;
       case "error":
-        if (readBooleanAlias(params, ["willRetry", "will_retry"]) === true) {
+        if (params.willRetry === true) {
           break;
         }
         this.promptError = this.formatCodexErrorMessage(params) ?? "codex app-server error";
@@ -265,13 +769,31 @@ export class CodexAppServerEventProjector {
     toolTelemetry: CodexAppServerToolTelemetry,
     options?: { yieldDetected?: boolean },
   ): EmbeddedRunAttemptResult {
+    // Result construction runs after the notification queue drains. Close any
+    // tool lacking a terminal item so audit consumers never retain an open action.
+    this.nativeToolLifecycleProjector.finalizeActive();
     const assistantTexts = this.collectAssistantTexts();
-    const reasoningText = collectTextValues(this.reasoningTextByItem).join("\n\n");
+    const reasoningText = collectReasoningTextValues(
+      this.reasoningTextByGroup,
+      this.reasoningItemOrder,
+    ).join("\n\n");
     const planText = collectTextValues(this.planTextByItem).join("\n\n");
+    const hasAssistantItemText = this.hasAssistantItemTextForSynthesis();
+    const legacyFailClosed =
+      !this.completedTurn || this.completedTurn.status !== "completed" || hasAssistantItemText;
+    const hasDeliverableAssistantOnCompletedTurn =
+      this.completedTurn?.status === "completed" &&
+      assistantTexts.some((text) => text.trim().length > 0);
+    this.synthesizeMissingToolResults({
+      synthesize: legacyFailClosed,
+      recordPromptError:
+        legacyFailClosed && !hasDeliverableAssistantOnCompletedTurn && !this.aborted,
+    });
     const lastAssistant =
       assistantTexts.length > 0
         ? this.createAssistantMessage(assistantTexts.join("\n\n"))
         : undefined;
+    const currentAttemptAssistant = this.createCurrentAttemptAssistantMessage();
     // Each snapshot entry is tagged with a stable mirror identity of the
     // shape `${turnId}:${kind}`. The mirror's idempotency key is derived
     // from this identity rather than from snapshot position or content
@@ -283,9 +805,7 @@ export class CodexAppServerEventProjector {
     //   - Two distinct turns where the user repeats verbatim content →
     //     distinct turnIds → distinct identities → both kept.
     const turnId = this.turnId;
-    const messagesSnapshot: AgentMessage[] = this.params.suppressNextUserMessagePersistence
-      ? []
-      : [attachCodexMirrorIdentity(buildCodexUserPromptMessage(this.params), `${turnId}:prompt`)];
+    const messagesSnapshot = promptSnapshot(this.params, turnId, this.options.upstreamUserText);
     // Codex owns the canonical thread. These mirror records keep enough local
     // context for OpenClaw history, search, and future harness switching.
     if (reasoningText) {
@@ -311,6 +831,7 @@ export class CodexAppServerEventProjector {
     const turnFailed = this.completedTurn?.status === "failed";
     const promptError =
       this.promptError ??
+      this.synthesizedMissingToolResultError ??
       (turnFailed ? (this.completedTurn?.error?.message ?? "codex app-server turn failed") : null);
     const agentHarnessResultClassification = classifyAgentHarnessTerminalOutcome({
       assistantTexts,
@@ -323,6 +844,7 @@ export class CodexAppServerEventProjector {
     const hadPotentialSideEffects =
       toolTelemetry.didSendViaMessagingTool ||
       (toolTelemetry.successfulCronAdds ?? 0) > 0 ||
+      this.nativeGeneratedMediaItemIds.size > 0 ||
       this.sideEffectingToolItemIds.size > 0 ||
       this.sideEffectingDynamicToolCallIds.size > 0;
     return {
@@ -342,8 +864,11 @@ export class CodexAppServerEventProjector {
       assistantTexts,
       toolMetas,
       lastAssistant,
+      currentAttemptAssistant,
       ...(this.lastNativeToolError ? { lastToolError: this.lastNativeToolError } : {}),
       didSendViaMessagingTool: toolTelemetry.didSendViaMessagingTool,
+      didDeliverSourceReplyViaMessageTool:
+        toolTelemetry.didDeliverSourceReplyViaMessageTool === true,
       messagingToolSentTexts: toolTelemetry.messagingToolSentTexts,
       messagingToolSentMediaUrls: toolTelemetry.messagingToolSentMediaUrls,
       messagingToolSentTargets: toolTelemetry.messagingToolSentTargets,
@@ -389,22 +914,33 @@ export class CodexAppServerEventProjector {
     sideEffectEvidence?: boolean;
     contentItems: CodexDynamicToolCallOutputContentItem[];
   }): void {
-    const existingMeta = this.toolMetas.get(params.callId);
+    const resultText = collectDynamicToolContentText(params.contentItems);
+    const existing = this.toolMetas.get(params.callId);
     this.toolMetas.set(params.callId, {
-      toolName: params.tool,
-      ...(existingMeta?.meta ? { meta: existingMeta.meta } : {}),
-      ...(existingMeta?.asyncStarted === true || params.asyncStarted === true
-        ? { asyncStarted: true }
-        : {}),
+      toolName: existing?.toolName ?? params.tool,
+      ...(existing?.meta ? { meta: existing.meta } : {}),
+      ...(params.asyncStarted === true ? { asyncStarted: true } : {}),
+      ...(!params.success ? { isError: true } : {}),
     });
     this.recordToolTranscriptResult({
       id: params.callId,
       name: params.tool,
-      text: collectDynamicToolContentText(params.contentItems),
+      text: resultText,
       isError: !params.success,
     });
-    const terminalType = params.terminalType ?? (params.success ? "completed" : "error");
-    if (terminalType !== "blocked" && params.sideEffectEvidence === true) {
+    if (!params.success && params.terminalType === "blocked") {
+      this.lastNativeToolError = {
+        toolName: params.tool,
+        error: resultText || "codex dynamic tool blocked",
+      };
+    } else if (
+      params.success &&
+      this.lastNativeToolError &&
+      !this.lastNativeToolError.mutatingAction
+    ) {
+      this.lastNativeToolError = undefined;
+    }
+    if (params.sideEffectEvidence === true) {
       this.sideEffectingDynamicToolCallIds.add(params.callId);
     }
   }
@@ -424,10 +960,19 @@ export class CodexAppServerEventProjector {
   }
 
   private async handleAssistantDelta(params: JsonObject): Promise<void> {
-    const itemId = readString(params, "itemId") ?? readString(params, "id") ?? "assistant";
+    const itemId = readString(params, "itemId") ?? "assistant";
     const delta = readString(params, "delta") ?? "";
     if (!delta) {
       return;
+    }
+    if (itemId !== this.pendingRawTerminalAssistantEchoItemId) {
+      this.pendingRawTerminalAssistantEchoItemId = undefined;
+    }
+    // Deltas carry no phase; the item/started notification for this item has
+    // already recorded it in assistantPhaseByItem.
+    const isCommentary = this.isCommentaryAssistantItem(itemId);
+    if (!isCommentary && itemId !== this.latestTerminalAssistantCandidateItemId) {
+      this.markTerminalAssistantCandidateSupersededBy();
     }
     if (!this.assistantStarted) {
       this.assistantStarted = true;
@@ -436,27 +981,87 @@ export class CodexAppServerEventProjector {
     this.rememberAssistantItem(itemId);
     const text = `${this.assistantTextByItem.get(itemId) ?? ""}${delta}`;
     this.assistantTextByItem.set(itemId, text);
-    if (this.isCommentaryAssistantItem(itemId)) {
+    if (isCommentary) {
       this.emitCommentaryProgress({ itemId, text });
+    } else {
+      const knownFinalAnswer = this.shouldStreamAssistantPartial(itemId);
+      const replace =
+        this.streamedPartialAssistantItemId !== undefined &&
+        this.streamedPartialAssistantItemId !== itemId;
+      // Codex defines final_answer as terminal text. Replacement mode is for
+      // phase-unknown/provisional items; append-only consumers cannot retract
+      // bytes after a known terminal answer has started.
+      if (replace && (!knownFinalAnswer || this.streamedPartialAssistantItemReplaceable)) {
+        this.streamedPartialAssistantItemReplaceable = true;
+      } else if (this.streamedPartialAssistantItemId === undefined) {
+        this.streamedPartialAssistantItemReplaceable = !knownFinalAnswer;
+      }
+      this.streamedPartialAssistantItemId = itemId;
+      const replaceable = this.streamedPartialAssistantItemReplaceable;
+      const replacement = replace && replaceable;
+      const streamPayload = {
+        text,
+        delta: replacement ? "" : delta,
+        ...(replacement ? { replace: true as const } : {}),
+      };
+      this.emitAgentEvent({
+        stream: "assistant",
+        data: {
+          ...streamPayload,
+          ...(replaceable ? { replaceable: true as const } : {}),
+        },
+      });
+      // Legacy channel preview callbacks are append-oriented and do not all
+      // understand replacement snapshots. Keep them on the known final-answer
+      // path; replaceable snapshots stay on the typed agent-event path.
+      if (knownFinalAnswer && !replaceable) {
+        await this.params.onPartialReply?.(streamPayload);
+      }
     }
-    // Codex app-server can emit multiple agentMessage items per turn, including
-    // intermediate coordination/progress prose. Keep those deltas internal until
-    // turn completion chooses the last assistant item as the user-visible reply.
+    // Stream non-commentary assistant deltas as partial replies and assistant
+    // agent events so live surfaces (TUI, WebChat) render incremental answer
+    // text via gateway emitChatDelta. When Codex switches to a new non-commentary
+    // item, mark replace:true with an empty delta so live merge and append-oriented
+    // partial consumers reset to the new cumulative text instead of concatenating.
   }
 
-  private async handleReasoningDelta(params: JsonObject): Promise<void> {
-    const itemId = readString(params, "itemId") ?? readString(params, "id") ?? "reasoning";
+  private async handleReasoningDelta(
+    method: ReasoningDeltaMethod,
+    params: JsonObject,
+  ): Promise<void> {
+    const itemId = readString(params, "itemId") ?? "reasoning";
     const delta = readString(params, "delta") ?? "";
     if (!delta) {
       return;
     }
     this.reasoningStarted = true;
-    this.reasoningTextByItem.set(itemId, `${this.reasoningTextByItem.get(itemId) ?? ""}${delta}`);
-    await this.params.onReasoningStream?.({ text: delta });
+    if (!this.reasoningItemOrder.has(itemId)) {
+      this.reasoningItemOrder.set(itemId, this.reasoningItemOrder.size);
+    }
+    // Codex indexes reasoning sections independently within an item. Keep those
+    // sections separate so the live snapshot matches the completed item shape.
+    const groupIndex =
+      method === "item/reasoning/textDelta"
+        ? (readNonNegativeInteger(params, "contentIndex") ?? 0)
+        : (readNonNegativeInteger(params, "summaryIndex") ?? 0);
+    const groupKey = `${method}\0${itemId}\0${groupIndex}`;
+    const current = this.reasoningTextByGroup.get(groupKey);
+    this.reasoningTextByGroup.set(groupKey, {
+      itemId,
+      method,
+      index: groupIndex,
+      text: `${current?.text ?? ""}${delta}`,
+    });
+    await this.params.onReasoningStream?.({
+      text: collectReasoningTextValues(this.reasoningTextByGroup, this.reasoningItemOrder).join(
+        "\n\n",
+      ),
+      isReasoningSnapshot: true,
+    });
   }
 
   private handlePlanDelta(params: JsonObject): void {
-    const itemId = readString(params, "itemId") ?? readString(params, "id") ?? "plan";
+    const itemId = readString(params, "itemId") ?? "plan";
     const delta = readString(params, "delta") ?? "";
     if (!delta) {
       return;
@@ -488,11 +1093,27 @@ export class CodexAppServerEventProjector {
 
   private async handleItemStarted(params: JsonObject): Promise<void> {
     const item = readItem(params.item);
-    const itemId = item?.id ?? readString(params, "itemId") ?? readString(params, "id");
+    const itemId = item?.id ?? readString(params, "itemId");
+    if (
+      item?.type === "agentMessage" &&
+      itemId &&
+      itemId !== this.pendingRawTerminalAssistantEchoItemId
+    ) {
+      this.pendingRawTerminalAssistantEchoItemId = undefined;
+    }
     this.rememberAssistantPhase(item);
     if (itemId) {
       this.activeItemIds.add(itemId);
+      if (itemId !== this.latestTerminalAssistantCandidateItemId) {
+        this.markTerminalAssistantCandidateSupersededBy(itemId, {
+          preserveEarlierActiveItem: true,
+        });
+        if (this.latestTerminalAssistantCandidateSuperseded) {
+          this.pendingRawTerminalAssistantEchoItemId = undefined;
+        }
+      }
     }
+    this.recordNativeToolOutcome(item);
     if (item?.type === "contextCompaction" && itemId) {
       this.activeCompactionItemIds.add(itemId);
       await runAgentHarnessBeforeCompactionHook({
@@ -522,7 +1143,7 @@ export class CodexAppServerEventProjector {
     }
     this.recordToolMeta(item);
     this.emitStandardItemEvent({ phase: "start", item });
-    this.emitNormalizedToolItemEvent({ phase: "start", item });
+    await this.emitNormalizedToolItemEvent({ phase: "start", item });
     this.recordNativeToolTranscriptCall(item);
     this.emitToolResultSummary(item);
     this.emitAgentEvent({
@@ -533,17 +1154,40 @@ export class CodexAppServerEventProjector {
 
   private async handleItemCompleted(params: JsonObject): Promise<void> {
     const item = readItem(params.item);
-    const itemId = item?.id ?? readString(params, "itemId") ?? readString(params, "id");
+    this.recordNativeToolOutcome(item);
+    this.clearTerminalPresentationForNativeItem(item);
+    const itemId = item?.id ?? readString(params, "itemId");
+    if (
+      item?.type === "agentMessage" &&
+      itemId &&
+      itemId !== this.pendingRawTerminalAssistantEchoItemId
+    ) {
+      this.pendingRawTerminalAssistantEchoItemId = undefined;
+    }
     if (itemId) {
       this.activeItemIds.delete(itemId);
       this.completedItemIds.add(itemId);
+      this.latestCompletedItemId = itemId;
     }
     this.rememberAssistantPhase(item);
-    if (item?.type === "agentMessage" && typeof item.text === "string" && item.text) {
+    if (item?.type === "agentMessage" && !this.isCommentaryAssistantItem(item.id)) {
+      this.latestCompletedTerminalAssistantItemId = item.id;
+      this.markLatestTerminalAssistantCandidate(item.id);
+      this.pendingRawTerminalAssistantEchoItemId = item.id;
+    } else if (itemId) {
+      this.markTerminalAssistantCandidateSupersededBy(itemId, {
+        preserveEarlierActiveItem: true,
+      });
+      if (this.latestTerminalAssistantCandidateSuperseded) {
+        this.pendingRawTerminalAssistantEchoItemId = undefined;
+      }
+    }
+    if (item?.type === "agentMessage" && typeof item.text === "string") {
       this.rememberAssistantItem(item.id);
       this.assistantTextByItem.set(item.id, item.text);
-      if (this.isCommentaryAssistantItem(item.id)) {
+      if (item.text && this.isCommentaryAssistantItem(item.id)) {
         this.emitCommentaryProgress({ itemId: item.id, text: item.text });
+        this.pendingRawCommentaryEchoes += 1;
       }
     }
     this.recordNativeGeneratedMedia(item);
@@ -554,6 +1198,7 @@ export class CodexAppServerEventProjector {
     if (item?.type === "contextCompaction" && itemId) {
       this.activeCompactionItemIds.delete(itemId);
       this.completedCompactionCount += 1;
+      this.options.onContextCompacted?.();
       await runAgentHarnessAfterCompactionHook({
         sessionFile: this.params.sessionFile,
         messages: await this.readMirroredSessionMessages(),
@@ -582,8 +1227,9 @@ export class CodexAppServerEventProjector {
       });
     }
     this.recordToolMeta(item);
+    this.rememberCommandAggregateOutputEcho(item);
     this.emitStandardItemEvent({ phase: "end", item });
-    this.emitNormalizedToolItemEvent({ phase: "result", item });
+    await this.emitNormalizedToolItemEvent({ phase: "result", item });
     this.recordNativeToolTranscriptCall(item);
     this.recordNativeToolTranscriptResult(item);
     this.emitToolResultSummary(item);
@@ -595,14 +1241,13 @@ export class CodexAppServerEventProjector {
   }
 
   private handleTokenUsage(params: JsonObject): void {
+    // v2 ThreadTokenUsageUpdatedNotification: tokenUsage = {total, last, modelContextWindow}.
     const tokenUsage = isJsonObject(params.tokenUsage) ? params.tokenUsage : undefined;
-    const current =
-      (tokenUsage ? readFirstJsonObject(tokenUsage, CURRENT_TOKEN_USAGE_KEYS) : undefined) ??
-      readFirstJsonObject(params, CURRENT_TOKEN_USAGE_KEYS);
-    if (!current) {
+    const last = tokenUsage && isJsonObject(tokenUsage.last) ? tokenUsage.last : undefined;
+    if (!last) {
       return;
     }
-    const usage = normalizeCodexTokenUsage(current);
+    const usage = normalizeCodexTokenUsage(last);
     if (usage) {
       this.tokenUsage = usage;
     }
@@ -625,6 +1270,16 @@ export class CodexAppServerEventProjector {
         userAuthorization: review ? readString(review, "userAuthorization") : undefined,
         rationale: review ? readNullableString(review, "rationale") : undefined,
         actionType: action ? readString(action, "type") : undefined,
+      },
+    });
+  }
+
+  private handleGuardianWarning(params: JsonObject): void {
+    this.emitAgentEvent({
+      stream: "codex_app_server.guardian",
+      data: {
+        phase: "warning",
+        message: readString(params, "message"),
       },
     });
   }
@@ -659,7 +1314,7 @@ export class CodexAppServerEventProjector {
   }
 
   private async handleTurnCompleted(params: JsonObject): Promise<void> {
-    const turn = readTurn(params.turn);
+    const turn = readCodexTurn(params.turn);
     if (!turn || turn.id !== this.turnId) {
       return;
     }
@@ -669,15 +1324,31 @@ export class CodexAppServerEventProjector {
         formatCodexUsageLimitErrorMessage({
           message: turn.error?.message,
           codexErrorInfo: turn.error?.codexErrorInfo as JsonValue | null | undefined,
-          rateLimits: this.latestRateLimits ?? readRecentCodexRateLimits(),
+          rateLimits: this.options.readRecentRateLimits?.(),
         }) ??
         turn.error?.message ??
         "codex app-server turn failed";
       this.promptErrorSource = "prompt";
     }
-    for (const item of turn.items ?? []) {
+    const turnItems = turn.items ?? [];
+    // The final snapshot is authoritative when item notifications were omitted.
+    // Only its last relevant tool may change the terminal presentation.
+    for (let index = turnItems.length - 1; index >= 0; index -= 1) {
+      const item = turnItems[index];
+      if (!item || !this.isCurrentTurnSnapshotItem(item)) {
+        continue;
+      }
+      if (item?.type === "dynamicToolCall") {
+        break;
+      }
+      if (shouldClearTerminalPresentationForNativeItem(item)) {
+        this.clearTerminalPresentationForNativeItem(item);
+        break;
+      }
+    }
+    for (const item of turnItems) {
       this.rememberAssistantPhase(item);
-      if (item.type === "agentMessage" && typeof item.text === "string" && item.text) {
+      if (item.type === "agentMessage" && typeof item.text === "string") {
         this.rememberAssistantItem(item.id);
         this.assistantTextByItem.set(item.id, item.text);
       }
@@ -687,7 +1358,8 @@ export class CodexAppServerEventProjector {
         this.emitPlanUpdate({ explanation: undefined, steps: splitPlanText(item.text) });
       }
       this.recordToolMeta(item);
-      this.emitSnapshotOnlyNativeToolProgress(item);
+      this.rememberCommandAggregateOutputEcho(item);
+      await this.emitSnapshotOnlyNativeToolProgress(item);
       this.recordNativeToolTranscriptCall(item);
       this.recordNativeToolTranscriptResult(item);
       this.emitAfterToolCallObservation(item);
@@ -698,7 +1370,7 @@ export class CodexAppServerEventProjector {
     await this.maybeEndReasoning();
   }
 
-  private emitSnapshotOnlyNativeToolProgress(item: CodexThreadItem): void {
+  private async emitSnapshotOnlyNativeToolProgress(item: CodexThreadItem): Promise<void> {
     if (
       !shouldSynthesizeToolProgressForItem(item) ||
       !this.isCurrentTurnSnapshotItem(item) ||
@@ -710,16 +1382,16 @@ export class CodexAppServerEventProjector {
     const wasStarted = this.activeItemIds.has(item.id);
     if (!wasStarted) {
       this.emitStandardItemEvent({ phase: "start", item });
-      this.emitNormalizedToolItemEvent({ phase: "start", item });
+      await this.emitNormalizedToolItemEvent({ phase: "start", item });
     }
     this.activeItemIds.delete(item.id);
     this.emitStandardItemEvent({ phase: "end", item });
-    this.emitNormalizedToolItemEvent({ phase: "result", item });
+    await this.emitNormalizedToolItemEvent({ phase: "result", item });
     this.completedItemIds.add(item.id);
   }
 
   private isCurrentTurnSnapshotItem(item: CodexThreadItem): boolean {
-    const itemTurnId = readItemString(item, "turnId") ?? readItemString(item, "turn_id");
+    const itemTurnId = readItemString(item, "turnId");
     return itemTurnId === undefined || itemTurnId === this.turnId;
   }
 
@@ -729,7 +1401,22 @@ export class CodexAppServerEventProjector {
     if (!itemId || !delta) {
       return;
     }
-    appendToolOutputDeltaText(this.toolResultOutputTextByItem, itemId, delta);
+    const storedOutput = appendToolOutputDeltaText(
+      this.toolResultOutputTextByItem,
+      this.toolResultOutputPrefixByItem,
+      this.toolResultOutputTextOriginalLengthByItem,
+      this.toolResultOutputTextNormalizedLengthByItem,
+      this.toolResultOutputTextTrimStateByItem,
+      this.toolResultOutputTextTruncatedItemIds,
+      itemId,
+      delta,
+    );
+    this.rememberToolProgressEcho(itemId, {
+      displayText: storedOutput.text,
+      rawLength: storedOutput.normalizedLength,
+      rawPrefix: storedOutput.rawPrefix,
+      streamedDisplay: true,
+    });
     if (!this.shouldEmitToolOutput()) {
       return;
     }
@@ -758,7 +1445,7 @@ export class CodexAppServerEventProjector {
       });
       return;
     }
-    const chunk = delta.length > remainingChars ? delta.slice(0, remainingChars) : delta;
+    const chunk = delta.length > remainingChars ? truncateUtf16Safe(delta, remainingChars) : delta;
     state.chars += chunk.length;
     state.messages += 1;
     const reachedLimit =
@@ -780,25 +1467,110 @@ export class CodexAppServerEventProjector {
     });
   }
 
-  private handleRawResponseItemCompleted(params: JsonObject): void {
+  private async handleRawResponseItemCompleted(params: JsonObject): Promise<void> {
     const item = isJsonObject(params.item) ? params.item : undefined;
-    if (!item || readString(item, "role") !== "assistant") {
+    if (!item) {
+      return;
+    }
+    const role = readString(item, "role");
+    const phase = readString(item, "phase");
+    const rawItemId = readString(item, "id");
+    const candidateWasSupersededBeforeRaw = this.latestTerminalAssistantCandidateSuperseded;
+    const pendingTerminalAssistantEchoItemId = this.pendingRawTerminalAssistantEchoItemId;
+    const isPendingTerminalAssistantEcho =
+      role === "assistant" &&
+      phase !== "commentary" &&
+      pendingTerminalAssistantEchoItemId !== undefined &&
+      (rawItemId === undefined || rawItemId === pendingTerminalAssistantEchoItemId);
+    if (pendingTerminalAssistantEchoItemId !== undefined && !isPendingTerminalAssistantEcho) {
+      this.pendingRawTerminalAssistantEchoItemId = undefined;
+    }
+    if (!isPendingTerminalAssistantEcho) {
+      this.latestCompletedItemId = undefined;
+      this.markTerminalAssistantCandidateSupersededBy(rawItemId);
+    }
+    await this.recordRawGeneratedImageMedia(item);
+    if (role !== "assistant") {
+      return;
+    }
+    if (phase === "commentary" && this.pendingRawCommentaryEchoes > 0) {
+      this.pendingRawCommentaryEchoes -= 1;
       return;
     }
     const text = extractRawAssistantText(item);
+    if (isPendingTerminalAssistantEcho) {
+      const typedItemId = pendingTerminalAssistantEchoItemId;
+      this.pendingRawTerminalAssistantEchoItemId = undefined;
+      // Contributors may rewrite the typed completion without rewriting its raw echo.
+      if (this.assistantTextByItem.get(typedItemId)?.trim() || !text) {
+        return;
+      }
+      this.rememberAssistantItem(typedItemId);
+      this.assistantTextByItem.set(typedItemId, text);
+      return;
+    }
     if (!text) {
       return;
     }
-    const itemId = readString(item, "id") ?? `raw-assistant-${this.assistantItemOrder.length + 1}`;
-    const phase = readString(item, "phase");
+    const itemId = rawItemId ?? `raw-assistant-${this.assistantItemOrder.length + 1}`;
+    const isIdlessTerminalAssistantAfterCompletedWork =
+      candidateWasSupersededBeforeRaw &&
+      rawItemId === undefined &&
+      pendingTerminalAssistantEchoItemId === undefined &&
+      this.activeItemIds.size === 0;
+    if (
+      phase !== "commentary" &&
+      candidateWasSupersededBeforeRaw &&
+      itemId !== this.streamedPartialAssistantItemId &&
+      !isIdlessTerminalAssistantAfterCompletedWork
+    ) {
+      return;
+    }
     if (phase) {
       this.assistantPhaseByItem.set(itemId, phase);
     }
     this.rememberAssistantItem(itemId);
     this.assistantTextByItem.set(itemId, text);
+    this.rawPromotedAssistantItemIds.add(itemId);
     if (phase === "commentary") {
       this.emitCommentaryProgress({ itemId, text });
+    } else {
+      this.markLatestTerminalAssistantCandidate(itemId, {
+        canReleaseAfterToolHandoff: isIdlessTerminalAssistantAfterCompletedWork,
+      });
     }
+  }
+
+  private markLatestTerminalAssistantCandidate(
+    itemId: string,
+    options?: { canReleaseAfterToolHandoff?: boolean },
+  ): void {
+    this.latestTerminalAssistantCandidateItemId = itemId;
+    this.latestTerminalAssistantCandidateSuperseded = false;
+    this.latestTerminalAssistantCandidateCanReleaseAfterToolHandoff =
+      options?.canReleaseAfterToolHandoff === true;
+    this.terminalAssistantCandidateEarlierActiveItemIds = new Set(this.activeItemIds);
+  }
+
+  private markTerminalAssistantCandidateSupersededBy(
+    itemId?: string,
+    options?: { preserveEarlierActiveItem?: boolean },
+  ): void {
+    if (!this.latestTerminalAssistantCandidateItemId) {
+      return;
+    }
+    // Preserve app-server ordering where an item already active at assistant
+    // completion reports its delayed completion afterward. Only new work proves
+    // the candidate stale; origin/main has an integration test for this order.
+    if (itemId && this.terminalAssistantCandidateEarlierActiveItemIds.has(itemId)) {
+      if (!options?.preserveEarlierActiveItem) {
+        this.terminalAssistantCandidateEarlierActiveItemIds.delete(itemId);
+      }
+      return;
+    }
+    this.latestTerminalAssistantCandidateSuperseded = true;
+    this.latestTerminalAssistantCandidateCanReleaseAfterToolHandoff = false;
+    this.terminalAssistantCandidateEarlierActiveItemIds.clear();
   }
 
   private recordNativeGeneratedMedia(item: CodexThreadItem | undefined): void {
@@ -807,14 +1579,88 @@ export class CodexAppServerEventProjector {
     }
     const savedPath = readItemString(item, "savedPath")?.trim();
     if (savedPath) {
-      this.nativeGeneratedMediaUrls.add(savedPath);
+      this.recordNativeGeneratedMediaUrl({
+        itemId: item.id,
+        mediaUrl: savedPath,
+      });
     }
   }
 
+  private async recordRawGeneratedImageMedia(item: JsonObject): Promise<void> {
+    if (readString(item, "type") !== "image_generation_call") {
+      return;
+    }
+    const result = readString(item, "result");
+    if (!result) {
+      return;
+    }
+    const itemId = readString(item, "id") ?? `raw-image-${this.nativeGeneratedMediaItemIds.size}`;
+    this.nativeGeneratedMediaItemIds.add(itemId);
+    const maxBytes = resolveGeneratedImageMaxBytes(this.params.config);
+    const estimatedDecodedBytes = estimateBase64DecodedBytes(result);
+    if (estimatedDecodedBytes !== undefined && estimatedDecodedBytes > maxBytes) {
+      embeddedAgentLog.warn("codex app-server raw image generation result exceeds media limit", {
+        itemId,
+        estimatedDecodedBytes,
+        maxBytes,
+      });
+      return;
+    }
+    const asset = generatedImageAssetFromBase64({
+      base64: result,
+      index: this.nativeGeneratedMediaItemIds.size,
+      revisedPrompt: readString(item, "revised_prompt") ?? readString(item, "revisedPrompt"),
+      fileNamePrefix: "codex-image-generation",
+      sniffMimeType: true,
+    });
+    if (!asset) {
+      return;
+    }
+    try {
+      const saved = await saveMediaBuffer(
+        asset.buffer,
+        asset.mimeType,
+        GENERATED_IMAGE_MEDIA_SUBDIR,
+        maxBytes,
+        asset.fileName,
+      );
+      this.recordNativeGeneratedMediaUrl({
+        itemId,
+        mediaUrl: saved.path,
+        // The typed savedPath may belong to a remote app-server host. Always
+        // prefer the copy persisted into this gateway's managed media root.
+        replaceExisting: true,
+      });
+    } catch (error) {
+      embeddedAgentLog.warn("codex app-server raw image generation result save failed", {
+        itemId,
+        error,
+      });
+    }
+  }
+
+  private recordNativeGeneratedMediaUrl(params: {
+    itemId: string;
+    mediaUrl: string;
+    replaceExisting?: boolean;
+  }): void {
+    if (
+      this.nativeGeneratedMediaUrlsByItemId.has(params.itemId) &&
+      params.replaceExisting !== true
+    ) {
+      this.nativeGeneratedMediaItemIds.add(params.itemId);
+      return;
+    }
+    this.nativeGeneratedMediaUrlsByItemId.set(params.itemId, params.mediaUrl);
+    this.nativeGeneratedMediaItemIds.add(params.itemId);
+  }
+
   private buildToolMediaUrls(toolTelemetry: CodexAppServerToolTelemetry): string[] | undefined {
-    const mediaUrls = new Set(normalizeStringEntries(toolTelemetry.toolMediaUrls ?? []));
+    const mediaUrls = new Set(
+      toolTelemetry.toolMediaUrls?.map((url) => url.trim()).filter(Boolean) ?? [],
+    );
     if ((toolTelemetry.messagingToolSentMediaUrls?.length ?? 0) === 0) {
-      for (const mediaUrl of this.nativeGeneratedMediaUrls) {
+      for (const mediaUrl of this.nativeGeneratedMediaUrlsByItemId.values()) {
         mediaUrls.add(mediaUrl);
       }
     }
@@ -857,6 +1703,10 @@ export class CodexAppServerEventProjector {
 
   private isCommentaryAssistantItem(itemId: string): boolean {
     return this.assistantPhaseByItem.get(itemId) === "commentary";
+  }
+
+  private shouldStreamAssistantPartial(itemId: string): boolean {
+    return this.assistantPhaseByItem.get(itemId) === "final_answer";
   }
 
   private emitCommentaryProgress(params: { itemId: string; text: string }): void {
@@ -910,10 +1760,10 @@ export class CodexAppServerEventProjector {
     });
   }
 
-  private emitNormalizedToolItemEvent(params: {
+  private async emitNormalizedToolItemEvent(params: {
     phase: "start" | "result";
     item: CodexThreadItem | undefined;
-  }): void {
+  }): Promise<void> {
     const { item } = params;
     if (!item || !shouldSynthesizeToolProgressForItem(item)) {
       return;
@@ -926,13 +1776,13 @@ export class CodexAppServerEventProjector {
     const args = itemToolArgs(item);
     const meta = itemMeta(item, this.toolProgressDetailMode());
     this.recordToolTrajectoryEvent({ phase: params.phase, item, name, args, status });
-    this.emitDiagnosticToolExecutionEvent({ phase: params.phase, item, name, status });
     if (params.phase === "result") {
       this.recordNativeToolError({ item, name, meta, status });
     }
     if (!shouldEmitTranscriptToolProgress(name, args)) {
       if (params.phase === "result") {
         this.emitAfterToolCallObservation(item);
+        await this.options.onNativeToolResultRecorded?.();
       }
       return;
     }
@@ -956,7 +1806,28 @@ export class CodexAppServerEventProjector {
     });
     if (params.phase === "result") {
       this.emitAfterToolCallObservation(item);
+      await this.options.onNativeToolResultRecorded?.();
     }
+  }
+
+  private clearTerminalPresentationForNativeItem(item: CodexThreadItem | undefined): void {
+    if (
+      !item ||
+      this.terminalPresentationClearedItemIds.has(item.id) ||
+      !shouldClearTerminalPresentationForNativeItem(item)
+    ) {
+      return;
+    }
+    const toolCallOrdinal = this.nativeToolOutcomeOrdinals.get(item.id);
+    this.terminalPresentationClearedItemIds.add(item.id);
+    this.params.onToolOutcome?.({
+      toolName: itemName(item) ?? item.type,
+      argsHash: "",
+      resultHash: "",
+      ...(toolCallOrdinal !== undefined ? { toolCallOrdinal } : {}),
+      terminalPresentation: undefined,
+      presentationOnly: true,
+    });
   }
 
   private recordNativeToolError(params: {
@@ -1002,6 +1873,9 @@ export class CodexAppServerEventProjector {
     status: ReturnType<typeof itemStatus>;
   }): void {
     if (params.phase === "start") {
+      this.toolTrajectoryCallIds.add(params.item.id);
+      this.toolTrajectoryNamesById.set(params.item.id, params.name);
+      this.toolTrajectoryItemsById.set(params.item.id, params.item);
       this.options.trajectoryRecorder?.recordEvent("tool.call", {
         threadId: this.threadId,
         turnId: this.turnId,
@@ -1012,6 +1886,7 @@ export class CodexAppServerEventProjector {
       });
       return;
     }
+    this.toolTrajectoryResultIds.add(params.item.id);
     const toolResult = itemToolResult(params.item).result;
     const output = itemOutputText(params.item, this.toolResultOutputTextByItem);
     this.options.trajectoryRecorder?.recordEvent("tool.result", {
@@ -1025,54 +1900,6 @@ export class CodexAppServerEventProjector {
       ...(toolResult ? { result: toolResult } : {}),
       ...(output ? { output } : {}),
     });
-  }
-
-  private emitDiagnosticToolExecutionEvent(params: {
-    phase: "start" | "result";
-    item: CodexThreadItem;
-    name: string;
-    status: ReturnType<typeof itemStatus>;
-  }): void {
-    const base = {
-      runId: this.params.runId,
-      sessionId: this.params.sessionId,
-      sessionKey: this.params.sessionKey,
-      toolName: params.name,
-      toolCallId: params.item.id,
-    };
-    if (params.phase === "start") {
-      this.diagnosticToolStartedAtByItem.set(params.item.id, Date.now());
-      emitTrustedDiagnosticEvent({
-        type: "tool.execution.started",
-        ...base,
-      });
-      return;
-    }
-
-    const startedAt = this.diagnosticToolStartedAtByItem.get(params.item.id);
-    this.diagnosticToolStartedAtByItem.delete(params.item.id);
-    const itemDurationMs =
-      typeof params.item.durationMs === "number" ? params.item.durationMs : undefined;
-    const durationMs =
-      itemDurationMs ?? (startedAt === undefined ? 0 : Math.max(0, Date.now() - startedAt));
-    const terminalEvent =
-      params.status === "blocked"
-        ? {
-            type: "tool.execution.blocked" as const,
-            reason: "codex_native_tool_blocked",
-            deniedReason: "codex_native_tool_blocked",
-          }
-        : params.status === "failed"
-          ? {
-              type: "tool.execution.error" as const,
-              durationMs,
-              errorCategory: "codex_native_tool_error",
-            }
-          : {
-              type: "tool.execution.completed" as const,
-              durationMs,
-            };
-    emitTrustedDiagnosticEvent({ ...base, ...terminalEvent });
   }
 
   private emitAfterToolCallObservation(item: CodexThreadItem): void {
@@ -1090,8 +1917,7 @@ export class CodexAppServerEventProjector {
     this.afterToolCallObservedItemIds.add(item.id);
     const result = itemToolResult(item).result;
     const error = itemToolError(item, status, this.toolResultOutputTextByItem);
-    const startedAt =
-      typeof item.durationMs === "number" ? Date.now() - Math.max(0, item.durationMs) : undefined;
+    const startedAt = resolveStartedAtFromDurationMs(item.durationMs);
     const hookParams = {
       toolName: name,
       toolCallId: item.id,
@@ -1178,11 +2004,12 @@ export class CodexAppServerEventProjector {
     finalOutput?: boolean;
     isError?: boolean;
   }): void {
-    const text = params.text.trim();
+    const rawText = params.text.trim();
+    const text = truncateToolTranscriptText(rawText);
     if (!text) {
       return;
     }
-    this.toolProgressTexts.add(text);
+    this.rememberToolProgressEcho(params.itemId, { displayText: text, rawText });
     if (params.finalOutput) {
       this.toolResultOutputItemIds.add(params.itemId);
     }
@@ -1220,22 +2047,24 @@ export class CodexAppServerEventProjector {
     if (!item) {
       return;
     }
-    const toolName = itemName(item);
-    if (!toolName) {
-      return;
-    }
-    const meta = itemMeta(item, this.toolProgressDetailMode());
-    const existingMeta = this.toolMetas.get(item.id);
-    this.toolMetas.set(item.id, {
-      toolName,
-      ...(meta ? { meta } : {}),
-      ...(existingMeta?.asyncStarted === true ? { asyncStarted: true } : {}),
-    });
     if (isSideEffectingNativeToolItem(item)) {
       this.sideEffectingToolItemIds.add(item.id);
     } else {
       this.sideEffectingToolItemIds.delete(item.id);
     }
+    const toolName = itemName(item);
+    if (!toolName) {
+      return;
+    }
+    const meta = itemMeta(item, this.toolProgressDetailMode());
+    const status = itemStatus(item);
+    const existing = this.toolMetas.get(item.id);
+    this.toolMetas.set(item.id, {
+      toolName,
+      ...(meta ? { meta } : {}),
+      ...(existing?.asyncStarted ? { asyncStarted: true } : {}),
+      ...(status !== "running" && isNonSuccessItemStatus(status) ? { isError: true } : {}),
+    });
   }
 
   private recordNativeToolTranscriptCall(item: CodexThreadItem | undefined): void {
@@ -1274,6 +2103,7 @@ export class CodexAppServerEventProjector {
       return;
     }
     this.toolTranscriptCallIds.add(params.id);
+    this.toolTranscriptNamesById.set(params.id, params.name);
     this.toolTranscriptArgumentsById.set(params.id, params.arguments);
     if (!shouldEmitTranscriptToolProgress(params.name, params.arguments)) {
       this.transcriptToolProgressSuppressedIds.add(params.id);
@@ -1301,6 +2131,95 @@ export class CodexAppServerEventProjector {
         `${this.turnId}:tool:${params.id}:result`,
       ),
     );
+  }
+
+  private synthesizeMissingToolResults(params: {
+    synthesize: boolean;
+    recordPromptError: boolean;
+  }): void {
+    if (!params.synthesize) {
+      return;
+    }
+    const missingTranscriptIds = [...this.toolTranscriptCallIds].filter(
+      (id) => !this.toolTranscriptResultIds.has(id),
+    );
+    const missingTrajectoryIds = [...this.toolTrajectoryCallIds].filter(
+      (id) => !this.toolTrajectoryResultIds.has(id),
+    );
+    if (missingTranscriptIds.length === 0 && missingTrajectoryIds.length === 0) {
+      return;
+    }
+
+    for (const id of missingTranscriptIds) {
+      const name = this.toolTranscriptNamesById.get(id) ?? this.toolTrajectoryNamesById.get(id);
+      if (!name) {
+        continue;
+      }
+      this.recordToolTranscriptResult({
+        id,
+        name,
+        text: formatMissingToolResultError({ id, name }),
+        isError: true,
+      });
+    }
+
+    for (const id of missingTrajectoryIds) {
+      const name = this.toolTrajectoryNamesById.get(id) ?? this.toolTranscriptNamesById.get(id);
+      if (!name) {
+        continue;
+      }
+      this.toolTrajectoryResultIds.add(id);
+      const text = formatMissingToolResultError({ id, name });
+      this.options.trajectoryRecorder?.recordEvent("tool.result", {
+        threadId: this.threadId,
+        turnId: this.turnId,
+        itemId: id,
+        toolCallId: id,
+        name,
+        status: "failed",
+        isError: true,
+        result: { status: "failed", reason: "missing_tool_result" },
+        output: text,
+      });
+    }
+
+    if (!params.recordPromptError) {
+      const firstMissingId =
+        missingTranscriptIds.find((id) => {
+          const name = this.toolTranscriptNamesById.get(id) ?? this.toolTrajectoryNamesById.get(id);
+          return Boolean(name);
+        }) ??
+        missingTrajectoryIds.find((id) => {
+          const name = this.toolTrajectoryNamesById.get(id) ?? this.toolTranscriptNamesById.get(id);
+          return Boolean(name);
+        });
+      if (firstMissingId) {
+        const name =
+          this.toolTranscriptNamesById.get(firstMissingId) ??
+          this.toolTrajectoryNamesById.get(firstMissingId);
+        if (name) {
+          const item = this.toolTrajectoryItemsById.get(firstMissingId);
+          const meta = item
+            ? itemMeta(item, this.toolProgressDetailMode())
+            : this.toolMetas.get(firstMissingId)?.meta;
+          const actionFingerprint = item ? nativeToolActionFingerprint(item) : undefined;
+          this.lastNativeToolError = {
+            toolName: name,
+            ...(meta ? { meta } : {}),
+            error: formatMissingToolResultError({ id: firstMissingId, name }),
+            ...(item && isMutatingNativeToolItem(item) ? { mutatingAction: true } : {}),
+            ...(actionFingerprint ? { actionFingerprint } : {}),
+          };
+        }
+      }
+      return;
+    }
+    const missingCount = new Set([...missingTranscriptIds, ...missingTrajectoryIds]).size;
+    this.synthesizedMissingToolResultError =
+      missingCount === 1
+        ? MISSING_TOOL_RESULT_ERROR
+        : `${MISSING_TOOL_RESULT_ERROR} missingToolResultCount=${missingCount}`;
+    this.promptErrorSource = this.promptErrorSource ?? "prompt";
   }
 
   private emitTranscriptToolCallProgress(params: ToolTranscriptCallInput): void {
@@ -1370,7 +2289,7 @@ export class CodexAppServerEventProjector {
       formatCodexUsageLimitErrorMessage({
         message: error ? readString(error, "message") : undefined,
         codexErrorInfo: error?.codexErrorInfo,
-        rateLimits: this.latestRateLimits ?? readRecentCodexRateLimits(),
+        rateLimits: this.options.readRecentRateLimits?.(),
       }) ?? readCodexErrorNotificationMessage(params)
     );
   }
@@ -1404,7 +2323,28 @@ export class CodexAppServerEventProjector {
     return finalText ? [finalText] : [];
   }
 
+  private hasAssistantItemTextForSynthesis(): boolean {
+    for (let i = this.assistantItemOrder.length - 1; i >= 0; i -= 1) {
+      const itemId = this.assistantItemOrder[i];
+      if (!itemId) {
+        continue;
+      }
+      if (this.assistantPhaseByItem.get(itemId) === "commentary") {
+        continue;
+      }
+      const text = this.assistantTextByItem.get(itemId);
+      if (text && text.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private resolveFinalAssistantText(): string | undefined {
+    return this.resolveFinalAssistantTextItem()?.text;
+  }
+
+  private resolveFinalAssistantTextItem(): { itemId: string; text: string } | undefined {
     for (let i = this.assistantItemOrder.length - 1; i >= 0; i -= 1) {
       const itemId = this.assistantItemOrder[i];
       if (!itemId) {
@@ -1414,8 +2354,8 @@ export class CodexAppServerEventProjector {
       if (this.assistantPhaseByItem.get(itemId) === "commentary") {
         continue;
       }
-      if (text && !this.toolProgressTexts.has(text)) {
-        return text;
+      if (text && !this.isToolProgressEchoText(itemId, text)) {
+        return { itemId, text };
       }
     }
     return undefined;
@@ -1428,8 +2368,133 @@ export class CodexAppServerEventProjector {
     this.assistantItemOrder.push(itemId);
   }
 
+  private createCurrentAttemptAssistantMessage(): AssistantMessage | undefined {
+    for (let i = this.assistantItemOrder.length - 1; i >= 0; i -= 1) {
+      const itemId = this.assistantItemOrder[i];
+      if (
+        !itemId ||
+        this.isCommentaryAssistantItem(itemId) ||
+        !this.assistantTextByItem.has(itemId)
+      ) {
+        continue;
+      }
+      const text = this.assistantTextByItem.get(itemId) ?? "";
+      const normalizedText = text.trim();
+      if (normalizedText && this.isToolProgressEchoText(itemId, normalizedText)) {
+        continue;
+      }
+      return this.createAssistantMessage(text);
+    }
+    return undefined;
+  }
+
+  private isToolProgressEchoText(itemId: string, text: string): boolean {
+    if (!this.rawPromotedAssistantItemIds.has(itemId)) {
+      return false;
+    }
+    for (const state of this.toolProgressEchoesByItem.values()) {
+      if (state.streamedDisplayText === text) {
+        return true;
+      }
+      if (state.displayTexts.includes(text)) {
+        return true;
+      }
+      if (
+        state.streamedRawSignature &&
+        text.length === state.streamedRawSignature.length &&
+        text.startsWith(state.streamedRawSignature.prefix)
+      ) {
+        return true;
+      }
+      for (const signature of state.rawSignatures) {
+        if (text.length === signature.length && text.startsWith(signature.prefix)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private rememberToolProgressEcho(
+    itemId: string,
+    signature: {
+      displayText?: string;
+      rawText?: string;
+      rawLength?: number;
+      rawPrefix?: string;
+      streamedDisplay?: boolean;
+    },
+  ): void {
+    if (!itemId) {
+      return;
+    }
+    const existing = this.toolProgressEchoesByItem.get(itemId) ?? {
+      displayTexts: [],
+      rawSignatures: [],
+    };
+    const displayText = signature.displayText?.trim();
+    if (displayText) {
+      if (signature.streamedDisplay) {
+        existing.streamedDisplayText = displayText;
+      } else if (!existing.displayTexts.includes(displayText)) {
+        if (existing.displayTexts.length >= TOOL_PROGRESS_ECHO_SIGNATURE_CAP) {
+          existing.displayTexts.shift();
+        }
+        existing.displayTexts.push(displayText);
+      }
+    }
+    const rawText = signature.rawText?.trim();
+    const rawLength = signature.rawLength ?? rawText?.length;
+    const rawPrefix = signature.rawPrefix?.trim() ?? rawText;
+    if (
+      rawLength !== undefined &&
+      rawPrefix &&
+      rawPrefix.length >= TOOL_PROGRESS_ECHO_PREFIX_MIN_CHARS
+    ) {
+      const next: ToolProgressRawSignature = {
+        length: rawLength,
+        prefix: rawPrefix.slice(0, TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS),
+      };
+      if (signature.streamedDisplay) {
+        // Stream accumulation is one logical shape; replace the dedicated slot only.
+        existing.streamedRawSignature = next;
+      } else {
+        const matchIndex = existing.rawSignatures.findIndex(
+          (entry) => entry.prefix === next.prefix,
+        );
+        if (matchIndex >= 0) {
+          existing.rawSignatures[matchIndex] = next;
+        } else {
+          if (existing.rawSignatures.length >= TOOL_PROGRESS_ECHO_SIGNATURE_CAP) {
+            existing.rawSignatures.shift();
+          }
+          existing.rawSignatures.push(next);
+        }
+      }
+    }
+    this.toolProgressEchoesByItem.set(itemId, existing);
+  }
+
+  private rememberCommandAggregateOutputEcho(item: CodexThreadItem | undefined): void {
+    if (item?.type !== "commandExecution" || typeof item.aggregatedOutput !== "string") {
+      return;
+    }
+    const signature = toolOutputRawEchoSignature(item.aggregatedOutput);
+    if (!signature) {
+      return;
+    }
+    this.rememberToolProgressEcho(item.id, signature);
+  }
+
   private async readMirroredSessionMessages(): Promise<AgentMessage[]> {
-    return (await readCodexMirroredSessionHistoryMessages(this.params.sessionFile)) ?? [];
+    return (
+      (await readCodexMirroredSessionHistoryMessages({
+        agentId: this.params.agentId,
+        sessionFile: this.params.sessionFile,
+        sessionId: this.params.sessionId,
+        sessionKey: this.params.sessionKey,
+      })) ?? []
+    );
   }
 
   private createAssistantMessage(text: string): AssistantMessage {
@@ -1452,7 +2517,7 @@ export class CodexAppServerEventProjector {
     return {
       role: "assistant",
       content: [{ type: "text", text }],
-      api: attribution.api ?? "openai-codex-responses",
+      api: attribution.api ?? "openai-chatgpt-responses",
       provider: attribution.provider,
       model: this.params.modelId,
       usage,
@@ -1467,7 +2532,7 @@ export class CodexAppServerEventProjector {
     return {
       role: "assistant",
       content: [{ type: "text", text: `${title}:\n${text}` }],
-      api: attribution.api ?? "openai-codex-responses",
+      api: attribution.api ?? "openai-chatgpt-responses",
       provider: attribution.provider,
       model: this.params.modelId,
       usage: ZERO_USAGE,
@@ -1490,7 +2555,7 @@ export class CodexAppServerEventProjector {
           input: args,
         },
       ],
-      api: attribution.api ?? "openai-codex-responses",
+      api: attribution.api ?? "openai-chatgpt-responses",
       provider: attribution.provider,
       model: this.params.modelId,
       usage: ZERO_USAGE,
@@ -1525,7 +2590,7 @@ export class CodexAppServerEventProjector {
 
   private isNotificationForTurn(params: JsonObject): boolean {
     const threadId = readCodexNotificationThreadId(params);
-    const turnId = readNotificationTurnId(params);
+    const turnId = readCodexNotificationTurnId(params);
     return threadId === this.threadId && turnId === this.turnId;
   }
 
@@ -1540,13 +2605,42 @@ function isHookNotificationMethod(method: string): method is "hook/started" | "h
   return method === "hook/started" || method === "hook/completed";
 }
 
-function readNotificationTurnId(record: JsonObject): string | undefined {
-  return readCodexNotificationTurnId(record);
-}
-
 function readString(record: JsonObject, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function estimateBase64DecodedBytes(base64: string): number | undefined {
+  let nonWhitespaceLength = 0;
+  let previousCode = -1;
+  let lastCode = -1;
+  for (let i = 0; i < base64.length; i += 1) {
+    const code = base64.charCodeAt(i);
+    if (isBase64WhitespaceCode(code)) {
+      continue;
+    }
+    nonWhitespaceLength += 1;
+    previousCode = lastCode;
+    lastCode = code;
+  }
+  if (nonWhitespaceLength === 0) {
+    return undefined;
+  }
+  const equalsCode = "=".charCodeAt(0);
+  const padding = lastCode === equalsCode ? (previousCode === equalsCode ? 2 : 1) : 0;
+  return Math.max(0, Math.floor((nonWhitespaceLength * 3) / 4) - padding);
+}
+
+function isBase64WhitespaceCode(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+function resolveGeneratedImageMaxBytes(config: EmbeddedRunAttemptParams["config"]): number {
+  const configured = config?.agents?.defaults?.mediaMaxMb;
+  if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured * BYTES_PER_MB);
+  }
+  return DEFAULT_GENERATED_IMAGE_MAX_BYTES;
 }
 
 function normalizeNonEmptyString(value: unknown): string | undefined {
@@ -1584,29 +2678,25 @@ function readNullableString(record: JsonObject, key: string): string | null | un
 }
 
 function readNumber(record: JsonObject, key: string): number | undefined {
-  return asFiniteNumber(record[key]);
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function readBoolean(record: JsonObject, key: string): boolean | undefined {
-  return asBoolean(record[key]);
-}
-
-function readBooleanAlias(record: JsonObject, keys: readonly string[]): boolean | undefined {
-  for (const key of keys) {
-    const value = readBoolean(record, key);
-    if (value !== undefined) {
-      return value;
-    }
+function resolveStartedAtFromDurationMs(durationMs: unknown): number | undefined {
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) {
+    return undefined;
   }
-  return undefined;
+  return asDateTimestampMs(Date.now() - Math.max(0, durationMs));
+}
+
+function readNonNegativeInteger(record: JsonObject, key: string): number | undefined {
+  const value = readNumber(record, key);
+  return value !== undefined && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function readCodexErrorNotificationMessage(record: JsonObject): string | undefined {
   const error = record.error;
-  if (isJsonObject(error)) {
-    return readString(error, "message") ?? readString(error, "error");
-  }
-  return readString(record, "message");
+  return isJsonObject(error) ? readString(error, "message") : undefined;
 }
 
 function readHookOutputEntries(
@@ -1628,52 +2718,20 @@ function readHookOutputEntries(
   });
 }
 
-function readFirstJsonObject(record: JsonObject, keys: readonly string[]): JsonObject | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (isJsonObject(value)) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function readNumberAlias(record: JsonObject, keys: readonly string[]): number | undefined {
-  for (const key of keys) {
-    const value = readNumber(record, key);
-    if (value !== undefined) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
 function normalizeCodexTokenUsage(record: JsonObject): ReturnType<typeof normalizeUsage> {
-  const promptTotalInput = readNumberAlias(record, CODEX_PROMPT_TOTAL_INPUT_KEYS);
-  const cacheRead = readNumberAlias(record, [
-    "cachedInputTokens",
-    "cached_input_tokens",
-    "cacheRead",
-    "cache_read",
-    "cache_read_input_tokens",
-    "cached_tokens",
-  ]);
+  // v2 TokenUsageBreakdown. inputTokens includes cached input; OpenClaw usage
+  // tracks uncached input and cache reads separately.
+  const inputTokens = readNumber(record, "inputTokens");
+  const cacheRead = readNumber(record, "cachedInputTokens");
   const input =
-    promptTotalInput !== undefined && cacheRead !== undefined
-      ? Math.max(0, promptTotalInput - cacheRead)
-      : (promptTotalInput ?? readNumber(record, "input"));
-
+    inputTokens !== undefined && cacheRead !== undefined
+      ? Math.max(0, inputTokens - cacheRead)
+      : inputTokens;
   return normalizeUsage({
     input,
-    output: readNumberAlias(record, ["outputTokens", "output_tokens", "output"]),
+    output: readNumber(record, "outputTokens"),
     cacheRead,
-    cacheWrite: readNumberAlias(record, [
-      "cacheWrite",
-      "cache_write",
-      "cacheCreationInputTokens",
-      "cache_creation_input_tokens",
-    ]),
-    total: readNumberAlias(record, ["totalTokens", "total_tokens", "total"]),
+    total: readNumber(record, "totalTokens"),
   });
 }
 
@@ -1686,6 +2744,29 @@ function splitPlanText(text: string): string[] {
 
 function collectTextValues(map: Map<string, string>): string[] {
   return [...map.values()].filter((text) => text.trim().length > 0);
+}
+
+function collectReasoningTextValues(
+  groups: Map<string, ReasoningTextGroup>,
+  itemOrder: Map<string, number>,
+): string[] {
+  return [...groups.values()]
+    .toSorted((left, right) => {
+      const itemDelta =
+        (itemOrder.get(left.itemId) ?? Number.MAX_SAFE_INTEGER) -
+        (itemOrder.get(right.itemId) ?? Number.MAX_SAFE_INTEGER);
+      if (itemDelta !== 0) {
+        return itemDelta;
+      }
+      const methodDelta = reasoningMethodOrder(left.method) - reasoningMethodOrder(right.method);
+      return methodDelta !== 0 ? methodDelta : left.index - right.index;
+    })
+    .map((group) => group.text)
+    .filter((text) => text.trim().length > 0);
+}
+
+function reasoningMethodOrder(method: ReasoningDeltaMethod): number {
+  return method === "item/reasoning/summaryTextDelta" ? 0 : 1;
 }
 
 function extractRawAssistantText(item: JsonObject): string | undefined {
@@ -1750,16 +2831,45 @@ function itemTitle(item: CodexThreadItem): string {
 
 function itemStatus(item: CodexThreadItem): "completed" | "failed" | "running" | "blocked" {
   const status = readItemString(item, "status");
-  if (status === "failed") {
+  if (status === "failed" || status === "error") {
     return "failed";
   }
   if (status === "declined") {
     return "blocked";
   }
-  if (status === "inProgress" || status === "running") {
+  if (status === "inProgress" || status === "in_progress" || status === "running") {
     return "running";
   }
   return "completed";
+}
+
+function auditNativeToolTerminalStatus(item: CodexThreadItem): CodexNativeToolAuditStatus {
+  if (item.type === "imageView" || item.type === "sleep") {
+    return "completed";
+  }
+  const status = readItemString(item, "status");
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "failed" || status === "error") {
+    return "failed";
+  }
+  if (status === "declined") {
+    return "blocked";
+  }
+  // A completed notification with a missing, active, or new status does not
+  // prove success. Preserve that ambiguity at the durable audit boundary.
+  return "unknown";
+}
+
+function auditNativeToolUnfinishedStatus(item: CodexThreadItem): CodexNativeToolUnfinishedStatus {
+  // Search and image generation publish explicit terminal states. An enclosing
+  // run outcome cannot substitute when that dependency-owned state is absent.
+  return item.type === "webSearch" || item.type === "imageGeneration" ? "unknown" : "failed";
+}
+
+function formatMissingToolResultError(params: { id: string; name: string }): string {
+  return `${MISSING_TOOL_RESULT_ERROR} toolCallId=${params.id}; toolName=${params.name}`;
 }
 
 function isNonSuccessItemStatus(status: ReturnType<typeof itemStatus>): boolean {
@@ -1782,6 +2892,31 @@ function itemName(item: CodexThreadItem): string | undefined {
   }
   if (item.type === "webSearch") {
     return "web_search";
+  }
+  return undefined;
+}
+
+function auditNativeToolName(item: CodexThreadItem): string | undefined {
+  if (item.type === "dynamicToolCall") {
+    return undefined;
+  }
+  const progressName = itemName(item);
+  if (progressName) {
+    return progressName;
+  }
+  if (item.type === "collabAgentToolCall") {
+    return typeof item.tool === "string" && item.tool.trim()
+      ? `collab.${item.tool.trim()}`
+      : "collab_agent";
+  }
+  if (item.type === "imageGeneration") {
+    return "image_generation";
+  }
+  if (item.type === "imageView") {
+    return "image_view";
+  }
+  if (item.type === "sleep") {
+    return "sleep";
   }
   return undefined;
 }
@@ -1810,7 +2945,31 @@ function shouldRecordNativeToolTranscript(item: CodexThreadItem): boolean {
 }
 
 function isMutatingNativeToolItem(item: CodexThreadItem): boolean {
-  return item.type === "commandExecution" || item.type === "fileChange";
+  if (item.type === "commandExecution") {
+    // Codex commandActions describe presentation, not safety. Upstream may
+    // classify mutating commands as read/search, so native commands fail closed.
+    return true;
+  }
+  return (
+    item.type === "fileChange" ||
+    item.type === "collabAgentToolCall" ||
+    item.type === "imageGeneration"
+  );
+}
+
+function shouldClearTerminalPresentationForNativeItem(item: CodexThreadItem): boolean {
+  switch (item.type) {
+    case "collabAgentToolCall":
+    case "commandExecution":
+    case "fileChange":
+    case "imageGeneration":
+    case "imageView":
+    case "mcpToolCall":
+    case "webSearch":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function nativeToolActionFingerprint(item: CodexThreadItem): string | undefined {
@@ -1860,7 +3019,7 @@ function itemToolArgs(item: CodexThreadItem): Record<string, unknown> | undefine
   }
   if (item.type === "fileChange") {
     return sanitizeCodexAgentEventRecord({
-      changes: itemFileChanges(item),
+      changes: itemFileChangesForTranscript(item),
     });
   }
   if (item.type === "webSearch") {
@@ -1947,10 +3106,116 @@ function webSearchToolResult(item: CodexThreadItem): Record<string, unknown> {
   });
 }
 
-function itemFileChanges(item: CodexThreadItem): Array<{ path: string; kind: string }> {
-  return Array.isArray(item.changes)
-    ? item.changes.map((change) => ({ path: change.path, kind: change.kind }))
-    : [];
+type CodexFileChangeSummary = {
+  path: string;
+  kind: unknown;
+};
+
+type CodexTranscriptFileChange = CodexFileChangeSummary & {
+  diff?: string;
+  diffTruncated?: true;
+  stat?: { added: number; removed: number };
+};
+
+function itemFileChangeRecords(item: CodexThreadItem): JsonObject[] {
+  const changes = (item as Record<string, unknown>).changes;
+  return Array.isArray(changes) ? changes.filter(isJsonObject) : [];
+}
+
+function itemFileChanges(item: CodexThreadItem): CodexFileChangeSummary[] {
+  return itemFileChangeRecords(item).flatMap((change) => {
+    const path = normalizeNonEmptyString(change.path);
+    if (!path || change.kind === undefined) {
+      return [];
+    }
+    return [{ path, kind: change.kind }];
+  });
+}
+
+function fileChangeKindType(kind: unknown): string | undefined {
+  if (typeof kind === "string") {
+    return kind;
+  }
+  return isJsonObject(kind) ? normalizeNonEmptyString(kind.type) : undefined;
+}
+
+function countFileContentLines(content: string): number {
+  if (!content) {
+    return 0;
+  }
+  const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  if (lines.length > 1 && lines.at(-1) === "") {
+    lines.pop();
+  }
+  return lines.length;
+}
+
+function fileChangeDiffStat(diff: string, kind: unknown): { added: number; removed: number } {
+  const kindType = fileChangeKindType(kind);
+  if (kindType === "add") {
+    return { added: countFileContentLines(diff), removed: 0 };
+  }
+  if (kindType === "delete") {
+    return { added: 0, removed: countFileContentLines(diff) };
+  }
+  let added = 0;
+  let removed = 0;
+  let inHunk = false;
+  for (const line of diff.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      added += 1;
+    } else if (line.startsWith("-")) {
+      removed += 1;
+    }
+  }
+  return { added, removed };
+}
+
+function truncateFileChangeDiffAtLineBoundary(
+  diff: string,
+  maxChars: number,
+): { diff?: string; diffTruncated?: true } {
+  if (diff.length <= maxChars) {
+    return { diff };
+  }
+  if (maxChars <= 0) {
+    return { diffTruncated: true };
+  }
+  const boundary = diff.lastIndexOf("\n", maxChars - 1);
+  return boundary >= 0
+    ? { diff: diff.slice(0, boundary + 1), diffTruncated: true }
+    : { diffTruncated: true };
+}
+
+function itemFileChangesForTranscript(item: CodexThreadItem): CodexTranscriptFileChange[] {
+  let remainingDiffChars = TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS;
+  return itemFileChangeRecords(item).flatMap((change) => {
+    const path = normalizeNonEmptyString(change.path);
+    if (!path || change.kind === undefined) {
+      return [];
+    }
+    const result: CodexTranscriptFileChange = { path, kind: change.kind };
+    if (typeof change.diff !== "string") {
+      return [result];
+    }
+    result.stat = fileChangeDiffStat(change.diff, change.kind);
+    const bounded = truncateFileChangeDiffAtLineBoundary(change.diff, remainingDiffChars);
+    if (bounded.diff !== undefined) {
+      result.diff = bounded.diff;
+      remainingDiffChars -= bounded.diff.length;
+    }
+    if (bounded.diffTruncated) {
+      result.diffTruncated = true;
+    }
+    return [result];
+  });
 }
 
 function itemToolError(
@@ -1996,16 +3261,20 @@ function itemOutputText(
   outputTextByItem?: ReadonlyMap<string, string>,
 ): string | undefined {
   if (item.type === "commandExecution") {
-    return item.aggregatedOutput?.trim() || outputTextByItem?.get(item.id)?.trim() || undefined;
+    const output = item.aggregatedOutput?.trim() || outputTextByItem?.get(item.id)?.trim();
+    return output ? truncateToolTranscriptText(output) : undefined;
   }
   if (item.type === "dynamicToolCall") {
-    return collectDynamicToolContentText(item.contentItems).trim() || undefined;
+    const output = collectDynamicToolContentText(item.contentItems).trim();
+    return output ? truncateToolTranscriptText(output) : undefined;
   }
   if (item.type === "mcpToolCall") {
-    if (item.error) {
-      return stringifyJsonValue(item.error);
-    }
-    return item.result ? stringifyJsonValue(item.result) : undefined;
+    const output = item.error
+      ? stringifyJsonValue(item.error)
+      : item.result
+        ? stringifyJsonValue(item.result)
+        : undefined;
+    return output ? truncateToolTranscriptText(output) : undefined;
   }
   return undefined;
 }
@@ -2019,21 +3288,89 @@ function itemTranscriptResultText(
     return output;
   }
   const result = itemToolResult(item).result;
-  return result ? stringifyJsonValue(result) : itemStatus(item);
+  const resultText = result ? stringifyJsonValue(result) : undefined;
+  return resultText ? truncateToolTranscriptText(resultText) : itemStatus(item);
 }
 
 function appendToolOutputDeltaText(
   outputTextByItem: Map<string, string>,
+  outputPrefixByItem: Map<string, string>,
+  originalLengthByItem: Map<string, number>,
+  normalizedLengthByItem: Map<string, number>,
+  trimStateByItem: Map<string, ToolOutputTrimState>,
+  truncatedItemIds: Set<string>,
   itemId: string,
   delta: string,
-): void {
-  const current = outputTextByItem.get(itemId) ?? "";
-  if (current.length >= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
-    return;
+): { text: string; originalLength: number; normalizedLength: number; rawPrefix: string } {
+  const previousOriginalLength =
+    originalLengthByItem.get(itemId) ?? outputTextByItem.get(itemId)?.length ?? 0;
+  const originalLength = previousOriginalLength + delta.length;
+  originalLengthByItem.set(itemId, originalLength);
+  const normalizedLength = updateToolOutputTrimState(trimStateByItem, itemId, delta);
+  normalizedLengthByItem.set(itemId, normalizedLength);
+  // Lengths keep growing after truncation for echo matching + the notice total;
+  // the stored raw prefix freezes so later deltas cannot fill UTF-16 capacity
+  // recovered by backing up over a split surrogate pair (see class field comment).
+  if (truncatedItemIds.has(itemId)) {
+    const frozenPrefix = outputPrefixByItem.get(itemId) ?? outputTextByItem.get(itemId) ?? "";
+    const next = appendBoundedToolTranscriptText(frozenPrefix, "", originalLength);
+    outputPrefixByItem.set(itemId, next.rawPrefix);
+    outputTextByItem.set(itemId, next.text);
+    return { text: next.text, originalLength, normalizedLength, rawPrefix: next.rawPrefix };
   }
-  const remaining = TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS - current.length;
-  const next = current + (delta.length > remaining ? delta.slice(0, remaining) : delta);
-  outputTextByItem.set(itemId, next);
+  const currentPrefix = outputPrefixByItem.get(itemId) ?? outputTextByItem.get(itemId) ?? "";
+  const next = appendBoundedToolTranscriptText(currentPrefix, delta, originalLength);
+  outputPrefixByItem.set(itemId, next.rawPrefix);
+  outputTextByItem.set(itemId, next.text);
+  if (originalLength > TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
+    truncatedItemIds.add(itemId);
+  }
+  return { text: next.text, originalLength, normalizedLength, rawPrefix: next.rawPrefix };
+}
+
+function updateToolOutputTrimState(
+  trimStateByItem: Map<string, ToolOutputTrimState>,
+  itemId: string,
+  delta: string,
+): number {
+  const state = trimStateByItem.get(itemId) ?? {
+    totalLength: 0,
+    leadingWhitespaceLength: 0,
+    trailingWhitespaceLength: 0,
+    sawNonWhitespace: false,
+  };
+  state.totalLength += delta.length;
+  const firstNonWhitespace = delta.search(/\S/u);
+  if (firstNonWhitespace === -1) {
+    if (!state.sawNonWhitespace) {
+      state.leadingWhitespaceLength += delta.length;
+    }
+    state.trailingWhitespaceLength += delta.length;
+    trimStateByItem.set(itemId, state);
+    return state.sawNonWhitespace
+      ? state.totalLength - state.leadingWhitespaceLength - state.trailingWhitespaceLength
+      : 0;
+  }
+  if (!state.sawNonWhitespace) {
+    state.leadingWhitespaceLength += firstNonWhitespace;
+    state.sawNonWhitespace = true;
+  }
+  state.trailingWhitespaceLength = delta.match(/\s*$/u)?.[0].length ?? 0;
+  trimStateByItem.set(itemId, state);
+  return state.totalLength - state.leadingWhitespaceLength - state.trailingWhitespaceLength;
+}
+
+function toolOutputRawEchoSignature(
+  text: string,
+): { rawLength: number; rawPrefix: string } | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return {
+    rawLength: trimmed.length,
+    rawPrefix: trimmed.slice(0, TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS),
+  };
 }
 
 function normalizeToolTranscriptArguments(value: unknown): Record<string, unknown> {
@@ -2058,11 +3395,45 @@ function collectDynamicToolContentText(contentItems: CodexThreadItem["contentIte
     .join("\n");
 }
 
-function truncateToolTranscriptText(text: string): string {
-  if (text.length <= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
+function appendBoundedToolTranscriptText(
+  currentPrefix: string,
+  delta: string,
+  originalLength: number,
+): { text: string; rawPrefix: string } {
+  if (originalLength <= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
+    const rawPrefix = currentPrefix + delta;
+    return { text: rawPrefix, rawPrefix };
+  }
+  const notice = toolTranscriptTruncationNotice(originalLength);
+  if (notice.length >= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
+    return { text: notice.slice(0, TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS), rawPrefix: "" };
+  }
+  const textBudget = TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS - notice.length;
+  const remaining = Math.max(0, textBudget - currentPrefix.length);
+  const prefix =
+    remaining > 0 ? `${currentPrefix}${truncateUtf16Safe(delta, remaining)}` : currentPrefix;
+  const rawPrefix = truncateUtf16Safe(prefix, textBudget);
+  return { text: `${rawPrefix}${notice}`, rawPrefix };
+}
+
+function toolTranscriptTruncationNotice(originalLength: number): string {
+  const noticeText = `${TOOL_OUTPUT_TRUNCATION_NOTICE_PREFIX}: original ${originalLength} chars, showing ${TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS}; rerun with narrower args.)`;
+  return `\n${noticeText}`;
+}
+
+function truncateToolTranscriptText(text: string, originalLength = text.length): string {
+  if (
+    originalLength <= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS &&
+    text.length <= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS
+  ) {
     return text;
   }
-  return `${text.slice(0, TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS)}\n...(truncated)...`;
+  const notice = toolTranscriptTruncationNotice(originalLength);
+  if (notice.length >= TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS) {
+    return notice.slice(1, TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS + 1);
+  }
+  const textBudget = TOOL_TRANSCRIPT_OUTPUT_MAX_CHARS - notice.length;
+  return `${truncateUtf16Safe(text, textBudget)}${notice}`;
 }
 
 function toolResultStatusText(params: ToolTranscriptResultInput): string {
@@ -2126,8 +3497,4 @@ function readItem(value: JsonValue | undefined): CodexThreadItem | undefined {
     return undefined;
   }
   return value as CodexThreadItem;
-}
-
-function readTurn(value: JsonValue | undefined): CodexTurn | undefined {
-  return readCodexTurn(value);
 }

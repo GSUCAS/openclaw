@@ -7,7 +7,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { createHookRunner } from "./hooks.js";
-import { addStaticTestHooks, addTestHook, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-helpers.js";
+import { addStaticTestHooks, addTestHook, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-fixtures.js";
 import { createEmptyPluginRegistry, type PluginRegistry } from "./registry.js";
 import type { PluginHookBeforeAgentStartResult, PluginHookRegistration } from "./types.js";
 
@@ -202,10 +202,10 @@ describe("before_agent_start hook merger", () => {
   });
 
   it("passes runId through the agent context to hook handlers", async () => {
-    const registry = createEmptyPluginRegistry();
+    const registryLocal = createEmptyPluginRegistry();
     let capturedCtx: typeof stubCtx | undefined;
     addTestHook({
-      registry,
+      registry: registryLocal,
       pluginId: "ctx-spy",
       hookName: "before_agent_start",
       handler: ((eventValue: unknown, ctx: typeof stubCtx) => {
@@ -214,7 +214,7 @@ describe("before_agent_start hook merger", () => {
       }) as PluginHookRegistration["handler"],
     });
 
-    const runner = createHookRunner(registry);
+    const runner = createHookRunner(registryLocal);
     await runner.runBeforeAgentStart({ prompt: "test" }, stubCtx);
 
     expect(capturedCtx).toBe(stubCtx);

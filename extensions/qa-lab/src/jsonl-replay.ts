@@ -1,9 +1,7 @@
+// Qa Lab plugin module implements jsonl replay behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  isRecord,
-  normalizeOptionalString as readString,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   runRuntimeParityScenario,
   type RuntimeId,
@@ -14,18 +12,18 @@ import {
 
 export type JsonlReplayInput = {
   directory: string;
-  runtimePair: ["pi", "codex"];
+  runtimePair: ["openclaw", "codex"];
   providerMode: "mock-openai" | "live-frontier";
 };
 
-export type JsonlReplayTurn = {
+type JsonlReplayTurn = {
   turn: number;
   lineNumber: number;
   userText: string;
   transcriptPrefix: string;
 };
 
-export type JsonlReplayCellRunner = (params: {
+type JsonlReplayCellRunner = (params: {
   runtime: RuntimeId;
   transcriptPath: string;
   turn: JsonlReplayTurn;
@@ -33,26 +31,30 @@ export type JsonlReplayCellRunner = (params: {
   providerMode: JsonlReplayInput["providerMode"];
 }) => Promise<RuntimeParityScenarioExecution>;
 
-export type JsonlReplayResult = {
+type JsonlReplayResult = {
   transcripts: Array<{
     transcriptPath: string;
     userTurnCount: number;
-    cells: { pi: RuntimeParityCell[]; codex: RuntimeParityCell[] };
+    cells: { openclaw: RuntimeParityCell[]; codex: RuntimeParityCell[] };
     drift: Array<RuntimeParityResult["drift"]>;
     firstDriftAtTurn?: number;
   }>;
 };
 
-export type JsonlReplayOptions = {
+type JsonlReplayOptions = {
   runCell?: JsonlReplayCellRunner;
 };
 
-export type JsonlReplayMarkdownReport = {
+type JsonlReplayMarkdownReport = {
   generatedAt: string;
   providerMode: JsonlReplayInput["providerMode"];
   runtimePair: JsonlReplayInput["runtimePair"];
   transcripts: JsonlReplayResult["transcripts"];
 };
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
 
 function readReplayMessage(record: Record<string, unknown>): Record<string, unknown> | undefined {
   if (isRecord(record.message)) {
@@ -103,7 +105,7 @@ function extractTextContent(content: unknown): string {
   return parts.join("\n").trim();
 }
 
-export function extractJsonlReplayUserTurns(transcriptBytes: string): JsonlReplayTurn[] {
+function extractJsonlReplayUserTurns(transcriptBytes: string): JsonlReplayTurn[] {
   const turns: JsonlReplayTurn[] = [];
   const acceptedLines: string[] = [];
   for (const [lineIndex, rawLine] of transcriptBytes.split(/\r?\n/u).entries()) {
@@ -162,7 +164,7 @@ function defaultRunCell(): Promise<RuntimeParityScenarioExecution> {
 }
 
 function assertSupportedRuntimePair(runtimePair: JsonlReplayInput["runtimePair"]) {
-  if (runtimePair[0] !== "pi" || runtimePair[1] !== "codex") {
+  if (runtimePair[0] !== "openclaw" || runtimePair[1] !== "codex") {
     throw new Error(`unsupported jsonl replay runtime pair: ${runtimePair.join(",")}`);
   }
 }
@@ -199,8 +201,8 @@ export async function runJsonlReplay(
   for (const transcriptPath of transcriptPaths) {
     const transcriptBytes = await fs.readFile(transcriptPath, "utf8");
     const turns = extractJsonlReplayUserTurns(transcriptBytes);
-    const cells: { pi: RuntimeParityCell[]; codex: RuntimeParityCell[] } = {
-      pi: [],
+    const cells: { openclaw: RuntimeParityCell[]; codex: RuntimeParityCell[] } = {
+      openclaw: [],
       codex: [],
     };
     const drift: Array<RuntimeParityResult["drift"]> = [];
@@ -218,7 +220,7 @@ export async function runJsonlReplay(
             providerMode: input.providerMode,
           }),
       });
-      cells.pi.push(parity.cells.pi);
+      cells.openclaw.push(parity.cells.openclaw);
       cells.codex.push(parity.cells.codex);
       drift.push(parity.drift);
       if (firstDriftAtTurn === undefined && parity.drift !== "none") {

@@ -1,10 +1,13 @@
-import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-primitives";
+// Matrix helper module supports config schema behavior.
 import {
   AllowFromListSchema,
+  BlockStreamingCoalesceSchema,
+  buildChannelConfigSchema,
   buildNestedDmConfigSchema,
   ContextVisibilityModeSchema,
   GroupPolicySchema,
   MarkdownConfigSchema,
+  MentionPatternsPolicySchema,
   ToolPolicySchema,
 } from "openclaw/plugin-sdk/channel-config-schema";
 import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
@@ -80,6 +83,14 @@ const matrixNetworkSchema = z
 const matrixStreamingSchema = z
   .object({
     mode: z.enum(["partial", "quiet", "progress", "off"]).optional(),
+    chunkMode: z.enum(["length", "newline"]).optional(),
+    block: z
+      .object({
+        enabled: z.boolean().optional(),
+        coalesce: BlockStreamingCoalesceSchema.optional(),
+      })
+      .strict()
+      .optional(),
     progress: z
       .object({
         label: z.union([z.string(), z.literal(false)]).optional(),
@@ -99,7 +110,7 @@ const matrixStreamingSchema = z
   })
   .strict();
 
-export const MatrixConfigSchema = z.object({
+const MatrixConfigSchema = z.object({
   name: z.string().optional(),
   enabled: z.boolean().optional(),
   defaultAccount: z.string().optional(),
@@ -121,15 +132,12 @@ export const MatrixConfigSchema = z.object({
   allowBots: z.union([z.boolean(), z.literal("mentions")]).optional(),
   botLoopProtection: botLoopProtectionSchema,
   groupPolicy: GroupPolicySchema.optional(),
+  mentionPatterns: MentionPatternsPolicySchema.optional(),
   contextVisibility: ContextVisibilityModeSchema.optional(),
-  blockStreaming: z.boolean().optional(),
-  streaming: z
-    .union([z.enum(["partial", "quiet", "progress", "off"]), z.boolean(), matrixStreamingSchema])
-    .optional(),
+  streaming: matrixStreamingSchema.optional(),
   replyToMode: z.enum(["off", "first", "all", "batched"]).optional(),
   threadReplies: z.enum(["off", "inbound", "always"]).optional(),
   textChunkLimit: z.number().optional(),
-  chunkMode: z.enum(["length", "newline"]).optional(),
   responsePrefix: z.string().optional(),
   ackReaction: z.string().optional(),
   ackReactionScope: z

@@ -1,3 +1,4 @@
+// Tests text-to-speech command configuration, preference persistence, and summaries.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -140,6 +141,13 @@ describe("handleTtsCommands status fallback reporting", () => {
     );
   });
 
+  it("does not coerce partial TTS limit values", async () => {
+    const result = await handleTtsCommands(buildTtsParams("/tts limit 2000chars"), true);
+
+    expect(expectReply(result).text).toBe("❌ Limit must be between 100 and 4096 characters.");
+    expect(ttsMocks.setTtsMaxLength).not.toHaveBeenCalled();
+  });
+
   it("shows attempted provider chain for failed attempts", async () => {
     ttsMocks.getLastTtsAttempt.mockReturnValue({
       timestamp: Date.now() - 1_000,
@@ -239,6 +247,22 @@ describe("handleTtsCommands status fallback reporting", () => {
     );
     const reply = expectReply(result);
     expect(reply.text).toContain("TTS status");
+  });
+
+  it("keeps base status fields in display order", async () => {
+    const reply = expectReply(await handleTtsCommands(buildTtsParams("/tts status"), true));
+
+    expect(reply.text).toBe(
+      [
+        "📊 TTS status",
+        "State: ✅ enabled",
+        "Chat override: default",
+        `Provider: ${PRIMARY_TTS_PROVIDER} (✅ configured)`,
+        "Persona: none",
+        "Text limit: 1500 chars",
+        "Auto-summary: on",
+      ].join("\n"),
+    );
   });
 
   it("resolves status config for the active agent", async () => {
@@ -356,7 +380,7 @@ describe("handleTtsCommands status fallback reporting", () => {
 
     const beforeTtsRead = Date.now();
     const result = await handleTtsCommands(
-      buildTtsParams("/tts latest", {}, undefined, { sessionEntry, sessionStore }),
+      buildTtsParams("/tts read latest", {}, undefined, { sessionEntry, sessionStore }),
       true,
     );
 

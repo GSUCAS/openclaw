@@ -1,3 +1,7 @@
+// Cron list pagination tests cover stable sorting and page boundary guards.
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMockCronStateForJobs } from "./service.test-harness.js";
 import { listPage } from "./service/ops.js";
@@ -101,5 +105,87 @@ describe("cron listPage sort guards", () => {
     const page = await listPage(state);
 
     expect(page.jobs.map((job) => job.id)).toEqual(["job-main", "job-ops"]);
+  });
+
+  it("keeps one revision across pages and changes it for same-count store churn", async () => {
+    const jobs = [
+      createBaseJob({ id: "job-a", name: "alpha" }),
+      createBaseJob({ id: "job-b", name: "beta" }),
+    ];
+    const state = createMockCronStateForJobs({ jobs });
+
+    const firstPage = await listPage(state, { limit: 1, offset: 0, sortBy: "name" });
+    const secondPage = await listPage(state, { limit: 1, offset: 1, sortBy: "name" });
+    expect(secondPage.snapshotRevision).toBe(firstPage.snapshotRevision);
+
+    if (!state.store) {
+      throw new Error("expected loaded cron store");
+    }
+    state.store.jobs = [jobs[1]!, createBaseJob({ id: "job-c", name: "gamma" })];
+    const changedPage = await listPage(state, { limit: 1, offset: 0, sortBy: "name" });
+
+    expect(changedPage.total).toBe(firstPage.total);
+    expect(changedPage.snapshotRevision).not.toBe(firstPage.snapshotRevision);
+  });
+
+  it("detaches returned pages from later in-place store mutations", async () => {
+    const job = createBaseJob({ id: "job-a", name: "alpha" });
+    const state = createMockCronStateForJobs({ jobs: [job] });
+
+    const page = await listPage(state);
+    job.state.lastStatus = "ok";
+
+    expect(page.jobs[0]).not.toBe(job);
+    expect(page.jobs[0]?.state.lastStatus).toBeUndefined();
+  });
+
+  it("matches job ids in listPage text search", async () => {
+    const jobs = [
+      createBaseJob({ id: "daily-report", name: "Morning report" }),
+      createBaseJob({ id: "tax-digest", name: "Finance digest" }),
+    ];
+    const state = createMockCronStateForJobs({ jobs });
+
+    const page = await listPage(state, { query: "tax" });
+
+    expect(page.jobs.map((job) => job.id)).toEqual(["tax-digest"]);
+  });
+
+  it("applies schedule and last-run status filters before paging", async () => {
+    const nextRunAtMs = Date.parse("2030-02-27T15:30:00.000Z");
+    const jobs = [
+      createBaseJob({
+        id: "at-unknown",
+        schedule: { kind: "at", at: "2030-02-27T15:30:00.000Z" },
+        state: { nextRunAtMs },
+      }),
+      createBaseJob({
+        id: "cron-error",
+        schedule: { kind: "cron", expr: "0 9 * * *" },
+        state: { nextRunAtMs, lastStatus: "error" },
+      }),
+      createBaseJob({
+        id: "cron-unknown",
+        schedule: { kind: "cron", expr: "0 10 * * *" },
+        state: { nextRunAtMs },
+      }),
+    ];
+    const state = createMockCronStateForJobs({ jobs });
+    const storeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cron-list-page-"));
+    try {
+      state.deps.storePath = path.join(storeDir, "jobs.json");
+
+      const page = await listPage(state, {
+        scheduleKind: "cron",
+        lastRunStatus: "unknown",
+        limit: 1,
+      });
+
+      expect(page.jobs.map((job) => job.id)).toEqual(["cron-unknown"]);
+      expect(page.total).toBe(1);
+      expect(page.hasMore).toBe(false);
+    } finally {
+      await fs.rm(storeDir, { recursive: true, force: true });
+    }
   });
 });

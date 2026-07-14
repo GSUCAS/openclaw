@@ -1,3 +1,4 @@
+// Mattermost tests cover config schema plugin behavior.
 import { describe, expect, it } from "vitest";
 import { MattermostConfigSchema } from "./config-schema-core.js";
 
@@ -29,6 +30,32 @@ describe("MattermostConfigSchema", () => {
     expect(result.success).toBe(true);
   });
 
+  it("accepts per-chat-type reply threading", () => {
+    const result = MattermostConfigSchema.safeParse({
+      replyToModeByChatType: {
+        direct: "first",
+        group: "all",
+        channel: "off",
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects dmPolicy="open" without wildcard allowFrom', () => {
+    const result = MattermostConfigSchema.safeParse({
+      dmPolicy: "open",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts dmPolicy="open" with wildcard allowFrom', () => {
+    const result = MattermostConfigSchema.safeParse({
+      dmPolicy: "open",
+      allowFrom: ["*"],
+    });
+    expect(result.success).toBe(true);
+  });
+
   it("accepts documented streaming modes and progress config", () => {
     const result = MattermostConfigSchema.safeParse({
       streaming: {
@@ -41,11 +68,20 @@ describe("MattermostConfigSchema", () => {
       },
       accounts: {
         quiet: {
-          streaming: "off",
+          streaming: { mode: "off" },
         },
       },
     });
     expect(result.success).toBe(true);
+  });
+
+  it("rejects retired scalar streaming and flat delivery keys", () => {
+    // Scalar/boolean streaming and the flat delivery keys are doctor-migrated
+    // legacy input; the runtime schema accepts the nested shape only.
+    expect(MattermostConfigSchema.safeParse({ streaming: "partial" }).success).toBe(false);
+    expect(MattermostConfigSchema.safeParse({ streaming: false }).success).toBe(false);
+    expect(MattermostConfigSchema.safeParse({ blockStreaming: true }).success).toBe(false);
+    expect(MattermostConfigSchema.safeParse({ chunkMode: "newline" }).success).toBe(false);
   });
 
   it("accepts groups with requireMention", () => {
@@ -90,10 +126,10 @@ describe("MattermostConfigSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects unsupported per-chat-type reply threading config", () => {
+  it("rejects unknown per-chat-type reply threading keys", () => {
     const result = MattermostConfigSchema.safeParse({
       replyToModeByChatType: {
-        direct: "all",
+        forum: "all",
       },
     });
     expect(result.success).toBe(false);

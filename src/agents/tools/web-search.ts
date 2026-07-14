@@ -1,9 +1,14 @@
+/**
+ * web_search built-in tool.
+ *
+ * Runs the configured runtime provider and returns normalized cached search results.
+ */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RuntimeWebSearchMetadata } from "../../secrets/runtime-web-tools.types.js";
-import { resolveWebSearchProviderId, runWebSearch } from "../../web-search/runtime.js";
+import { runWebSearch } from "../../web-search/runtime.js";
 import type { AnyAgentTool } from "./common.js";
 import { asToolParamsRecord, jsonResult } from "./common.js";
-import { MAX_SEARCH_COUNT, SEARCH_CACHE } from "./web-search-provider-common.js";
+import { MAX_SEARCH_COUNT } from "./web-search-provider-common.js";
 import { resolveWebSearchToolRuntimeContext } from "./web-tool-runtime-context.js";
 
 const WebSearchSchema = {
@@ -69,6 +74,7 @@ function isWebSearchDisabled(config?: OpenClawConfig): boolean {
   return Boolean(search && typeof search === "object" && search.enabled === false);
 }
 
+/** Creates the `web_search` tool, or `null` when web search is disabled by config. */
 export function createWebSearchTool(options?: {
   config?: OpenClawConfig;
   agentDir?: string;
@@ -83,9 +89,11 @@ export function createWebSearchTool(options?: {
   return {
     label: "Web Search",
     name: "web_search",
-    description: "Search web for current info; returns normalized provider results.",
+    description: "Search current web; normalized provider results.",
     parameters: WebSearchSchema,
     execute: async (_toolCallId, args, signal) => {
+      // Late binding lets long-lived agents pick up runtime web-search credentials/config without
+      // rebuilding the tool object.
       const { config, preferRuntimeProviders, runtimeWebSearch } =
         resolveWebSearchToolRuntimeContext({
           config: options?.config,
@@ -111,10 +119,3 @@ export function createWebSearchTool(options?: {
     },
   };
 }
-
-export const testing = {
-  SEARCH_CACHE,
-  resolveSearchProvider: (search?: Parameters<typeof resolveWebSearchProviderId>[0]["search"]) =>
-    resolveWebSearchProviderId({ search }),
-};
-export { testing as __testing };

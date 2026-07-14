@@ -1,21 +1,22 @@
+// Memory Core plugin module implements cli behavior.
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isUsageCountedSessionTranscriptFileName } from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
 import type { MemoryEmbeddingProbeResult } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
   resolveMemoryDreamingConfig,
+  resolveMemoryLightDreamingConfig,
   resolveMemoryRemDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
 import { buildAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import {
-  colorize,
   defaultRuntime,
   formatErrorMessage,
   getRuntimeConfig,
   getMemorySearchManager,
-  isRich,
   listMemoryFiles,
   normalizeExtraMemoryPaths,
   resolveCommandSecretRefsViaGateway,
@@ -49,6 +50,10 @@ import {
 } from "./dreaming-repair.js";
 import { asRecord } from "./dreaming-shared.js";
 import { resolveShortTermPromotionDreamingConfig } from "./dreaming.js";
+import type {
+  MemoryCoreAcquireLocalService,
+  MemoryCoreLocalServiceHost,
+} from "./memory/embedding-local-service.js";
 import { formatMemoryVectorDegradedWriteReason } from "./memory/manager-vector-warning.js";
 import { previewGroundedRemMarkdown } from "./rem-evidence.js";
 import { previewRemHarness } from "./rem-harness.js";
@@ -66,10 +71,78 @@ import {
   type ShortTermAuditSummary,
 } from "./short-term-promotion.js";
 
+const { accent, heading, info, muted, success, warn } = theme;
+
 type MemoryManager = NonNullable<Awaited<ReturnType<typeof getMemorySearchManager>>["manager"]>;
 type MemoryManagerPurpose = Parameters<typeof getMemorySearchManager>[0]["purpose"];
 
 type MemorySourceName = "memory" | "sessions";
+
+type LlamaCppRuntimeStatus = {
+  state?: string;
+  backend?: string;
+  buildType?: string;
+  deviceNames?: string[];
+  memory?: {
+    totalBytes: number;
+    usedBytes: number;
+    freeBytes: number;
+    unifiedBytes: number;
+    observedAtMs: number;
+  };
+  offload?: {
+    supported: boolean;
+    offloadedLayers?: number;
+    totalLayers?: number;
+  };
+  context?: {
+    requestedSize: number | "auto";
+  };
+  loadError?: string;
+};
+
+function readLlamaCppRuntimeStatus(
+  status: ReturnType<MemoryManager["status"]>,
+): LlamaCppRuntimeStatus | null {
+  const runtime = asRecord(asRecord(status.custom)?.llamaCppRuntime);
+  return runtime?.engine === "llama.cpp" ? (runtime as LlamaCppRuntimeStatus) : null;
+}
+
+function formatMemoryIndexIdentityWarning(
+  status: ReturnType<MemoryManager["status"]>,
+  agentId: string,
+): {
+  reason: string;
+  fix: string;
+} | null {
+  const indexIdentity = asRecord(asRecord(status.custom)?.indexIdentity);
+  const reason =
+    (indexIdentity?.status === "mismatched" || indexIdentity?.status === "missing") &&
+    typeof indexIdentity.reason === "string"
+      ? indexIdentity.reason
+      : undefined;
+  if (!reason) {
+    return null;
+  }
+  return {
+    reason,
+    fix: `Run: openclaw memory status --index --agent ${agentId}`,
+  };
+}
+
+function formatRuntimeBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
+}
 
 type SourceScan = {
   source: MemorySourceName;
@@ -116,7 +189,7 @@ function emitMemorySecretResolveDiagnostics(
   }
   const toStderr = params?.json === true;
   for (const entry of diagnostics) {
-    const message = theme.warn(`[secrets] ${entry}`);
+    const message = warn(`[secrets] ${entry}`);
     if (toStderr) {
       defaultRuntime.error(message);
     } else {
@@ -200,12 +273,23 @@ async function createHistoricalRemHarnessWorkspace(params: {
 
 function formatDreamingSummary(cfg: OpenClawConfig): string {
   const pluginConfig = resolveMemoryPluginConfig(cfg);
-  const dreaming = resolveShortTermPromotionDreamingConfig({ pluginConfig, cfg });
-  if (!dreaming.enabled) {
-    return "off";
-  }
-  const timezone = dreaming.timezone ? ` (${dreaming.timezone})` : "";
-  return `${dreaming.cron}${timezone} · limit=${dreaming.limit} · minScore=${dreaming.minScore} · minRecallCount=${dreaming.minRecallCount} · minUniqueQueries=${dreaming.minUniqueQueries} · recencyHalfLifeDays=${dreaming.recencyHalfLifeDays} · maxAgeDays=${dreaming.maxAgeDays ?? "none"}`;
+  const light = resolveMemoryLightDreamingConfig({ pluginConfig, cfg });
+  const deep = resolveShortTermPromotionDreamingConfig({ pluginConfig, cfg });
+  const rem = resolveMemoryRemDreamingConfig({ pluginConfig, cfg });
+  const timezone = deep.timezone ?? light.timezone ?? rem.timezone;
+  const formatCron = (cron: string) => (timezone ? `${cron} (${timezone})` : cron);
+  const lightSummary = light.enabled
+    ? `light=${formatCron(light.cron)} · limit=${light.limit} · lookbackDays=${light.lookbackDays}`
+    : null;
+  const remSummary = rem.enabled
+    ? `rem=${formatCron(rem.cron)} · limit=${rem.limit} · lookbackDays=${rem.lookbackDays} · minPatternStrength=${rem.minPatternStrength}`
+    : null;
+  const hasLighterPhase = light.enabled || rem.enabled;
+  const deepLabel = hasLighterPhase ? "deep=" : "";
+  const deepDetails = `${formatCron(deep.cron)} · limit=${deep.limit} · minScore=${deep.minScore} · minRecallCount=${deep.minRecallCount} · minUniqueQueries=${deep.minUniqueQueries} · recencyHalfLifeDays=${deep.recencyHalfLifeDays} · maxAgeDays=${deep.maxAgeDays ?? "none"} · maxPromotedSnippetTokens=${deep.maxPromotedSnippetTokens}`;
+  const deepSummary = deep.enabled ? `${deepLabel}${deepDetails}` : null;
+  const phases = [lightSummary, remSummary, deepSummary].filter(Boolean);
+  return phases.length > 0 ? phases.join(" · ") : "off";
 }
 
 function formatAuditCounts(audit: ShortTermAuditSummary): string {
@@ -234,9 +318,14 @@ function formatAuditCounts(audit: ShortTermAuditSummary): string {
 function formatRepairSummary(repair: RepairShortTermPromotionArtifactsResult): string {
   const actions: string[] = [];
   if (repair.rewroteStore) {
-    actions.push(
-      `rewrote store${repair.removedInvalidEntries > 0 ? ` (-${repair.removedInvalidEntries} invalid)` : ""}`,
-    );
+    const removedOverflowEntries = repair.removedOverflowEntries ?? 0;
+    const details = [
+      repair.removedInvalidEntries > 0 ? `-${repair.removedInvalidEntries} invalid` : null,
+      removedOverflowEntries > 0 ? `-${removedOverflowEntries} overflow` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    actions.push(`rewrote store${details ? ` (${details})` : ""}`);
   }
   if (repair.removedStaleLock) {
     actions.push("removed stale lock");
@@ -455,6 +544,7 @@ async function withMemoryManagerForAgent(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose?: MemoryManagerPurpose;
+  acquireLocalService?: MemoryCoreAcquireLocalService;
   run: (manager: MemoryManager) => Promise<void>;
 }): Promise<void> {
   const managerParams: Parameters<typeof getMemorySearchManager>[0] = {
@@ -463,6 +553,9 @@ async function withMemoryManagerForAgent(params: {
   };
   if (params.purpose) {
     managerParams.purpose = params.purpose;
+  }
+  if (params.acquireLocalService) {
+    managerParams.acquireLocalService = params.acquireLocalService;
   }
   await withManager<MemoryManager>({
     getManager: () => getMemorySearchManager(managerParams),
@@ -498,7 +591,7 @@ async function scanSessionFiles(agentId: string): Promise<SourceScan> {
   try {
     const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
     const totalFiles = entries.filter(
-      (entry) => entry.isFile() && entry.name.endsWith(".jsonl"),
+      (entry) => entry.isFile() && isUsageCountedSessionTranscriptFileName(entry.name),
     ).length;
     return { source: "sessions", totalFiles, issues };
   } catch (err) {
@@ -550,7 +643,7 @@ async function scanMemoryFiles(
     }
   }
 
-  let dirReadable: boolean | null = null;
+  let dirReadable: boolean | null;
   try {
     await fs.access(memoryDir, fsSync.constants.R_OK);
     dirReadable = true;
@@ -582,7 +675,7 @@ async function scanMemoryFiles(
     }
   }
 
-  let totalFiles: number | null = 0;
+  let totalFiles: number | null;
   if (dirReadable === null) {
     totalFiles = null;
   } else {
@@ -655,7 +748,10 @@ async function scanMemorySources(params: {
   return { sources: scans, totalFiles, issues };
 }
 
-export async function runMemoryStatus(opts: MemoryCommandOptions) {
+export async function runMemoryStatus(
+  opts: MemoryCommandOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
+) {
   setVerbose(Boolean(opts.verbose));
   const { config: cfg, diagnostics } = await loadMemoryCommandConfig("memory status");
   emitMemorySecretResolveDiagnostics(diagnostics, { json: Boolean(opts.json) });
@@ -678,6 +774,7 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
       cfg,
       agentId,
       purpose: managerPurpose,
+      acquireLocalService: hostOptions?.acquireLocalService,
       run: async (manager) => {
         const deep = Boolean(opts.deep || opts.index);
         let embeddingProbe: MemoryEmbeddingProbeResult | undefined;
@@ -803,13 +900,6 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
     return;
   }
 
-  const rich = isRich();
-  const heading = (text: string) => colorize(rich, theme.heading, text);
-  const muted = (text: string) => colorize(rich, theme.muted, text);
-  const info = (text: string) => colorize(rich, theme.info, text);
-  const success = (text: string) => colorize(rich, theme.success, text);
-  const warn = (text: string) => colorize(rich, theme.warn, text);
-  const accent = (text: string) => colorize(rich, theme.accent, text);
   const label = (text: string) => muted(`${text}:`);
 
   for (const result of allResults) {
@@ -856,12 +946,60 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
       `${label("Dreaming")} ${info(formatDreamingSummary(cfg))}`,
     ].filter(Boolean) as string[];
     if (embeddingProbe) {
-      const state = embeddingProbe.ok ? "ready" : "unavailable";
-      const stateColor = embeddingProbe.ok ? theme.success : theme.warn;
-      lines.push(`${label("Embeddings")} ${colorize(rich, stateColor, state)}`);
+      const state =
+        embeddingProbe.ok && embeddingProbe.checked === false
+          ? "skipped"
+          : embeddingProbe.ok
+            ? "ready"
+            : "unavailable";
+      const stateColor = state === "skipped" ? muted : embeddingProbe.ok ? success : warn;
+      lines.push(`${label("Embeddings")} ${stateColor(state)}`);
       if (embeddingProbe.error) {
         lines.push(`${label("Embeddings error")} ${warn(embeddingProbe.error)}`);
       }
+    }
+    const llamaCppRuntime = opts.deep ? readLlamaCppRuntimeStatus(status) : null;
+    if (llamaCppRuntime) {
+      const runtime = llamaCppRuntime;
+      const backend = runtime.backend ?? "unknown";
+      const build = runtime.buildType ? ` (${runtime.buildType})` : "";
+      lines.push(`${label("llama.cpp")} ${info(backend)}${muted(build)}`);
+      if (runtime.deviceNames?.length) {
+        lines.push(`${label("Devices")} ${info(runtime.deviceNames.join(", "))}`);
+      }
+      if (runtime.memory) {
+        const unified =
+          runtime.memory.unifiedBytes > 0
+            ? ` · ${formatRuntimeBytes(runtime.memory.unifiedBytes)} unified`
+            : "";
+        lines.push(
+          `${label("VRAM snapshot")} ${info(`${formatRuntimeBytes(runtime.memory.usedBytes)} used · ${formatRuntimeBytes(runtime.memory.freeBytes)} free · ${formatRuntimeBytes(runtime.memory.totalBytes)} total${unified}`)} ${muted(`(${new Date(runtime.memory.observedAtMs).toISOString()})`)}`,
+        );
+      }
+      if (runtime.offload) {
+        const layers =
+          typeof runtime.offload.offloadedLayers === "number" &&
+          typeof runtime.offload.totalLayers === "number"
+            ? `${runtime.offload.offloadedLayers}/${runtime.offload.totalLayers} layers`
+            : runtime.offload.supported
+              ? "supported"
+              : "unsupported";
+        lines.push(`${label("GPU offload")} ${info(layers)}`);
+      }
+      if (runtime.context) {
+        lines.push(
+          `${label("Requested context")} ${info(`${runtime.context.requestedSize} tokens`)}`,
+        );
+      }
+      if (runtime.loadError) {
+        lines.push(`${label("llama.cpp error")} ${warn(runtime.loadError)}`);
+      }
+    }
+    const identityWarning = formatMemoryIndexIdentityWarning(status, agentId);
+    if (identityWarning) {
+      lines.push(`${label("Index identity")} ${warn(identityWarning.reason)}`);
+      lines.push(`${label("Vector search")} ${warn("paused until memory is rebuilt")}`);
+      lines.push(`${label("Fix")} ${muted(identityWarning.fix)}`);
     }
     if (status.sourceCounts?.length) {
       lines.push(label("By source"));
@@ -889,9 +1027,8 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
               : "unavailable"
           : "disabled";
       const formatVectorLine = (lineLabel: string, state: string) => {
-        const vectorColor =
-          state === "ready" ? theme.success : state === "unavailable" ? theme.warn : theme.muted;
-        lines.push(`${label(lineLabel)} ${colorize(rich, vectorColor, state)}`);
+        const vectorColor = state === "ready" ? success : state === "unavailable" ? warn : muted;
+        lines.push(`${label(lineLabel)} ${vectorColor(state)}`);
       };
       if (status.backend === "builtin") {
         const storeState = formatVectorState(status.vector.storeAvailable);
@@ -921,36 +1058,29 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
           ? "ready"
           : "unavailable"
         : "disabled";
-      const ftsColor =
-        ftsState === "ready"
-          ? theme.success
-          : ftsState === "unavailable"
-            ? theme.warn
-            : theme.muted;
-      lines.push(`${label("FTS")} ${colorize(rich, ftsColor, ftsState)}`);
+      const ftsColor = ftsState === "ready" ? success : ftsState === "unavailable" ? warn : muted;
+      lines.push(`${label("FTS")} ${ftsColor(ftsState)}`);
       if (status.fts.error) {
         lines.push(`${label("FTS error")} ${warn(status.fts.error)}`);
       }
     }
     if (status.cache) {
       const cacheState = status.cache.enabled ? "enabled" : "disabled";
-      const cacheColor = status.cache.enabled ? theme.success : theme.muted;
+      const cacheColor = status.cache.enabled ? success : muted;
       const suffix =
         status.cache.enabled && typeof status.cache.entries === "number"
           ? ` (${status.cache.entries} entries)`
           : "";
-      lines.push(`${label("Embedding cache")} ${colorize(rich, cacheColor, cacheState)}${suffix}`);
+      lines.push(`${label("Embedding cache")} ${cacheColor(cacheState)}${suffix}`);
       if (status.cache.enabled && typeof status.cache.maxEntries === "number") {
         lines.push(`${label("Cache cap")} ${info(String(status.cache.maxEntries))}`);
       }
     }
     if (status.batch) {
       const batchState = status.batch.enabled ? "enabled" : "disabled";
-      const batchColor = status.batch.enabled ? theme.success : theme.warn;
+      const batchColor = status.batch.enabled ? success : warn;
       const batchSuffix = ` (failures ${status.batch.failures}/${status.batch.limit})`;
-      lines.push(
-        `${label("Batch")} ${colorize(rich, batchColor, batchState)}${muted(batchSuffix)}`,
-      );
+      lines.push(`${label("Batch")} ${batchColor(batchState)}${muted(batchSuffix)}`);
       if (status.batch.lastError) {
         lines.push(`${label("Batch error")} ${warn(status.batch.lastError)}`);
       }
@@ -1032,7 +1162,10 @@ export async function runMemoryStatus(opts: MemoryCommandOptions) {
   }
 }
 
-export async function runMemoryIndex(opts: MemoryCommandOptions) {
+export async function runMemoryIndex(
+  opts: MemoryCommandOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
+) {
   setVerbose(Boolean(opts.verbose));
   const { config: cfg, diagnostics } = await loadMemoryCommandConfig("memory index");
   emitMemorySecretResolveDiagnostics(diagnostics);
@@ -1042,16 +1175,12 @@ export async function runMemoryIndex(opts: MemoryCommandOptions) {
       cfg,
       agentId,
       purpose: "cli",
+      acquireLocalService: hostOptions?.acquireLocalService,
       run: async (manager) => {
         try {
           const syncFn = manager.sync ? manager.sync.bind(manager) : undefined;
           if (opts.verbose) {
             const status = manager.status();
-            const rich = isRich();
-            const heading = (text: string) => colorize(rich, theme.heading, text);
-            const muted = (text: string) => colorize(rich, theme.muted, text);
-            const info = (text: string) => colorize(rich, theme.info, text);
-            const warn = (text: string) => colorize(rich, theme.warn, text);
             const label = (text: string) => muted(`${text}:`);
             const sourceLabels = (status.sources ?? []).map((source) =>
               formatSourceLabel(source, status.workspaceDir ?? "", agentId),
@@ -1195,6 +1324,7 @@ export async function runMemoryIndex(opts: MemoryCommandOptions) {
 export async function runMemorySearch(
   queryArg: string | undefined,
   opts: MemorySearchCommandOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
 ) {
   const query = opts.query ?? queryArg;
   if (!query) {
@@ -1218,6 +1348,7 @@ export async function runMemorySearch(
     cfg,
     agentId,
     purpose: "cli",
+    acquireLocalService: hostOptions?.acquireLocalService,
     run: async (manager) => {
       const sessionKey = buildCliMemorySearchSessionKey(agentId);
       let results: Awaited<ReturnType<typeof manager.search>>;
@@ -1251,21 +1382,25 @@ export async function runMemorySearch(
         defaultRuntime.writeJson({ results });
         return;
       }
+      const identityWarning =
+        typeof manager.status === "function"
+          ? formatMemoryIndexIdentityWarning(manager.status(), agentId)
+          : null;
+      if (identityWarning) {
+        defaultRuntime.error(
+          `Memory index warning: ${identityWarning.reason}. Vector memory search is paused until the index is rebuilt. ${identityWarning.fix}`,
+        );
+      }
       if (results.length === 0) {
         defaultRuntime.log("No matches.");
         return;
       }
-      const rich = isRich();
       const lines: string[] = [];
       for (const result of results) {
         lines.push(
-          `${colorize(rich, theme.success, result.score.toFixed(3))} ${colorize(
-            rich,
-            theme.accent,
-            `${shortenHomePath(result.path)}:${result.startLine}-${result.endLine}`,
-          )}`,
+          `${success(result.score.toFixed(3))} ${accent(`${shortenHomePath(result.path)}:${result.startLine}-${result.endLine}`)}`,
         );
-        lines.push(colorize(rich, theme.muted, result.snippet));
+        lines.push(muted(result.snippet));
         lines.push("");
       }
       defaultRuntime.log(lines.join("\n").trim());
@@ -1273,7 +1408,10 @@ export async function runMemorySearch(
   });
 }
 
-export async function runMemoryPromote(opts: MemoryPromoteCommandOptions) {
+export async function runMemoryPromote(
+  opts: MemoryPromoteCommandOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
+) {
   const { config: cfg, diagnostics } = await loadMemoryCommandConfig("memory promote");
   emitMemorySecretResolveDiagnostics(diagnostics, { json: Boolean(opts.json) });
   const agentId = resolveAgent(cfg, opts.agent);
@@ -1282,6 +1420,7 @@ export async function runMemoryPromote(opts: MemoryPromoteCommandOptions) {
     cfg,
     agentId,
     purpose: "status",
+    acquireLocalService: hostOptions?.acquireLocalService,
     run: async (manager) => {
       const status = manager.status();
       const workspaceDir = status.workspaceDir?.trim();
@@ -1324,6 +1463,7 @@ export async function runMemoryPromote(opts: MemoryPromoteCommandOptions) {
             minRecallCount: opts.minRecallCount ?? dreaming.minRecallCount,
             minUniqueQueries: opts.minUniqueQueries ?? dreaming.minUniqueQueries,
             maxAgeDays: dreaming.maxAgeDays,
+            maxPromotedSnippetTokens: dreaming.maxPromotedSnippetTokens,
             timezone: dreaming.timezone,
           });
         } catch (err) {
@@ -1379,67 +1519,48 @@ export async function runMemoryPromote(opts: MemoryPromoteCommandOptions) {
         return;
       }
 
-      const rich = isRich();
       const lines: string[] = [];
-      lines.push(
-        `${colorize(rich, theme.heading, "Short-Term Promotion Candidates")} ${colorize(
-          rich,
-          theme.muted,
-          `(${agentId})`,
-        )}`,
-      );
-      lines.push(`${colorize(rich, theme.muted, "Recall store:")} ${shortenHomePath(storePath)}`);
-      lines.push(colorize(rich, theme.muted, `Store health: ${formatAuditCounts(audit)}`));
+      lines.push(`${heading("Short-Term Promotion Candidates")} ${muted(`(${agentId})`)}`);
+      lines.push(`${muted("Recall store:")} ${shortenHomePath(storePath)}`);
+      lines.push(muted(`Store health: ${formatAuditCounts(audit)}`));
       for (const candidate of candidates) {
         lines.push(
-          `${colorize(rich, theme.success, candidate.score.toFixed(3))} ${colorize(
-            rich,
-            theme.accent,
-            `${shortenHomePath(candidate.path)}:${candidate.startLine}-${candidate.endLine}`,
-          )}`,
+          `${success(candidate.score.toFixed(3))} ${accent(`${shortenHomePath(candidate.path)}:${candidate.startLine}-${candidate.endLine}`)}`,
         );
         lines.push(
-          colorize(
-            rich,
-            theme.muted,
-            `recalls=${candidate.recallCount} avg=${candidate.avgScore.toFixed(3)} queries=${candidate.uniqueQueries} age=${candidate.ageDays.toFixed(1)}d consolidate=${candidate.components.consolidation.toFixed(2)} conceptual=${candidate.components.conceptual.toFixed(2)}`,
+          muted(
+            `signals=${candidate.signalCount} recalls=${candidate.recallCount} avg=${candidate.avgScore.toFixed(3)} queries=${candidate.uniqueQueries} age=${candidate.ageDays.toFixed(1)}d consolidate=${candidate.components.consolidation.toFixed(2)} conceptual=${candidate.components.conceptual.toFixed(2)}`,
           ),
         );
         if (candidate.conceptTags.length > 0) {
-          lines.push(colorize(rich, theme.muted, `concepts=${candidate.conceptTags.join(", ")}`));
+          lines.push(muted(`concepts=${candidate.conceptTags.join(", ")}`));
         }
         if (candidate.snippet) {
-          lines.push(colorize(rich, theme.muted, candidate.snippet));
+          lines.push(muted(candidate.snippet));
         }
         lines.push("");
       }
       if (audit.issues.length > 0) {
-        lines.push(colorize(rich, theme.warn, "Audit issues:"));
+        lines.push(warn("Audit issues:"));
         for (const issue of audit.issues) {
-          lines.push(
-            colorize(rich, issue.severity === "error" ? theme.warn : theme.muted, issue.message),
-          );
+          lines.push((issue.severity === "error" ? warn : muted)(issue.message));
         }
         lines.push("");
       }
       if (applyResult) {
         if (applyResult.applied > 0) {
           lines.push(
-            colorize(
-              rich,
-              theme.success,
+            success(
               `Processed ${applyResult.applied} candidate(s) for ${shortenHomePath(applyResult.memoryPath)}.`,
             ),
           );
           lines.push(
-            colorize(
-              rich,
-              theme.muted,
+            muted(
               `appended=${applyResult.appended} reconciledExisting=${applyResult.reconciledExisting}`,
             ),
           );
         } else {
-          lines.push(colorize(rich, theme.warn, "No candidates met apply criteria."));
+          lines.push(warn("No candidates met apply criteria."));
         }
       }
       defaultRuntime.log(lines.join("\n").trim());
@@ -1450,6 +1571,7 @@ export async function runMemoryPromote(opts: MemoryPromoteCommandOptions) {
 export async function runMemoryPromoteExplain(
   selectorArg: string | undefined,
   opts: MemoryPromoteExplainOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
 ) {
   const selector = selectorArg?.trim();
   if (!selector) {
@@ -1466,6 +1588,7 @@ export async function runMemoryPromoteExplain(
     cfg,
     agentId,
     purpose: "status",
+    acquireLocalService: hostOptions?.acquireLocalService,
     run: async (manager) => {
       const status = manager.status();
       const workspaceDir = status.workspaceDir?.trim();
@@ -1517,7 +1640,8 @@ export async function runMemoryPromoteExplain(
           candidate,
           passes: {
             score: candidate.score >= thresholds.minScore,
-            recallCount: candidate.recallCount >= thresholds.minRecallCount,
+            // Engine gate is aggregate signalCount vs minRecallCount (config name unchanged).
+            recallCount: candidate.signalCount >= thresholds.minRecallCount,
             uniqueQueries: candidate.uniqueQueries >= thresholds.minUniqueQueries,
             maxAge:
               thresholds.maxAgeDays === null ? true : candidate.ageDays <= thresholds.maxAgeDays,
@@ -1526,45 +1650,35 @@ export async function runMemoryPromoteExplain(
         return;
       }
 
-      const rich = isRich();
       const lines = [
-        `${colorize(rich, theme.heading, "Promotion Explain")} ${colorize(
-          rich,
-          theme.muted,
-          "(" + agentId + ")",
-        )}`,
-        colorize(rich, theme.accent, candidate.key),
-        colorize(
-          rich,
-          theme.muted,
+        `${heading("Promotion Explain")} ${muted("(" + agentId + ")")}`,
+        accent(candidate.key),
+        muted(
           `${shortenHomePath(candidate.path)}:${String(candidate.startLine)}-${String(candidate.endLine)}`,
         ),
         candidate.snippet,
-        colorize(
-          rich,
-          theme.muted,
-          `score=${candidate.score.toFixed(3)} recallCount=${candidate.recallCount} uniqueQueries=${candidate.uniqueQueries} ageDays=${candidate.ageDays.toFixed(1)}`,
+        muted(
+          `score=${candidate.score.toFixed(3)} signals=${candidate.signalCount} recalls=${candidate.recallCount} uniqueQueries=${candidate.uniqueQueries} ageDays=${candidate.ageDays.toFixed(1)}`,
         ),
-        colorize(
-          rich,
-          theme.muted,
+        muted(
           `components: frequency=${candidate.components.frequency.toFixed(2)} relevance=${candidate.components.relevance.toFixed(2)} diversity=${candidate.components.diversity.toFixed(2)} recency=${candidate.components.recency.toFixed(2)} consolidation=${candidate.components.consolidation.toFixed(2)} conceptual=${candidate.components.conceptual.toFixed(2)}`,
         ),
-        colorize(
-          rich,
-          theme.muted,
+        muted(
           `thresholds: minScore=${thresholds.minScore} minRecallCount=${thresholds.minRecallCount} minUniqueQueries=${thresholds.minUniqueQueries} maxAgeDays=${thresholds.maxAgeDays ?? "none"}`,
         ),
       ];
       if (candidate.conceptTags.length > 0) {
-        lines.push(colorize(rich, theme.muted, `concepts=${candidate.conceptTags.join(", ")}`));
+        lines.push(muted(`concepts=${candidate.conceptTags.join(", ")}`));
       }
       defaultRuntime.log(lines.join("\n"));
     },
   });
 }
 
-export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
+export async function runMemoryRemHarness(
+  opts: MemoryRemHarnessOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
+) {
   const { config: cfg, diagnostics } = await loadMemoryCommandConfig("memory rem-harness");
   emitMemorySecretResolveDiagnostics(diagnostics, { json: Boolean(opts.json) });
   const agentId = resolveAgent(cfg, opts.agent);
@@ -1573,6 +1687,7 @@ export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
     cfg,
     agentId,
     purpose: "status",
+    acquireLocalService: hostOptions?.acquireLocalService,
     run: async (manager) => {
       const status = manager.status();
       const managerWorkspaceDir = status.workspaceDir?.trim();
@@ -1656,6 +1771,7 @@ export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
               minUniqueQueries: preview.deepConfig.minUniqueQueries,
               recencyHalfLifeDays: preview.deepConfig.recencyHalfLifeDays,
               maxAgeDays: preview.deepConfig.maxAgeDays ?? null,
+              maxPromotedSnippetTokens: preview.deepConfig.maxPromotedSnippetTokens,
             },
             rem: { skipped: preview.remSkipped, ...remPreview },
             grounded: groundedPreview,
@@ -1667,27 +1783,18 @@ export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
           return;
         }
 
-        const rich = isRich();
         const lines = [
-          `${colorize(rich, theme.heading, "REM Harness")} ${colorize(rich, theme.muted, `(${agentId})`)}`,
-          colorize(rich, theme.muted, `workspace=${shortenHomePath(workspaceDir)}`),
+          `${heading("REM Harness")} ${muted(`(${agentId})`)}`,
+          muted(`workspace=${shortenHomePath(workspaceDir)}`),
           ...(opts.path
             ? [
-                colorize(
-                  rich,
-                  theme.muted,
-                  `sourcePath=${shortenHomePath(path.resolve(opts.path))}`,
-                ),
-                colorize(
-                  rich,
-                  theme.muted,
+                muted(`sourcePath=${shortenHomePath(path.resolve(opts.path))}`),
+                muted(
                   `historicalFiles=${sourceFiles.length} importedFiles=${importedFileCount} importedSignals=${importedSignalCount}`,
                 ),
                 ...(skippedPaths.length > 0
                   ? [
-                      colorize(
-                        rich,
-                        theme.warn,
+                      warn(
                         `skipped=${skippedPaths.map((entry) => shortenHomePath(entry)).join(", ")}`,
                       ),
                     ]
@@ -1696,34 +1803,30 @@ export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
             : []),
           ...(opts.grounded
             ? [
-                colorize(
-                  rich,
-                  theme.muted,
+                muted(
                   `groundedInputs=${groundedInputPaths.length > 0 ? groundedInputPaths.map((entry) => shortenHomePath(entry)).join(", ") : "none"}`,
                 ),
               ]
             : []),
-          colorize(
-            rich,
-            theme.muted,
+          muted(
             `recentRecallEntries=${preview.recallEntryCount} deepCandidates=${deepCandidates.length}`,
           ),
           "",
-          colorize(rich, theme.heading, "REM Preview"),
+          heading("REM Preview"),
           ...remPreview.bodyLines,
           ...(groundedPreview
             ? [
                 "",
-                colorize(rich, theme.heading, "Grounded REM"),
+                heading("Grounded REM"),
                 ...groundedPreview.files.flatMap((file) => [
-                  colorize(rich, theme.muted, file.path),
+                  muted(file.path),
                   file.renderedMarkdown,
                   "",
                 ]),
               ]
             : []),
           "",
-          colorize(rich, theme.heading, "Deep Candidates"),
+          heading("Deep Candidates"),
           ...(deepCandidates.length > 0
             ? deepCandidates
                 .slice(0, 10)
@@ -1743,7 +1846,10 @@ export async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
   });
 }
 
-export async function runMemoryRemBackfill(opts: MemoryRemBackfillOptions) {
+export async function runMemoryRemBackfill(
+  opts: MemoryRemBackfillOptions,
+  hostOptions?: MemoryCoreLocalServiceHost,
+) {
   const { config: cfg, diagnostics } = await loadMemoryCommandConfig("memory rem-backfill");
   emitMemorySecretResolveDiagnostics(diagnostics, { json: Boolean(opts.json) });
   const agentId = resolveAgent(cfg, opts.agent);
@@ -1752,6 +1858,7 @@ export async function runMemoryRemBackfill(opts: MemoryRemBackfillOptions) {
     cfg,
     agentId,
     purpose: "status",
+    acquireLocalService: hostOptions?.acquireLocalService,
     run: async (manager) => {
       const status = manager.status();
       const workspaceDir = status.workspaceDir?.trim();
@@ -1795,30 +1902,18 @@ export async function runMemoryRemBackfill(opts: MemoryRemBackfillOptions) {
         }
         defaultRuntime.log(
           [
-            `${colorize(isRich(), theme.heading, "REM Backfill")} ${colorize(isRich(), theme.muted, "(rollback)")}`,
-            colorize(isRich(), theme.muted, `workspace=${shortenHomePath(workspaceDir)}`),
+            `${heading("REM Backfill")} ${muted("(rollback)")}`,
+            muted(`workspace=${shortenHomePath(workspaceDir)}`),
             ...(diaryRollback
               ? [
-                  colorize(
-                    isRich(),
-                    theme.muted,
-                    `dreamsPath=${shortenHomePath(diaryRollback.dreamsPath)}`,
-                  ),
-                  colorize(isRich(), theme.muted, `removedEntries=${diaryRollback.removed}`),
+                  muted(`dreamsPath=${shortenHomePath(diaryRollback.dreamsPath)}`),
+                  muted(`removedEntries=${diaryRollback.removed}`),
                 ]
               : []),
             ...(shortTermRollback
               ? [
-                  colorize(
-                    isRich(),
-                    theme.muted,
-                    `shortTermStorePath=${shortenHomePath(shortTermRollback.storePath)}`,
-                  ),
-                  colorize(
-                    isRich(),
-                    theme.muted,
-                    `removedShortTermEntries=${shortTermRollback.removed}`,
-                  ),
+                  muted(`shortTermStorePath=${shortenHomePath(shortTermRollback.storePath)}`),
+                  muted(`removedShortTermEntries=${shortTermRollback.removed}`),
                 ]
               : []),
           ].join("\n"),
@@ -1924,27 +2019,22 @@ export async function runMemoryRemBackfill(opts: MemoryRemBackfillOptions) {
           return;
         }
 
-        const rich = isRich();
         defaultRuntime.log(
           [
-            `${colorize(rich, theme.heading, "REM Backfill")} ${colorize(rich, theme.muted, `(${agentId})`)}`,
-            colorize(rich, theme.muted, `workspace=${shortenHomePath(workspaceDir)}`),
-            colorize(rich, theme.muted, `sourcePath=${shortenHomePath(path.resolve(opts.path))}`),
-            colorize(
-              rich,
-              theme.muted,
+            `${heading("REM Backfill")} ${muted(`(${agentId})`)}`,
+            muted(`workspace=${shortenHomePath(workspaceDir)}`),
+            muted(`sourcePath=${shortenHomePath(path.resolve(opts.path))}`),
+            muted(
               `historicalFiles=${sourceFiles.length} writtenEntries=${written.written} replacedEntries=${written.replaced}`,
             ),
             ...(opts.stageShortTerm
               ? [
-                  colorize(
-                    rich,
-                    theme.muted,
+                  muted(
                     `stagedShortTermEntries=${stagedShortTermEntries} replacedShortTermEntries=${replacedShortTermEntries}`,
                   ),
                 ]
               : []),
-            colorize(rich, theme.muted, `dreamsPath=${shortenHomePath(written.dreamsPath)}`),
+            muted(`dreamsPath=${shortenHomePath(written.dreamsPath)}`),
           ].join("\n"),
         );
       } finally {

@@ -1,31 +1,23 @@
-import { spawn } from "node:child_process";
+// File Transfer plugin module implements dir fetch tool behavior.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  callGatewayTool,
-  listNodes,
-  resolveNodeIdFromList,
-  type AnyAgentTool,
-  type NodeListNode,
-} from "openclaw/plugin-sdk/agent-harness-runtime";
+import { StringDecoder } from "node:string_decoder";
+import type { AnyAgentTool } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
+import { runCommandWithTimeout } from "openclaw/plugin-sdk/process-runtime";
+import { projectBoundedTextTail } from "../shared/append-bounded-text-tail.js";
 import { appendFileTransferAudit } from "../shared/audit.js";
-import { throwFromNodePayload } from "../shared/errors.js";
 import { IMAGE_MIME_INLINE_SET, mimeFromExtension } from "../shared/mime.js";
-import {
-  humanSize,
-  readBoolean,
-  readClampedInt,
-  readGatewayCallOptions,
-  readTrimmedString,
-} from "../shared/params.js";
+import { humanSize, readBoolean, readClampedInt } from "../shared/params.js";
 import {
   DIR_FETCH_DEFAULT_MAX_BYTES,
   DIR_FETCH_HARD_MAX_BYTES,
   DIR_FETCH_TOOL_DESCRIPTOR,
   FILE_TRANSFER_SUBDIR,
 } from "./descriptors.js";
+import { invokeNodeToolPayload, readRequiredNodePath } from "./node-tool-invoke.js";
 
 // Cap how many local file paths we surface in details.media.mediaUrls.
 // Larger trees still land on disk but we don't spam the channel adapter
@@ -40,6 +32,10 @@ const TAR_UNPACK_TIMEOUT_MS = 60_000;
 // tree to compute hashes — TAR_UNPACK_MAX_ENTRIES bounds how much work
 // that walk can do.
 const TAR_UNPACK_MAX_ENTRIES = 5000;
+const TAR_LIST_OUTPUT_MAX_CHARS = 32 * 1024 * 1024;
+const TAR_STDERR_TAIL_CHARS = 4096;
+const TAR_ERROR_REASON_STDERR_CHARS = 200;
+const TAR_UNPACK_ERROR_STDERR_CHARS = 300;
 
 // Hard caps on uncompressed extraction. Defends against decompression-bomb
 // archives that compress to <16MB but expand to gigabytes. Both caps are
@@ -47,6 +43,78 @@ const TAR_UNPACK_MAX_ENTRIES = 5000;
 // and per-file size to bound any single fs.stat / hash operation.
 const DIR_FETCH_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
 const DIR_FETCH_MAX_SINGLE_FILE_BYTES = 16 * 1024 * 1024;
+
+async function listTarOutputLines<T>(input: {
+  args: string[];
+  label: string;
+  tarBuffer: Buffer;
+  mapLine: (line: string) => T;
+  maxValues: number;
+}): Promise<{ ok: true; values: T[] } | { ok: false; reason: string }> {
+  const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
+  const decoder = new StringDecoder("utf8");
+  const values: T[] = [];
+  let pending = "";
+  let outputBytes = 0;
+  let outputTooLarge = false;
+  let valueLimitReached = false;
+  const appendLine = (line: string): boolean => {
+    if (!line) {
+      return true;
+    }
+    values.push(input.mapLine(line));
+    valueLimitReached = values.length >= input.maxValues;
+    return !valueLimitReached;
+  };
+  let result: Awaited<ReturnType<typeof runCommandWithTimeout>>;
+  try {
+    result = await runCommandWithTimeout([tarBin, ...input.args], {
+      input: input.tarBuffer,
+      maxOutputBytes: { stderr: TAR_STDERR_TAIL_CHARS },
+      onOutputChunk: (chunk, stream) => {
+        if (stream !== "stdout") {
+          return true;
+        }
+        outputBytes += chunk.byteLength;
+        if (outputBytes > TAR_LIST_OUTPUT_MAX_CHARS) {
+          outputTooLarge = true;
+          return false;
+        }
+        const lines = `${pending}${decoder.write(chunk)}`.split("\n");
+        pending = lines.pop() ?? "";
+        return lines.every(appendLine);
+      },
+      outputCapture: { stdout: "discard", stderr: "tail" },
+      tolerateOutputError: { stderr: true },
+      timeoutMs: 30_000,
+    });
+  } catch (error) {
+    return { ok: false, reason: `${input.label} error: ${formatErrorMessage(error)}` };
+  }
+  if (result.termination === "timeout") {
+    return { ok: false, reason: `${input.label} timed out` };
+  }
+  if (valueLimitReached) {
+    return { ok: true, values };
+  }
+  if (outputTooLarge) {
+    return { ok: false, reason: `${input.label} output too large` };
+  }
+  if (result.termination !== "exit") {
+    return {
+      ok: false,
+      reason: `${input.label} error: ${result.termination}`,
+    };
+  }
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      reason: `${input.label} exited ${result.code}: ${projectBoundedTextTail(result.stderr, TAR_ERROR_REASON_STDERR_CHARS)}`,
+    };
+  }
+  appendLine(pending + decoder.end());
+  return { ok: true, values };
+}
 
 async function computeFileSha256(filePath: string): Promise<string> {
   // Stream the hash so we never pull a whole large file into memory.
@@ -90,122 +158,27 @@ async function computeFileSha256(filePath: string): Promise<string> {
 async function listTarPaths(
   tarBuffer: Buffer,
 ): Promise<{ ok: true; paths: string[] } | { ok: false; reason: string }> {
-  return new Promise((resolve) => {
-    const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
-    const child = spawn(tarBin, ["-tzf", "-"], { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let aborted = false;
-    const watchdog = setTimeout(() => {
-      aborted = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
-      resolve({ ok: false, reason: "tar -tzf timed out" });
-    }, 30_000);
-    child.stdout.on("data", (c: Buffer) => {
-      stdout += c.toString();
-      if (stdout.length > 32 * 1024 * 1024) {
-        aborted = true;
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* gone */
-        }
-        clearTimeout(watchdog);
-        resolve({ ok: false, reason: "tar -tzf output too large" });
-      }
-    });
-    child.stderr.on("data", (c: Buffer) => {
-      stderr += c.toString();
-    });
-    child.on("close", (code) => {
-      clearTimeout(watchdog);
-      if (aborted) {
-        return;
-      }
-      if (code !== 0) {
-        resolve({ ok: false, reason: `tar -tzf exited ${code}: ${stderr.slice(0, 200)}` });
-        return;
-      }
-      // tar -tf emits one path per line with literal newlines as record
-      // separators. Filenames containing newlines are exotic enough that
-      // refusing them is safer than trying to parse around them.
-      const paths = stdout.split("\n").filter((l) => l.length > 0);
-      resolve({ ok: true, paths });
-    });
-    child.on("error", (e) => {
-      clearTimeout(watchdog);
-      if (!aborted) {
-        resolve({ ok: false, reason: `tar -tzf error: ${String(e)}` });
-      }
-    });
-    child.stdin.end(tarBuffer);
+  const result = await listTarOutputLines({
+    args: ["-tzf", "-"],
+    label: "tar -tzf",
+    tarBuffer,
+    mapLine: (line) => line,
+    maxValues: TAR_UNPACK_MAX_ENTRIES + 1,
   });
+  return result.ok ? { ok: true, paths: result.values } : result;
 }
 
 async function listTarTypeChars(
   tarBuffer: Buffer,
 ): Promise<{ ok: true; typeChars: string[] } | { ok: false; reason: string }> {
-  return new Promise((resolve) => {
-    const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
-    const child = spawn(tarBin, ["-tzvf", "-"], { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let aborted = false;
-    const watchdog = setTimeout(() => {
-      aborted = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
-      resolve({ ok: false, reason: "tar -tzvf timed out" });
-    }, 30_000);
-    child.stdout.on("data", (c: Buffer) => {
-      stdout += c.toString();
-      if (stdout.length > 32 * 1024 * 1024) {
-        aborted = true;
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* gone */
-        }
-        clearTimeout(watchdog);
-        resolve({ ok: false, reason: "tar -tzvf output too large" });
-      }
-    });
-    child.stderr.on("data", (c: Buffer) => {
-      stderr += c.toString();
-    });
-    child.on("close", (code) => {
-      clearTimeout(watchdog);
-      if (aborted) {
-        return;
-      }
-      if (code !== 0) {
-        resolve({ ok: false, reason: `tar -tzvf exited ${code}: ${stderr.slice(0, 200)}` });
-        return;
-      }
-      // Take only the first character of each line — the entry type.
-      // We don't touch the rest of the line (path/size/etc) so filenames
-      // with whitespace can't shift our parser.
-      const typeChars = stdout
-        .split("\n")
-        .filter((l) => l.length > 0)
-        .map((l) => l.charAt(0));
-      resolve({ ok: true, typeChars });
-    });
-    child.on("error", (e) => {
-      clearTimeout(watchdog);
-      if (!aborted) {
-        resolve({ ok: false, reason: `tar -tzvf error: ${String(e)}` });
-      }
-    });
-    child.stdin.end(tarBuffer);
+  const result = await listTarOutputLines({
+    args: ["-tzvf", "-"],
+    label: "tar -tzvf",
+    tarBuffer,
+    mapLine: (line) => line.charAt(0),
+    maxValues: TAR_UNPACK_MAX_ENTRIES + 1,
   });
+  return result.ok ? { ok: true, typeChars: result.values } : result;
 }
 
 async function preValidateTarball(
@@ -238,9 +211,14 @@ async function preValidateTarball(
     };
   }
 
-  for (let i = 0; i < paths.length; i++) {
-    const entryPath = paths[i];
-    const t = typeChars[i];
+  for (const [index, entryPath] of paths.entries()) {
+    const t = typeChars.at(index);
+    if (t === undefined) {
+      return {
+        ok: false,
+        reason: `tar -tzf and tar -tzvf disagree on entry count (${paths.length} vs ${typeChars.length}); refusing`,
+      };
+    }
     if (t === "l" || t === "h") {
       return { ok: false, reason: `archive contains link entry: ${entryPath}` };
     }
@@ -263,84 +241,55 @@ async function preValidateTarball(
   return { ok: true };
 }
 
-export async function validateTarUncompressedBudget(
+async function validateTarUncompressedBudget(
   tarBuffer: Buffer,
   maxBytes = DIR_FETCH_MAX_UNCOMPRESSED_BYTES,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  return new Promise((resolve) => {
-    const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
-    const child = spawn(tarBin, ["-xOzf", "-"], { stdio: ["pipe", "pipe", "pipe"] });
-    let totalBytes = 0;
-    let stderr = "";
-    let settled = false;
-    let watchdog: ReturnType<typeof setTimeout>;
-    const finish = (result: { ok: true } | { ok: false; reason: string }): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(watchdog);
-      resolve(result);
-    };
-    watchdog = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
-      finish({ ok: false, reason: "tar uncompressed budget validation timed out" });
-    }, TAR_UNPACK_TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      totalBytes += chunk.byteLength;
-      if (totalBytes > maxBytes) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* gone */
+  const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
+  let totalBytes = 0;
+  let budgetExceeded = false;
+  let result: Awaited<ReturnType<typeof runCommandWithTimeout>>;
+  try {
+    result = await runCommandWithTimeout([tarBin, "-xOzf", "-"], {
+      input: tarBuffer,
+      maxOutputBytes: { stderr: TAR_STDERR_TAIL_CHARS },
+      onOutputChunk: (chunk, stream) => {
+        if (stream !== "stdout") {
+          return true;
         }
-        finish({
-          ok: false,
-          reason: `archive expands past uncompressed budget ${maxBytes} bytes`,
-        });
-      }
+        totalBytes += chunk.byteLength;
+        budgetExceeded = totalBytes > maxBytes;
+        return !budgetExceeded;
+      },
+      outputCapture: { stdout: "discard", stderr: "tail" },
+      tolerateOutputError: { stderr: true },
+      timeoutMs: TAR_UNPACK_TIMEOUT_MS,
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-      if (stderr.length > 4096) {
-        stderr = stderr.slice(-4096);
-      }
-    });
-    child.on("close", (code) => {
-      if (settled) {
-        return;
-      }
-      if (code !== 0) {
-        finish({
-          ok: false,
-          reason: `tar uncompressed budget validation exited ${code}: ${stderr.slice(0, 200)}`,
-        });
-        return;
-      }
-      finish({ ok: true });
-    });
-    child.on("error", (error) => {
-      finish({
-        ok: false,
-        reason: `tar uncompressed budget validation error: ${String(error)}`,
-      });
-    });
-    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-      if (settled && error.code === "EPIPE") {
-        return;
-      }
-      finish({
-        ok: false,
-        reason: `tar uncompressed budget validation input error: ${String(error)}`,
-      });
-    });
-    child.stdin.end(tarBuffer);
-  });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `tar uncompressed budget validation error: ${formatErrorMessage(error)}`,
+    };
+  }
+  if (result.termination === "timeout") {
+    return { ok: false, reason: "tar uncompressed budget validation timed out" };
+  }
+  if (budgetExceeded) {
+    return { ok: false, reason: `archive expands past uncompressed budget ${maxBytes} bytes` };
+  }
+  if (result.termination !== "exit") {
+    return {
+      ok: false,
+      reason: `tar uncompressed budget validation error: ${result.termination}`,
+    };
+  }
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      reason: `tar uncompressed budget validation exited ${result.code}: ${projectBoundedTextTail(result.stderr, TAR_ERROR_REASON_STDERR_CHARS)}`,
+    };
+  }
+  return { ok: true };
 }
 
 type UnpackedFileEntry = {
@@ -376,41 +325,28 @@ type UnpackedFileEntry = {
  */
 async function unpackTar(tarBuffer: Buffer, destDir: string): Promise<void> {
   await fs.mkdir(destDir, { recursive: true, mode: 0o700 });
-  return new Promise((resolve, reject) => {
-    const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
-    const child = spawn(
-      tarBin,
-      ["-xzf", "-", "-C", destDir, "--no-same-owner", "--no-same-permissions"],
-      {
-        stdio: ["pipe", "ignore", "pipe"],
-      },
+  const tarBin = process.platform !== "win32" ? "/usr/bin/tar" : "tar";
+  const result = await runCommandWithTimeout(
+    [tarBin, "-xzf", "-", "-C", destDir, "--no-same-owner", "--no-same-permissions"],
+    {
+      input: tarBuffer,
+      maxOutputBytes: { stderr: TAR_STDERR_TAIL_CHARS },
+      outputCapture: { stdout: "discard", stderr: "tail" },
+      tolerateOutputError: { stderr: true },
+      timeoutMs: TAR_UNPACK_TIMEOUT_MS,
+    },
+  );
+  if (result.termination === "timeout") {
+    throw new Error(`tar unpack timed out after ${TAR_UNPACK_TIMEOUT_MS}ms`);
+  }
+  if (result.termination !== "exit") {
+    throw new Error(`tar unpack failed: ${result.termination}`);
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `tar unpack exited ${result.code}: ${projectBoundedTextTail(result.stderr, TAR_UNPACK_ERROR_STDERR_CHARS)}`,
     );
-    let stderrOut = "";
-    const watchdog = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-      reject(new Error(`tar unpack timed out after ${TAR_UNPACK_TIMEOUT_MS}ms`));
-    }, TAR_UNPACK_TIMEOUT_MS);
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrOut += chunk.toString();
-    });
-    child.on("close", (code) => {
-      clearTimeout(watchdog);
-      if (code !== 0) {
-        reject(new Error(`tar unpack exited ${code}: ${stderrOut.slice(0, 300)}`));
-        return;
-      }
-      resolve();
-    });
-    child.on("error", (e) => {
-      clearTimeout(watchdog);
-      reject(e);
-    });
-    child.stdin.end(tarBuffer);
-  });
+  }
 }
 
 /**
@@ -443,14 +379,7 @@ export function createDirFetchTool(): AnyAgentTool {
     ...DIR_FETCH_TOOL_DESCRIPTOR,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
-      const node = readTrimmedString(params, "node");
-      const dirPath = readTrimmedString(params, "path");
-      if (!node) {
-        throw new Error("node required");
-      }
-      if (!dirPath) {
-        throw new Error("path required");
-      }
+      const { node, requestedPath: dirPath } = readRequiredNodePath(params);
 
       const maxBytes = readClampedInt({
         input: params,
@@ -461,55 +390,17 @@ export function createDirFetchTool(): AnyAgentTool {
       });
       const includeDotfiles = readBoolean(params, "includeDotfiles", false);
 
-      const gatewayOpts = readGatewayCallOptions(params);
-      const nodes: NodeListNode[] = await listNodes(gatewayOpts);
-      const nodeId = resolveNodeIdFromList(nodes, node, false);
-      const nodeMeta = nodes.find((n) => n.nodeId === nodeId);
-      const nodeDisplayName = nodeMeta?.displayName ?? node;
-      const startedAt = Date.now();
-
-      const raw = await callGatewayTool<{ payload: unknown }>("node.invoke", gatewayOpts, {
-        nodeId,
+      const { nodeId, nodeDisplayName, payload, startedAt } = await invokeNodeToolPayload({
+        node,
+        params,
         command: "dir.fetch",
-        params: {
+        commandParams: {
           path: dirPath,
           maxBytes,
           includeDotfiles,
         },
-        idempotencyKey: crypto.randomUUID(),
+        requestedPath: dirPath,
       });
-
-      const payload =
-        raw?.payload && typeof raw.payload === "object" && !Array.isArray(raw.payload)
-          ? (raw.payload as Record<string, unknown>)
-          : null;
-      if (!payload) {
-        await appendFileTransferAudit({
-          op: "dir.fetch",
-          nodeId,
-          nodeDisplayName,
-          requestedPath: dirPath,
-          decision: "error",
-          errorMessage: "invalid payload",
-          durationMs: Date.now() - startedAt,
-        });
-        throw new Error("invalid dir.fetch payload");
-      }
-      if (payload.ok === false) {
-        await appendFileTransferAudit({
-          op: "dir.fetch",
-          nodeId,
-          nodeDisplayName,
-          requestedPath: dirPath,
-          canonicalPath:
-            typeof payload.canonicalPath === "string" ? payload.canonicalPath : undefined,
-          decision: "error",
-          errorCode: typeof payload.code === "string" ? payload.code : undefined,
-          errorMessage: typeof payload.message === "string" ? payload.message : undefined,
-          durationMs: Date.now() - startedAt,
-        });
-        throwFromNodePayload("dir.fetch", payload);
-      }
 
       const canonicalPath = typeof payload.path === "string" ? payload.path : "";
       const tarBase64 = typeof payload.tarBase64 === "string" ? payload.tarBase64 : "";
@@ -613,7 +504,7 @@ export function createDirFetchTool(): AnyAgentTool {
         throw new Error(`dir.fetch UNCOMPRESSED_TOO_LARGE: ${reason}`);
       };
       for (const { relPath, absPath } of walked) {
-        let size = 0;
+        let size;
         try {
           const st = await fs.stat(absPath);
           size = st.size;
@@ -677,3 +568,9 @@ export function createDirFetchTool(): AnyAgentTool {
     },
   };
 }
+
+export const testing = {
+  preValidateTarball,
+  unpackTar,
+  validateTarUncompressedBudget,
+};

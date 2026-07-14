@@ -1,17 +1,35 @@
+// Startup config secret tests protect gateway token preparation, weak-secret
+// detection, auth profile loading, warning emission, and runtime activation.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { loadAuthProfileStoreWithoutExternalProfiles } from "../agents/auth-profiles.js";
+import {
+  getRuntimeAuthProfileStoreCredentialsRevision,
+  getRuntimeAuthProfileStoreSnapshot,
+  setRuntimeAuthProfileStoreSnapshot,
+} from "../agents/auth-profiles/runtime-snapshots.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.js";
 import { measureDiagnosticsTimelineSpan } from "../infra/diagnostics-timeline.js";
+import {
+  activateSecretsRuntimeSnapshotState,
+  clearSecretsRuntimeSnapshot,
+  getActiveSecretsRuntimeSnapshot,
+  getActiveSecretsRuntimeSnapshotRevision,
+} from "../secrets/runtime-state.js";
 import type { PreparedSecretsRuntimeSnapshot, SecretResolverWarning } from "../secrets/runtime.js";
-import { KNOWN_WEAK_GATEWAY_TOKEN_PLACEHOLDERS } from "./known-weak-gateway-secrets.js";
 import {
   createRuntimeSecretsActivator,
   prepareGatewayStartupConfig,
 } from "./server-startup-config.js";
 import { buildTestConfigSnapshot } from "./test-helpers.config-snapshots.js";
+
+const KNOWN_WEAK_GATEWAY_TOKEN_PLACEHOLDERS = [
+  "change-me-to-a-long-random-token",
+  "change-me-now",
+] as const;
 
 type PrepareRuntimeSecretsSnapshotForTest =
   typeof import("../secrets/runtime.js").prepareSecretsRuntimeSnapshot;
@@ -23,6 +41,27 @@ type GatewayStartupSecretsRuntimeMock = {
   prepareRuntimeSecretsSnapshot: PrepareRuntimeSecretsSnapshotForTest;
   activateRuntimeSecretsSnapshot: ActivateRuntimeSecretsSnapshotForTest;
 };
+
+type GatewayStartupLogMock = {
+  info: ReturnType<typeof vi.fn<(message: string) => void>>;
+  warn: ReturnType<typeof vi.fn<(message: string) => void>>;
+  error: ReturnType<typeof vi.fn<(message: string) => void>>;
+};
+
+type GatewayStartupStateEmitterMock = ReturnType<
+  typeof vi.fn<(code: string, message: string, cfg: OpenClawConfig) => void>
+>;
+
+const RESOLVED_GATEWAY_TOKEN = "resolved-gateway-token";
+const autoCleanupTempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+function activateSecretsRuntimeSnapshotForTest(snapshot: PreparedSecretsRuntimeSnapshot): void {
+  activateSecretsRuntimeSnapshotState({
+    snapshot,
+    refreshContext: null,
+    refreshHandler: null,
+  });
+}
 
 function gatewayTokenConfig(config: OpenClawConfig): OpenClawConfig {
   return {
@@ -61,6 +100,7 @@ function preparedSnapshot(config: OpenClawConfig): PreparedSecretsRuntimeSnapsho
     sourceConfig: config,
     config,
     authStores: [],
+    authStoreCredentialsRevision: getRuntimeAuthProfileStoreCredentialsRevision(),
     warnings: [],
     webTools: {
       search: {
@@ -72,6 +112,25 @@ function preparedSnapshot(config: OpenClawConfig): PreparedSecretsRuntimeSnapsho
         diagnostics: [],
       },
       diagnostics: [],
+    },
+  };
+}
+
+function preparedSnapshotWithGatewayToken(
+  config: OpenClawConfig,
+  token = RESOLVED_GATEWAY_TOKEN,
+): PreparedSecretsRuntimeSnapshot {
+  return {
+    ...preparedSnapshot(config),
+    config: {
+      ...config,
+      gateway: {
+        ...config.gateway,
+        auth: {
+          ...config.gateway?.auth,
+          token,
+        },
+      },
     },
   };
 }
@@ -102,18 +161,32 @@ function gatewaySecretRefSnapshot(): ConfigFileSnapshot {
 
 function runtimeSecretsActivatorForTest(params: {
   prepareRuntimeSecretsSnapshot: PrepareRuntimeSecretsSnapshotForTest;
-  activateRuntimeSecretsSnapshot: ActivateRuntimeSecretsSnapshotForTest;
+  activateRuntimeSecretsSnapshot?: ActivateRuntimeSecretsSnapshotForTest;
+  emitStateEvent?: GatewayStartupStateEmitterMock;
+  logSecrets?: GatewayStartupLogMock;
 }) {
+  const defaultActivatorOptions = runtimeSecretsActivatorOptionsForTest();
   return createRuntimeSecretsActivator({
-    logSecrets: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    },
-    emitStateEvent: vi.fn(),
+    logSecrets: params.logSecrets ?? defaultActivatorOptions.logSecrets,
+    emitStateEvent: params.emitStateEvent ?? defaultActivatorOptions.emitStateEvent,
     prepareRuntimeSecretsSnapshot: params.prepareRuntimeSecretsSnapshot,
-    activateRuntimeSecretsSnapshot: params.activateRuntimeSecretsSnapshot,
+    activateRuntimeSecretsSnapshot: params.activateRuntimeSecretsSnapshot ?? vi.fn(),
   });
+}
+
+function runtimeSecretsActivatorOptionsForTest() {
+  return {
+    logSecrets: mockLogSecretsForTest(),
+    emitStateEvent: vi.fn<(code: string, message: string, cfg: OpenClawConfig) => void>(),
+  };
+}
+
+function mockLogSecretsForTest(): GatewayStartupLogMock {
+  return {
+    info: vi.fn<(message: string) => void>(),
+    warn: vi.fn<(message: string) => void>(),
+    error: vi.fn<(message: string) => void>(),
+  };
 }
 
 function readTimelineEvents(filePath: string): Array<Record<string, unknown>> {
@@ -122,6 +195,65 @@ function readTimelineEvents(filePath: string): Array<Record<string, unknown>> {
     .split(/\r?\n/u)
     .filter(Boolean)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function installDiagnosticsTimelineEnv() {
+  const root = mkdtempSync(path.join(tmpdir(), "openclaw-startup-secrets-timeline-"));
+  const timelinePath = path.join(root, "timeline.jsonl");
+  const previousDiagnostics = process.env.OPENCLAW_DIAGNOSTICS;
+  const previousTimelinePath = process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
+  process.env.OPENCLAW_DIAGNOSTICS = "timeline";
+  process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = timelinePath;
+
+  return {
+    timelinePath,
+    cleanup: () => {
+      if (previousDiagnostics === undefined) {
+        delete process.env.OPENCLAW_DIAGNOSTICS;
+      } else {
+        process.env.OPENCLAW_DIAGNOSTICS = previousDiagnostics;
+      }
+      if (previousTimelinePath === undefined) {
+        delete process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
+      } else {
+        process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = previousTimelinePath;
+      }
+      rmSync(root, { force: true, recursive: true });
+    },
+  };
+}
+
+/** Isolate path-based auth store discovery so prior full-suite env cannot force slow path. */
+function installIsolatedStartupFastPathEnv() {
+  const root = mkdtempSync(path.join(tmpdir(), "openclaw-startup-fast-path-env-"));
+  const keys = [
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_CONFIG_PATH",
+    "OPENCLAW_OAUTH_DIR",
+  ] as const;
+  const previous = new Map<(typeof keys)[number], string | undefined>();
+  for (const key of keys) {
+    previous.set(key, process.env[key]);
+  }
+  process.env.OPENCLAW_HOME = path.join(root, "home");
+  process.env.OPENCLAW_STATE_DIR = path.join(root, "state");
+  process.env.OPENCLAW_CONFIG_PATH = path.join(root, "state", "openclaw.json");
+  process.env.OPENCLAW_OAUTH_DIR = path.join(root, "credentials");
+
+  return {
+    cleanup: () => {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      rmSync(root, { force: true, recursive: true });
+    },
+  };
 }
 
 function installGatewayStartupSecretsRuntimeMock(state: GatewayStartupSecretsRuntimeMock) {
@@ -149,6 +281,25 @@ function installGatewayStartupSecretsRuntimeMock(state: GatewayStartupSecretsRun
     return {
       prepareSecretsRuntimeSnapshot: runtimeState.prepareRuntimeSecretsSnapshot,
       activateSecretsRuntimeSnapshot: runtimeState.activateRuntimeSecretsSnapshot,
+      preflightActiveSecretsRuntimeSnapshotRefresh: async ({
+        sourceConfig,
+      }: {
+        sourceConfig: OpenClawConfig;
+      }) => await runtimeState.prepareRuntimeSecretsSnapshot({ config: sourceConfig }),
+      refreshActiveSecretsRuntimeSnapshotForConfig: async ({
+        sourceConfig,
+        preflightResult,
+      }: {
+        sourceConfig: OpenClawConfig;
+        preflightResult?: unknown;
+      }) => {
+        const snapshot =
+          preflightResult && typeof preflightResult === "object"
+            ? (preflightResult as PreparedSecretsRuntimeSnapshot)
+            : await runtimeState.prepareRuntimeSecretsSnapshot({ config: sourceConfig });
+        runtimeState.activateRuntimeSecretsSnapshot(snapshot);
+        return true;
+      },
     };
   });
 }
@@ -163,11 +314,86 @@ function cleanupGatewayStartupSecretsRuntimeMock(): void {
   )["__gatewayStartupSecretsRuntimeMock"];
 }
 
+function createGatewayStartupSecretsRuntimeHarness(prefix: string) {
+  vi.resetModules();
+  const agentDir = mkdtempSync(path.join(tmpdir(), prefix));
+  const runtimeImport = vi.fn();
+  const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
+  const activateRuntimeSecretsSnapshot = vi.fn();
+  return {
+    activateRuntimeSecretsSnapshot,
+    agentDir,
+    install: () => {
+      installGatewayStartupSecretsRuntimeMock({
+        runtimeImport,
+        prepareRuntimeSecretsSnapshot,
+        activateRuntimeSecretsSnapshot,
+      });
+    },
+    prepareRuntimeSecretsSnapshot,
+    runtimeImport,
+    cleanup: () => {
+      cleanupGatewayStartupSecretsRuntimeMock();
+      rmSync(agentDir, { recursive: true, force: true });
+      vi.resetModules();
+    },
+  };
+}
+
+async function activateImportedStartupConfig(config: OpenClawConfig) {
+  const { createRuntimeSecretsActivator: createActivator } =
+    await import("./server-startup-config.js");
+  return await createActivator(runtimeSecretsActivatorOptionsForTest())(
+    gatewayTokenConfig(config),
+    {
+      reason: "startup",
+      activate: true,
+    },
+  );
+}
+
+async function prepareGatewaySecretRefStartupConfig(params: {
+  prepareRuntimeSecretsSnapshot: PrepareRuntimeSecretsSnapshotForTest;
+  activateRuntimeSecretsSnapshot: ActivateRuntimeSecretsSnapshotForTest;
+}) {
+  return await prepareGatewayStartupConfig({
+    configSnapshot: gatewaySecretRefSnapshot(),
+    activateRuntimeSecrets: runtimeSecretsActivatorForTest(params),
+  });
+}
+
+function expectBootstrapAuthResolvedGatewayToken(
+  result: Awaited<ReturnType<typeof prepareGatewayStartupConfig>>,
+): void {
+  expect(result.auth).toMatchObject({
+    mode: "token",
+    token: RESOLVED_GATEWAY_TOKEN,
+  });
+}
+
+async function expectImportedStartupConfigUsesFullSecretsRuntime(
+  harness: ReturnType<typeof createGatewayStartupSecretsRuntimeHarness>,
+  config: OpenClawConfig,
+): Promise<void> {
+  harness.install();
+
+  try {
+    await activateImportedStartupConfig(config);
+
+    expect(harness.runtimeImport).toHaveBeenCalledTimes(1);
+    expect(harness.prepareRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
+    expect(harness.activateRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
+  } finally {
+    harness.cleanup();
+  }
+}
+
 describe("gateway startup config secret preflight", () => {
   const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
   const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
 
   afterEach(() => {
+    clearSecretsRuntimeSnapshot();
     if (previousSkipChannels === undefined) {
       delete process.env.OPENCLAW_SKIP_CHANNELS;
     } else {
@@ -180,21 +406,148 @@ describe("gateway startup config secret preflight", () => {
     }
   });
 
+  it("activates a prepared snapshot only while its expected predecessor is current", async () => {
+    const initial = preparedSnapshot(gatewayTokenConfig({}));
+    const refreshed = preparedSnapshotWithGatewayToken(initial.sourceConfig, "refreshed-token");
+    const candidate = preparedSnapshotWithGatewayToken(initial.sourceConfig, "candidate-token");
+    const activateRuntimeSecretsSnapshot = vi.fn(activateSecretsRuntimeSnapshotForTest);
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
+      prepareRuntimeSecretsSnapshot: vi.fn(async ({ config }) => preparedSnapshot(config)),
+      activateRuntimeSecretsSnapshot,
+    });
+    activateSecretsRuntimeSnapshotForTest(initial);
+    const initialRevision = getActiveSecretsRuntimeSnapshotRevision();
+    activateSecretsRuntimeSnapshotForTest(refreshed);
+    const refreshedRevision = getActiveSecretsRuntimeSnapshotRevision();
+
+    await expect(
+      activateRuntimeSecrets.activatePreparedSnapshotIfCurrent?.(candidate, initialRevision, {
+        reason: "reload",
+        activate: true,
+      }),
+    ).resolves.toBeNull();
+    expect(activateRuntimeSecretsSnapshot).not.toHaveBeenCalled();
+
+    await expect(
+      activateRuntimeSecrets.activatePreparedSnapshotIfCurrent?.(candidate, refreshedRevision, {
+        reason: "reload",
+        activate: true,
+      }),
+    ).resolves.toBe(candidate);
+    expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a managed reload prepared before an OAuth credential mutation", async () => {
+    const agentDir = "/tmp/openclaw-managed-auth-store-cas";
+    const initial = preparedSnapshot(gatewayTokenConfig({}));
+    const candidate: PreparedSecretsRuntimeSnapshot = {
+      ...preparedSnapshotWithGatewayToken(initial.sourceConfig, "candidate-token"),
+      authStores: [
+        {
+          agentDir,
+          store: {
+            version: 1,
+            profiles: {
+              "openai:default": {
+                type: "oauth",
+                provider: "openai",
+                access: "access-old",
+                refresh: "refresh-old",
+                expires: Date.now() + 60_000,
+              },
+            },
+          },
+        },
+      ],
+    };
+    const activateRuntimeSecretsSnapshot = vi.fn(activateSecretsRuntimeSnapshotForTest);
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
+      prepareRuntimeSecretsSnapshot: vi.fn(async ({ config }) => preparedSnapshot(config)),
+      activateRuntimeSecretsSnapshot,
+    });
+    activateSecretsRuntimeSnapshotForTest(initial);
+    const initialRevision = getActiveSecretsRuntimeSnapshotRevision();
+    setRuntimeAuthProfileStoreSnapshot(
+      {
+        version: 1,
+        profiles: {
+          "openai:default": {
+            type: "oauth",
+            provider: "openai",
+            access: "access-new",
+            refresh: "refresh-new",
+            expires: Date.now() + 120_000,
+          },
+        },
+      },
+      agentDir,
+    );
+
+    await expect(
+      activateRuntimeSecrets.activatePreparedSnapshotIfCurrent?.(candidate, initialRevision, {
+        reason: "reload",
+        activate: true,
+      }),
+    ).resolves.toBeNull();
+    expect(activateRuntimeSecretsSnapshot).not.toHaveBeenCalled();
+    expect(getRuntimeAuthProfileStoreSnapshot(agentDir)?.profiles["openai:default"]).toMatchObject({
+      access: "access-new",
+      refresh: "refresh-new",
+    });
+  });
+
+  it("holds activation ownership through the accepted publication callback", async () => {
+    const initial = preparedSnapshot(gatewayTokenConfig({}));
+    const candidate = preparedSnapshotWithGatewayToken(initial.sourceConfig, "candidate-token");
+    const later = preparedSnapshotWithGatewayToken(initial.sourceConfig, "later-token");
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
+      prepareRuntimeSecretsSnapshot: vi.fn(async ({ config }) => preparedSnapshot(config)),
+      activateRuntimeSecretsSnapshot: vi.fn(activateSecretsRuntimeSnapshotForTest),
+    });
+    activateSecretsRuntimeSnapshotForTest(initial);
+    const initialRevision = getActiveSecretsRuntimeSnapshotRevision();
+    let releasePublication: (() => void) | undefined;
+    const publicationBlocked = new Promise<void>((resolve) => {
+      releasePublication = resolve;
+    });
+    let publicationStarted: (() => void) | undefined;
+    const publicationEntered = new Promise<void>((resolve) => {
+      publicationStarted = resolve;
+    });
+
+    const candidateActivation = activateRuntimeSecrets.activatePreparedSnapshotIfCurrent?.(
+      candidate,
+      initialRevision,
+      { reason: "reload", activate: true },
+      async () => {
+        publicationStarted?.();
+        await publicationBlocked;
+      },
+    );
+    await publicationEntered;
+    let laterActivated = false;
+    const laterActivation = activateRuntimeSecrets
+      .activatePreparedSnapshot?.(later, { reason: "reload", activate: true })
+      .then(() => {
+        laterActivated = true;
+      });
+    await Promise.resolve();
+    expect(laterActivated).toBe(false);
+
+    releasePublication?.();
+    await candidateActivation;
+    await laterActivation;
+    expect(getActiveSecretsRuntimeSnapshot()?.config.gateway?.auth?.token).toBe("later-token");
+  });
+
   it("measures startup auth subphases", async () => {
     const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
     const measured: string[] = [];
 
     await prepareGatewayStartupConfig({
       configSnapshot: buildSnapshot(gatewayTokenConfig({})),
-      activateRuntimeSecrets: createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      activateRuntimeSecrets: runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot: vi.fn(),
       }),
       measure: async (name, run) => {
         measured.push(name);
@@ -216,30 +569,20 @@ describe("gateway startup config secret preflight", () => {
   });
 
   it("emits sanitized diagnostics timeline spans for secrets preparation", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-startup-secrets-timeline-"));
-    const timelinePath = path.join(root, "timeline.jsonl");
-    const previousDiagnostics = process.env.OPENCLAW_DIAGNOSTICS;
-    const previousTimelinePath = process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
-    process.env.OPENCLAW_DIAGNOSTICS = "timeline";
-    process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = timelinePath;
+    const timelineEnv = installDiagnosticsTimelineEnv();
     try {
       const config = gatewaySecretRefSnapshot().config;
-      const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
+      const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config: preparedConfig }) =>
+        preparedSnapshot(preparedConfig),
+      );
 
-      const activateRuntimeSecrets = createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot: vi.fn(),
       });
 
       await activateRuntimeSecrets(config, { reason: "startup", activate: false });
 
-      const events = readTimelineEvents(timelinePath);
+      const events = readTimelineEvents(timelineEnv.timelinePath);
       expect(events).toHaveLength(2);
       expect(events.map((event) => event.type)).toEqual(["span.start", "span.end"]);
       for (const event of events) {
@@ -253,41 +596,19 @@ describe("gateway startup config secret preflight", () => {
       }
       expect(JSON.stringify(events)).not.toContain("GATEWAY_TOKEN_REF");
     } finally {
-      if (previousDiagnostics === undefined) {
-        delete process.env.OPENCLAW_DIAGNOSTICS;
-      } else {
-        process.env.OPENCLAW_DIAGNOSTICS = previousDiagnostics;
-      }
-      if (previousTimelinePath === undefined) {
-        delete process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
-      } else {
-        process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = previousTimelinePath;
-      }
-      rmSync(root, { force: true, recursive: true });
+      timelineEnv.cleanup();
     }
   });
 
   it("omits secret preparation error messages from diagnostics timeline spans", async () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-startup-secrets-timeline-"));
-    const timelinePath = path.join(root, "timeline.jsonl");
-    const previousDiagnostics = process.env.OPENCLAW_DIAGNOSTICS;
-    const previousTimelinePath = process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
-    process.env.OPENCLAW_DIAGNOSTICS = "timeline";
-    process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = timelinePath;
+    const timelineEnv = installDiagnosticsTimelineEnv();
     try {
       const prepareRuntimeSecretsSnapshot = vi.fn(async () => {
         throw new Error('Secret provider "default" is not configured for GATEWAY_TOKEN_REF.');
       });
 
-      const activateRuntimeSecrets = createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot: vi.fn(),
       });
 
       await expect(
@@ -303,7 +624,7 @@ describe("gateway startup config secret preflight", () => {
         }),
       ).rejects.toThrow("Startup failed: required secrets are unavailable.");
 
-      const events = readTimelineEvents(timelinePath);
+      const events = readTimelineEvents(timelineEnv.timelinePath);
       const errorEvents = events.filter((event) => event.type === "span.error");
       expect(errorEvents.map((event) => event.name)).toEqual([
         "secrets.prepare",
@@ -317,17 +638,7 @@ describe("gateway startup config secret preflight", () => {
       expect(JSON.stringify(events)).not.toContain("GATEWAY_TOKEN_REF");
       expect(JSON.stringify(events)).not.toContain("default");
     } finally {
-      if (previousDiagnostics === undefined) {
-        delete process.env.OPENCLAW_DIAGNOSTICS;
-      } else {
-        process.env.OPENCLAW_DIAGNOSTICS = previousDiagnostics;
-      }
-      if (previousTimelinePath === undefined) {
-        delete process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH;
-      } else {
-        process.env.OPENCLAW_DIAGNOSTICS_TIMELINE_PATH = previousTimelinePath;
-      }
-      rmSync(root, { force: true, recursive: true });
+      timelineEnv.cleanup();
     }
   });
 
@@ -337,15 +648,9 @@ describe("gateway startup config secret preflight", () => {
       throw error;
     });
     const emitStateEvent = vi.fn();
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
-      logSecrets: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      },
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
       emitStateEvent,
       prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot: vi.fn(),
     });
 
     await expect(
@@ -361,15 +666,8 @@ describe("gateway startup config secret preflight", () => {
 
   it("uses persisted auth stores only for startup secret preflight", async () => {
     const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
-      logSecrets: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      },
-      emitStateEvent: vi.fn(),
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
       prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot: vi.fn(),
     });
 
     await activateRuntimeSecrets(gatewayTokenConfig({}), {
@@ -396,16 +694,11 @@ describe("gateway startup config secret preflight", () => {
       warnings: [warning],
     }));
     const emitStateEvent = vi.fn();
-    const logSecrets = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
+    const logSecrets = mockLogSecretsForTest();
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
       logSecrets,
       emitStateEvent,
       prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot: vi.fn(),
     });
 
     const config = {
@@ -460,16 +753,11 @@ describe("gateway startup config secret preflight", () => {
       return preparedSnapshot(config);
     });
     const emitStateEvent = vi.fn();
-    const logSecrets = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
+    const logSecrets = mockLogSecretsForTest();
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
       logSecrets,
       emitStateEvent,
       prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot: vi.fn(),
     });
 
     await expect(
@@ -508,19 +796,7 @@ describe("gateway startup config secret preflight", () => {
   it.each(KNOWN_WEAK_GATEWAY_TOKEN_PLACEHOLDERS)(
     "rejects known weak gateway tokens resolved during secret activation: %s",
     async (token) => {
-      const sourceConfig = gatewayTokenConfig({
-        secrets: {
-          providers: {
-            default: { source: "env" },
-          },
-        },
-        gateway: {
-          auth: {
-            mode: "token",
-            token: { source: "env", provider: "default", id: "GATEWAY_TOKEN_REF" },
-          },
-        },
-      });
+      const sourceConfig = gatewayTokenConfig(gatewaySecretRefSnapshot().config);
       const prepareRuntimeSecretsSnapshot = vi.fn(async () =>
         preparedSnapshot({
           ...sourceConfig,
@@ -534,13 +810,7 @@ describe("gateway startup config secret preflight", () => {
         }),
       );
       const activateRuntimeSecretsSnapshot = vi.fn();
-      const activateRuntimeSecrets = createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
         activateRuntimeSecretsSnapshot,
       });
@@ -558,15 +828,8 @@ describe("gateway startup config secret preflight", () => {
   it("prunes channel refs from startup secret preflight when channels are skipped", async () => {
     process.env.OPENCLAW_SKIP_CHANNELS = "1";
     const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
-      logSecrets: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      },
-      emitStateEvent: vi.fn(),
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
       prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot: vi.fn(),
     });
     const config = gatewayTokenConfig(
       asConfig({
@@ -612,13 +875,7 @@ describe("gateway startup config secret preflight", () => {
         mode: "password",
         password: "override-password", // pragma: allowlist secret
       },
-      activateRuntimeSecrets: createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      activateRuntimeSecrets: runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
         activateRuntimeSecretsSnapshot,
       }),
@@ -640,15 +897,8 @@ describe("gateway startup config secret preflight", () => {
     const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
     const result = await prepareGatewayStartupConfig({
       configSnapshot: buildSnapshot(gatewayTokenConfig({})),
-      activateRuntimeSecrets: createRuntimeSecretsActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
+      activateRuntimeSecrets: runtimeSecretsActivatorForTest({
         prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot: vi.fn(),
       }),
     });
 
@@ -664,32 +914,18 @@ describe("gateway startup config secret preflight", () => {
   });
 
   it("uses gateway auth strings resolved during startup preflight for bootstrap auth", async () => {
-    const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => ({
-      ...preparedSnapshot(config),
-      config: {
-        ...config,
-        gateway: {
-          ...config.gateway,
-          auth: {
-            ...config.gateway?.auth,
-            token: "resolved-gateway-token",
-          },
-        },
-      },
-    }));
+    const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) =>
+      preparedSnapshotWithGatewayToken(config),
+    );
     const activateRuntimeSecretsSnapshot = vi.fn();
 
-    const result = await prepareGatewayStartupConfig({
-      configSnapshot: gatewaySecretRefSnapshot(),
-      activateRuntimeSecrets: runtimeSecretsActivatorForTest({
-        prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot,
-      }),
+    const result = await prepareGatewaySecretRefStartupConfig({
+      prepareRuntimeSecretsSnapshot,
+      activateRuntimeSecretsSnapshot,
     });
 
-    expect(result.auth.mode).toBe("token");
-    expect(result.auth.token).toBe("resolved-gateway-token");
-    expect(result.cfg.gateway?.auth?.token).toBe("resolved-gateway-token");
+    expectBootstrapAuthResolvedGatewayToken(result);
+    expect(result.cfg.gateway?.auth?.token).toBe(RESOLVED_GATEWAY_TOKEN);
     expect(prepareRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
     expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
     expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledWith(
@@ -697,7 +933,7 @@ describe("gateway startup config secret preflight", () => {
         config: expect.objectContaining({
           gateway: expect.objectContaining({
             auth: expect.objectContaining({
-              token: "resolved-gateway-token",
+              token: RESOLVED_GATEWAY_TOKEN,
             }),
           }),
         }),
@@ -717,29 +953,16 @@ describe("gateway startup config secret preflight", () => {
             }
           : config,
       ),
-      config: {
-        ...config,
-        gateway: {
-          ...config.gateway,
-          auth: {
-            ...config.gateway?.auth,
-            token: "resolved-gateway-token",
-          },
-        },
-      },
+      config: preparedSnapshotWithGatewayToken(config).config,
     }));
     const activateRuntimeSecretsSnapshot = vi.fn();
 
-    const result = await prepareGatewayStartupConfig({
-      configSnapshot: gatewaySecretRefSnapshot(),
-      activateRuntimeSecrets: runtimeSecretsActivatorForTest({
-        prepareRuntimeSecretsSnapshot,
-        activateRuntimeSecretsSnapshot,
-      }),
+    const result = await prepareGatewaySecretRefStartupConfig({
+      prepareRuntimeSecretsSnapshot,
+      activateRuntimeSecretsSnapshot,
     });
 
-    expect(result.auth.mode).toBe("token");
-    expect(result.auth.token).toBe("resolved-gateway-token");
+    expectBootstrapAuthResolvedGatewayToken(result);
     expect(prepareRuntimeSecretsSnapshot).toHaveBeenCalledTimes(2);
     expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
   });
@@ -747,6 +970,7 @@ describe("gateway startup config secret preflight", () => {
   it("activates no-SecretRef startup config without importing the full secrets runtime", async () => {
     vi.resetModules();
     const agentDir = mkdtempSync(path.join(tmpdir(), "openclaw-startup-fast-path-"));
+    const isolatedEnv = installIsolatedStartupFastPathEnv();
     const runtimeImport = vi.fn();
     const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
     const activateRuntimeSecretsSnapshot = vi.fn();
@@ -787,35 +1011,41 @@ describe("gateway startup config secret preflight", () => {
       return {
         prepareSecretsRuntimeSnapshot: state.prepareRuntimeSecretsSnapshot,
         activateSecretsRuntimeSnapshot: state.activateRuntimeSecretsSnapshot,
+        preflightActiveSecretsRuntimeSnapshotRefresh: async ({
+          sourceConfig,
+        }: {
+          sourceConfig: OpenClawConfig;
+        }) => await state.prepareRuntimeSecretsSnapshot({ config: sourceConfig }),
+        refreshActiveSecretsRuntimeSnapshotForConfig: async ({
+          sourceConfig,
+          preflightResult,
+        }: {
+          sourceConfig: OpenClawConfig;
+          preflightResult?: unknown;
+        }) => {
+          const snapshot =
+            preflightResult && typeof preflightResult === "object"
+              ? (preflightResult as PreparedSecretsRuntimeSnapshot)
+              : await state.prepareRuntimeSecretsSnapshot({ config: sourceConfig });
+          state.activateRuntimeSecretsSnapshot(snapshot);
+          return true;
+        },
       };
     });
 
     try {
-      const { createRuntimeSecretsActivator: createActivator } =
-        await import("./server-startup-config.js");
-      const { clearSecretsRuntimeSnapshot, getActiveSecretsRuntimeSnapshot } =
-        await import("../secrets/runtime-state.js");
+      const {
+        clearSecretsRuntimeSnapshot: clearImportedSecretsRuntimeSnapshot,
+        getActiveSecretsRuntimeSnapshot: getImportedSecretsRuntimeSnapshot,
+      } = await import("../secrets/runtime-state.js");
       const { getRuntimeConfigSnapshotRefreshHandler } =
         await import("../config/runtime-snapshot.js");
-      const result = await createActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
-      })(
-        gatewayTokenConfig(
-          asConfig({
-            agents: {
-              list: [{ id: "default", agentDir }],
-            },
-          }),
-        ),
-        {
-          reason: "startup",
-          activate: true,
-        },
+      const result = await activateImportedStartupConfig(
+        asConfig({
+          agents: {
+            list: [{ id: "default", agentDir }],
+          },
+        }),
       );
 
       expect(runtimeImport).not.toHaveBeenCalled();
@@ -823,7 +1053,7 @@ describe("gateway startup config secret preflight", () => {
       expect(activateRuntimeSecretsSnapshot).not.toHaveBeenCalled();
       expect(loadAuthProfileStoreWithoutExternalProfilesMock).not.toHaveBeenCalled();
       expect(result.config.gateway?.auth?.token).toBe("startup-test-token");
-      expect(getActiveSecretsRuntimeSnapshot()?.config.gateway?.auth?.token).toBe(
+      expect(getImportedSecretsRuntimeSnapshot()?.config.gateway?.auth?.token).toBe(
         "startup-test-token",
       );
       const refreshHandler = getRuntimeConfigSnapshotRefreshHandler();
@@ -843,8 +1073,9 @@ describe("gateway startup config secret preflight", () => {
         loadAuthStore?: unknown;
       }>(prepareRuntimeSecretsSnapshot);
       expect(refreshInput.loadAuthStore).toBeUndefined();
-      clearSecretsRuntimeSnapshot();
+      clearImportedSecretsRuntimeSnapshot();
     } finally {
+      isolatedEnv.cleanup();
       vi.doUnmock("../agents/auth-profiles.js");
       vi.doUnmock("../secrets/runtime.js");
       delete (
@@ -857,65 +1088,151 @@ describe("gateway startup config secret preflight", () => {
     }
   });
 
-  it("keeps the full secrets runtime path when startup config has a SecretRef", async () => {
-    vi.resetModules();
-    const agentDir = mkdtempSync(path.join(tmpdir(), "openclaw-startup-secret-ref-"));
-    const runtimeImport = vi.fn();
-    const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
-    const activateRuntimeSecretsSnapshot = vi.fn();
-    installGatewayStartupSecretsRuntimeMock({
-      runtimeImport,
-      prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot,
-    });
-
-    try {
-      const { createRuntimeSecretsActivator: createActivator } =
-        await import("./server-startup-config.js");
-      await createActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-        },
-        emitStateEvent: vi.fn(),
-      })(
-        gatewayTokenConfig(
-          asConfig({
-            agents: {
-              list: [{ id: "default", agentDir }],
-            },
-            models: {
-              providers: {
-                openai: {
-                  models: [],
-                  apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-                },
-              },
-            },
-          }),
-        ),
-        {
-          reason: "startup",
-          activate: true,
-        },
+  it("retries a stale startup fast-path preflight against the newer runtime context", async () => {
+    const agentDir = autoCleanupTempDirs.make("openclaw-startup-fast-path-cas-");
+    let clearImportedSecretsRuntimeSnapshot: (() => void) | undefined;
+    const config = (port: number) =>
+      gatewayTokenConfig(
+        asConfig({
+          agents: { list: [{ id: "default", agentDir }] },
+          gateway: { port },
+        }),
       );
+    try {
+      // A preceding lazy-import test resets Vitest's module cache. Import this
+      // whole runtime graph together so the activator and handler share state.
+      const { createRuntimeSecretsActivator: createImportedRuntimeSecretsActivator } =
+        await import("./server-startup-config.js");
+      const secretsRuntime = await import("../secrets/runtime.js");
+      clearImportedSecretsRuntimeSnapshot = secretsRuntime.clearSecretsRuntimeSnapshot;
+      const activateRuntimeSecrets = createImportedRuntimeSecretsActivator(
+        runtimeSecretsActivatorOptionsForTest(),
+      );
+      await activateRuntimeSecrets(config(19_021), {
+        reason: "startup",
+        activate: true,
+      });
+      const { getRuntimeConfigSnapshotRefreshHandler } =
+        await import("../config/runtime-snapshot.js");
+      const staleRefreshHandler = getRuntimeConfigSnapshotRefreshHandler();
+      if (!staleRefreshHandler?.preflight) {
+        throw new Error("expected startup fast-path refresh preflight handler");
+      }
+      const desiredConfig = config(19_023);
+      const preflightResult = await staleRefreshHandler.preflight({
+        sourceConfig: desiredConfig,
+      });
+      const concurrent = await secretsRuntime.prepareSecretsRuntimeSnapshot({
+        config: config(19_022),
+        agentDirs: [agentDir],
+        loadAuthStore: () => ({
+          version: 1,
+          profiles: {
+            "openai:default": {
+              type: "api_key",
+              provider: "openai",
+              key: "newer-context-key",
+            },
+          },
+        }),
+      });
+      secretsRuntime.activateSecretsRuntimeSnapshot(concurrent);
 
-      expect(runtimeImport).toHaveBeenCalledTimes(1);
-      expect(prepareRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
-      expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
+      await expect(
+        staleRefreshHandler.refresh({ sourceConfig: desiredConfig, preflightResult }),
+      ).resolves.toBe(true);
+
+      const active = secretsRuntime.getActiveSecretsRuntimeSnapshot();
+      expect(active?.sourceConfig.gateway?.port).toBe(19_023);
+      expect(active?.authStores[0]?.store.profiles["openai:default"]).toMatchObject({
+        key: "newer-context-key",
+      });
     } finally {
-      cleanupGatewayStartupSecretsRuntimeMock();
+      clearImportedSecretsRuntimeSnapshot?.();
       rmSync(agentDir, { recursive: true, force: true });
-      vi.resetModules();
     }
   });
 
+  it("grafts live auth stores onto one-shot config-write snapshots", async () => {
+    const agentDir = "/tmp/openclaw-managed-write-auth-store";
+    const credential = {
+      type: "api_key" as const,
+      provider: "openai",
+      key: "live-auth-store-key",
+    };
+    setRuntimeAuthProfileStoreSnapshot(
+      { version: 1, profiles: { "openai:default": credential } },
+      agentDir,
+    );
+    const active = preparedSnapshot(gatewayTokenConfig({}));
+    active.authStores = [
+      {
+        agentDir,
+        store: { version: 1, profiles: { "openai:default": credential } },
+      },
+    ];
+    active.authStoreCredentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
+    activateSecretsRuntimeSnapshotState({
+      snapshot: active,
+      refreshContext: {
+        env: {},
+        explicitAgentDirs: null,
+        includeAuthStoreRefs: true,
+        loadablePluginOrigins: new Map(),
+      },
+      refreshHandler: null,
+    });
+    const prepareRuntimeSecretsSnapshot = vi.fn(async (params: { config: OpenClawConfig }) =>
+      preparedSnapshot(params.config),
+    );
+    const activateRuntimeSecrets = runtimeSecretsActivatorForTest({
+      prepareRuntimeSecretsSnapshot,
+      activateRuntimeSecretsSnapshot: activateSecretsRuntimeSnapshotForTest,
+    });
+
+    const prepared = await activateRuntimeSecrets(
+      gatewayTokenConfig({ logging: { level: "debug" } }),
+      {
+        reason: "reload",
+        activate: false,
+        includeAuthStoreRefs: false,
+      },
+    );
+    expect(prepared.authStores[0]?.store.profiles["openai:default"]).toEqual(credential);
+    await activateRuntimeSecrets.activatePreparedSnapshot?.(prepared, {
+      reason: "reload",
+      activate: true,
+      includeAuthStoreRefs: false,
+    });
+    expect(getRuntimeAuthProfileStoreSnapshot(agentDir)?.profiles["openai:default"]).toEqual(
+      credential,
+    );
+  });
+
+  it("keeps the full secrets runtime path when startup config has a SecretRef", async () => {
+    const harness = createGatewayStartupSecretsRuntimeHarness("openclaw-startup-secret-ref-");
+    await expectImportedStartupConfigUsesFullSecretsRuntime(
+      harness,
+      asConfig({
+        agents: {
+          list: [{ id: "default", agentDir: harness.agentDir }],
+        },
+        models: {
+          providers: {
+            openai: {
+              models: [],
+              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+            },
+          },
+        },
+      }),
+    );
+  });
+
   it("keeps the full secrets runtime path when auth profile files are present", async () => {
-    vi.resetModules();
-    const agentDir = mkdtempSync(path.join(tmpdir(), "openclaw-startup-auth-store-"));
+    const harness = createGatewayStartupSecretsRuntimeHarness("openclaw-startup-auth-store-");
     writeFileSync(
-      path.join(agentDir, "auth-profiles.json"),
+      path.join(harness.agentDir, "auth-profiles.json"),
       `${JSON.stringify({
         version: 1,
         profiles: {
@@ -927,46 +1244,13 @@ describe("gateway startup config secret preflight", () => {
         },
       })}\n`,
     );
-    const runtimeImport = vi.fn();
-    const prepareRuntimeSecretsSnapshot = vi.fn(async ({ config }) => preparedSnapshot(config));
-    const activateRuntimeSecretsSnapshot = vi.fn();
-    installGatewayStartupSecretsRuntimeMock({
-      runtimeImport,
-      prepareRuntimeSecretsSnapshot,
-      activateRuntimeSecretsSnapshot,
-    });
-
-    try {
-      const { createRuntimeSecretsActivator: createActivator } =
-        await import("./server-startup-config.js");
-      await createActivator({
-        logSecrets: {
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
+    await expectImportedStartupConfigUsesFullSecretsRuntime(
+      harness,
+      asConfig({
+        agents: {
+          list: [{ id: "default", agentDir: harness.agentDir }],
         },
-        emitStateEvent: vi.fn(),
-      })(
-        gatewayTokenConfig(
-          asConfig({
-            agents: {
-              list: [{ id: "default", agentDir }],
-            },
-          }),
-        ),
-        {
-          reason: "startup",
-          activate: true,
-        },
-      );
-
-      expect(runtimeImport).toHaveBeenCalledTimes(1);
-      expect(prepareRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
-      expect(activateRuntimeSecretsSnapshot).toHaveBeenCalledTimes(1);
-    } finally {
-      cleanupGatewayStartupSecretsRuntimeMock();
-      rmSync(agentDir, { recursive: true, force: true });
-      vi.resetModules();
-    }
+      }),
+    );
   });
 });

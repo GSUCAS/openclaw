@@ -1,3 +1,4 @@
+// Launchd restart handoff tests cover restart coordination on macOS.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -52,7 +53,7 @@ describe("scheduleDetachedLaunchdRestartHandoff", () => {
       waitForPid: 9876,
     });
 
-    expect(result).toEqual({ ok: true, pid: 4242 });
+    expect(result).toEqual({ ok: true, value: 4242 });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [, args] = requireSpawnCall();
     expect(args[0]).toBe("-c");

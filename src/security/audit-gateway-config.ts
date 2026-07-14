@@ -1,21 +1,23 @@
+// Audits gateway config for bind, auth, and exposure risks.
 import { isIP } from "node:net";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type { GatewayAuthConfig } from "../config/types.gateway.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { hasConfiguredSecretInput } from "../config/types.secrets.js";
 import { resolveGatewayAuth } from "../gateway/auth-resolve.js";
 import { resolveGatewayAuthTokenSourceConflict } from "../gateway/auth-token-source-conflict.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
+import { parseStrictNonNegativeInteger } from "../infra/parse-finite-number.js";
 import type { SecurityAuditFinding } from "./audit.types.js";
 import { collectCoreInsecureOrDangerousFlags } from "./core-dangerous-config-flags.js";
 import { DEFAULT_GATEWAY_HTTP_TOOL_DENY } from "./dangerous-tools.js";
 
 type CollectDangerousConfigFlags = (cfg: OpenClawConfig) => string[];
 
-export type CollectGatewayConfigFindingsOptions = {
+type CollectGatewayConfigFindingsOptions = {
   collectDangerousConfigFlags?: CollectDangerousConfigFlags;
   gatewayAuthOverride?: Pick<GatewayAuthConfig, "mode" | "token" | "password">;
 };
@@ -277,6 +279,18 @@ export function collectGatewayConfigFindings(
     });
   }
 
+  if (cfg.mcp?.apps?.enabled === true) {
+    findings.push({
+      checkId: "mcp.apps.enabled",
+      severity: "warn",
+      title: "MCP Apps UI bridge enabled",
+      detail:
+        "mcp.apps.enabled=true allows configured MCP servers to provide interactive HTML. Views are CSP-restricted and origin-isolated, but they can call app-visible tools on their owning MCP server while the session runtime remains active.",
+      remediation:
+        "Keep this enabled only for MCP servers you trust. Disable with `openclaw config set mcp.apps.enabled false --strict-json` when it is not needed.",
+    });
+  }
+
   const enabledDangerousFlags = (
     options.collectDangerousConfigFlags ?? collectCoreInsecureOrDangerousFlags
   )(cfg);
@@ -303,7 +317,7 @@ export function collectGatewayConfigFindings(
   }
 
   if (auth.mode === "trusted-proxy") {
-    const trustedProxies = cfg.gateway?.trustedProxies ?? [];
+    const trustedProxiesLocal = cfg.gateway?.trustedProxies ?? [];
     const trustedProxyConfig = cfg.gateway?.auth?.trustedProxy;
 
     findings.push({
@@ -321,7 +335,7 @@ export function collectGatewayConfigFindings(
         "See /gateway/trusted-proxy-auth for setup guidance.",
     });
 
-    if (trustedProxies.length === 0) {
+    if (trustedProxiesLocal.length === 0) {
       findings.push({
         checkId: "gateway.trusted_proxy_no_proxies",
         severity: "critical",
@@ -407,8 +421,8 @@ function isStrictLoopbackTrustedProxyEntry(entry: string): boolean {
     return false;
   }
   const ipVersion = isIP(rawIp.trim());
-  const prefix = Number.parseInt(rawPrefix.trim(), 10);
-  if (!Number.isInteger(prefix)) {
+  const prefix = parseStrictNonNegativeInteger(rawPrefix);
+  if (prefix === undefined) {
     return false;
   }
   if (ipVersion === 4) {

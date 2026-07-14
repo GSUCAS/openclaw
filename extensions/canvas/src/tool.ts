@@ -1,3 +1,7 @@
+/**
+ * Agent-facing Canvas tool implementation for node canvas commands and
+ * snapshots.
+ */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -11,8 +15,10 @@ import {
   jsonResult,
   readStringParam,
 } from "openclaw/plugin-sdk/channel-actions";
+import { readFiniteNumberParam, readPositiveIntegerParam } from "openclaw/plugin-sdk/param-readers";
 import type { AnyAgentTool, OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
+import { validateSupportedA2UIJsonl } from "./a2ui-jsonl.js";
 import { normalizeCanvasSnapshotFileExtension, parseCanvasSnapshotPayload } from "./cli-helpers.js";
 import { CanvasToolSchema } from "./tool-schema.js";
 
@@ -29,7 +35,7 @@ function readGatewayCallOptions(params: Record<string, unknown>) {
   return {
     gatewayUrl: readStringParam(params, "gatewayUrl", { trim: false }),
     gatewayToken: readStringParam(params, "gatewayToken", { trim: false }),
-    timeoutMs: typeof params.timeoutMs === "number" ? params.timeoutMs : undefined,
+    timeoutMs: readPositiveIntegerParam(params, "timeoutMs"),
   };
 }
 
@@ -53,7 +59,7 @@ async function writeBase64ToTempFile(params: { base64: string; ext: string }): P
 function isPathInsideRoot(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return (
-    relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
+    relative === "" || (relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative))
   );
 }
 
@@ -84,6 +90,7 @@ function resolveCanvasImageSanitizationLimits(
   return { maxDimensionPx: Math.max(1, Math.floor(configured)) };
 }
 
+/** Creates the model-facing Canvas tool used to invoke paired node canvas commands. */
 export function createCanvasTool(options?: CanvasToolOptions): AnyAgentTool {
   const imageSanitization = resolveCanvasImageSanitizationLimits(options?.config);
   return {
@@ -96,28 +103,25 @@ export function createCanvasTool(options?: CanvasToolOptions): AnyAgentTool {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const gatewayOpts = readGatewayCallOptions(params);
+      const nodeQuery = readStringParam(params, "node", { trim: true });
 
-      const nodeId = await resolveNodeId(
-        gatewayOpts,
-        readStringParam(params, "node", { trim: true }),
-        true,
-      );
-
-      const invoke = async (command: string, invokeParams?: Record<string, unknown>) =>
-        await callGatewayTool("node.invoke", gatewayOpts, {
+      const invoke = async (command: string, invokeParams?: Record<string, unknown>) => {
+        const nodeId = await resolveNodeId(gatewayOpts, nodeQuery, true);
+        return await callGatewayTool("node.invoke", gatewayOpts, {
           nodeId,
           command,
           params: invokeParams,
           idempotencyKey: randomUUID(),
         });
+      };
 
       switch (action) {
         case "present": {
           const placement = {
-            x: typeof params.x === "number" ? params.x : undefined,
-            y: typeof params.y === "number" ? params.y : undefined,
-            width: typeof params.width === "number" ? params.width : undefined,
-            height: typeof params.height === "number" ? params.height : undefined,
+            x: readFiniteNumberParam(params, "x"),
+            y: readFiniteNumberParam(params, "y"),
+            width: readFiniteNumberParam(params, "width"),
+            height: readFiniteNumberParam(params, "height"),
           };
           const invokeParams: Record<string, unknown> = {};
           const presentTarget =
@@ -155,7 +159,7 @@ export function createCanvasTool(options?: CanvasToolOptions): AnyAgentTool {
             payload?: { result?: string };
           };
           const result = raw?.payload?.result;
-          if (result) {
+          if (typeof result === "string") {
             return {
               content: [{ type: "text", text: result }],
               details: { result },
@@ -169,14 +173,11 @@ export function createCanvasTool(options?: CanvasToolOptions): AnyAgentTool {
               ? params.outputFormat.trim().toLowerCase()
               : "png";
           const format = formatRaw === "jpg" || formatRaw === "jpeg" ? "jpeg" : "png";
-          const maxWidth =
-            typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
-              ? params.maxWidth
-              : undefined;
-          const quality =
-            typeof params.quality === "number" && Number.isFinite(params.quality)
-              ? params.quality
-              : undefined;
+          const maxWidth = readPositiveIntegerParam(params, "maxWidth");
+          const quality = readFiniteNumberParam(params, "quality", {
+            min: 0,
+            max: 1,
+          });
           const raw = (await invoke("canvas.snapshot", {
             format,
             maxWidth,
@@ -204,6 +205,7 @@ export function createCanvasTool(options?: CanvasToolOptions): AnyAgentTool {
           if (!jsonl.trim()) {
             throw new Error("jsonl or jsonlPath required");
           }
+          validateSupportedA2UIJsonl(jsonl);
           await invoke("canvas.a2ui.pushJSONL", { jsonl });
           return jsonResult({ ok: true });
         }

@@ -1,3 +1,4 @@
+// Imessage plugin module implements channel behavior.
 import { buildDmGroupAccountAllowlistAdapter } from "openclaw/plugin-sdk/allowlist-config-edit";
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
@@ -5,10 +6,11 @@ import {
   defineChannelMessageAdapter,
   type ChannelMessageSendResult,
   type MessageReceiptPartKind,
-} from "openclaw/plugin-sdk/channel-message";
+} from "openclaw/plugin-sdk/channel-outbound";
+import { sanitizeForPlainText } from "openclaw/plugin-sdk/channel-outbound";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
 import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
-import { sanitizeForPlainText } from "openclaw/plugin-sdk/outbound-runtime";
 import { buildOutboundBaseSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import {
   createComputedAccountStatusAdapter,
@@ -16,7 +18,10 @@ import {
 } from "openclaw/plugin-sdk/status-helpers";
 import { resolveIMessageAccount, type ResolvedIMessageAccount } from "./accounts.js";
 import { imessageMessageActions } from "./actions.js";
-import { imessageApprovalCapability } from "./approval-native.js";
+import {
+  imessageApprovalCapability,
+  shouldSuppressLocalIMessageExecApprovalPrompt,
+} from "./approval-native.js";
 import {
   chunkTextForOutbound,
   collectStatusIssuesFromLastError,
@@ -59,10 +64,14 @@ type IMessageMessageContextExtras = {
 };
 
 function toIMessageMessageSendResult(
-  result: { messageId?: string; receipt?: ChannelMessageSendResult["receipt"] },
+  result: {
+    messageId?: string;
+    meta?: Record<string, unknown>;
+    receipt?: ChannelMessageSendResult["receipt"];
+  },
   kind: MessageReceiptPartKind,
   replyToId?: string | null,
-): ChannelMessageSendResult {
+): ChannelMessageSendResult & { meta?: Record<string, unknown> } {
   const receipt =
     result.receipt ??
     createMessageReceiptFromOutboundResults({
@@ -73,7 +82,41 @@ function toIMessageMessageSendResult(
   return {
     messageId: result.messageId || receipt.primaryPlatformMessageId,
     receipt,
+    ...(result.meta && Object.keys(result.meta).length > 0 ? { meta: result.meta } : {}),
   };
+}
+
+const loadIMessageApprovalReactionsModule = createLazyRuntimeModule(
+  () => import("./approval-reactions.js"),
+);
+
+async function prepareForwardedIMessageApprovalPayload(params: {
+  payload: Parameters<NonNullable<ChannelOutboundAdapter["beforeDeliverPayload"]>>[0]["payload"];
+  approvalKind: "exec" | "plugin";
+}): Promise<void> {
+  const prepared = (
+    await loadIMessageApprovalReactionsModule()
+  ).addIMessageApprovalReactionHintToStructuredPayload(params);
+  if (prepared) {
+    Object.assign(params.payload, prepared);
+  }
+}
+
+async function registerDeliveredIMessageApprovalPayload(
+  params: Parameters<NonNullable<ChannelOutboundAdapter["afterDeliverPayload"]>>[0],
+): Promise<void> {
+  const accountId = resolveIMessageAccount({
+    cfg: params.cfg,
+    accountId: params.target.accountId,
+  }).accountId;
+  (
+    await loadIMessageApprovalReactionsModule()
+  ).registerIMessageApprovalReactionTargetForDeliveredPayload({
+    accountId,
+    target: params.target,
+    payload: params.payload,
+    results: params.results,
+  });
 }
 
 const imessageMessageAdapter = defineChannelMessageAdapter({
@@ -109,11 +152,16 @@ const imessageMessageAdapter = defineChannelMessageAdapter({
         text: ctx.text,
         mediaUrl: ctx.mediaUrl,
         mediaLocalRoots: ctx.mediaLocalRoots,
+        audioAsVoice: ctx.audioAsVoice,
         accountId: ctx.accountId ?? undefined,
         deps: (ctx as typeof ctx & IMessageMessageContextExtras).deps,
         replyToId: ctx.replyToId ?? undefined,
       });
-      return toIMessageMessageSendResult(result, "media", ctx.replyToId);
+      return toIMessageMessageSendResult(
+        result,
+        ctx.audioAsVoice ? "voice" : "media",
+        ctx.replyToId,
+      );
     },
   },
 });
@@ -125,6 +173,19 @@ function buildIMessageBaseSessionKey(params: {
   peer: RoutePeer;
 }) {
   return buildOutboundBaseSessionKey({ ...params, channel: "imessage" });
+}
+
+function isCanonicalIMessageDirectHandle(raw: string, normalized: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || !normalized) {
+    return false;
+  }
+  // Inbound DMs key sessions by normalized phone number or email. Names and
+  // other bridge aliases can deliver, but cannot prove the reply identity.
+  if (normalized.startsWith("+")) {
+    return /^[+\d\s().-]+$/.test(trimmed);
+  }
+  return /^[^\s@<>()[\]`]+@[^\s@<>()[\]`]+\.[^\s@<>()[\]`]+$/.test(trimmed);
 }
 
 function resolveIMessageOutboundSessionRoute(params: {
@@ -139,6 +200,14 @@ function resolveIMessageOutboundSessionRoute(params: {
     if (!handle) {
       return null;
     }
+    const account = resolveIMessageAccount({ cfg: params.cfg, accountId: params.accountId });
+    const service =
+      parsed.serviceExplicit || parsed.service !== "auto"
+        ? parsed.service
+        : account.config.service === "sms"
+          ? "sms"
+          : "imessage";
+    const directTarget = `${service}:${handle}`;
     const peer: RoutePeer = { kind: "direct", id: handle };
     const baseSessionKey = buildIMessageBaseSessionKey({
       cfg: params.cfg,
@@ -149,10 +218,11 @@ function resolveIMessageOutboundSessionRoute(params: {
     return {
       sessionKey: baseSessionKey,
       baseSessionKey,
+      recipientSessionExact: isCanonicalIMessageDirectHandle(parsed.to, handle),
       peer,
       chatType: "direct" as const,
-      from: `imessage:${handle}`,
-      to: `imessage:${handle}`,
+      from: directTarget,
+      to: directTarget,
     };
   }
 
@@ -181,6 +251,7 @@ function resolveIMessageOutboundSessionRoute(params: {
   return {
     sessionKey: baseSessionKey,
     baseSessionKey,
+    recipientSessionExact: false,
     peer,
     chatType: "group" as const,
     from: `imessage:group:${peerId}`,
@@ -319,7 +390,22 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
         chunker: chunkTextForOutbound,
         chunkerMode: "text",
         textChunkLimit: 4000,
-        sanitizeText: ({ text }) => sanitizeForPlainText(sanitizeOutboundText(text)),
+        // Native formatting consumes Markdown ranges, so preserve bold and strike semantics.
+        sanitizeText: ({ text }) =>
+          sanitizeForPlainText(sanitizeOutboundText(text), { style: "markdown" }),
+        shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
+          shouldSuppressLocalIMessageExecApprovalPrompt({ cfg, accountId, payload, hint }),
+        beforeDeliverPayload: async ({ payload, hint }) => {
+          if (hint?.kind !== "approval-pending") {
+            return;
+          }
+          await prepareForwardedIMessageApprovalPayload({
+            payload,
+            approvalKind: hint.approvalKind,
+          });
+        },
+        afterDeliverPayload: async (params) =>
+          await registerDeliveredIMessageApprovalPayload(params),
         deliveryCapabilities: {
           durableFinal: {
             text: true,
@@ -348,6 +434,7 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
           text,
           mediaUrl,
           mediaLocalRoots,
+          audioAsVoice,
           accountId,
           deps,
           replyToId,
@@ -360,6 +447,7 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             text,
             mediaUrl,
             mediaLocalRoots,
+            audioAsVoice,
             accountId: accountId ?? undefined,
             deps,
             replyToId: replyToId ?? undefined,

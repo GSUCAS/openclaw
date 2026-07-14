@@ -1,7 +1,8 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+// Normalizes provider model compatibility metadata from plugins.
+import { resolveUnsupportedToolSchemaKeywords } from "@openclaw/ai/internal/openai";
 import { detectOpenAICompletionsCompat } from "../agents/openai-completions-compat.js";
 import type { ModelCompatConfig } from "../config/types.models.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
+import type { Model } from "../llm/types.js";
 
 export function extractModelCompat(
   modelOrCompat: { compat?: unknown } | ModelCompatConfig | undefined,
@@ -54,31 +55,15 @@ export function resolveToolCallArgumentsEncoding(
   return extractModelCompat(modelOrCompat)?.toolCallArgumentsEncoding;
 }
 
-export function resolveUnsupportedToolSchemaKeywords(
-  modelOrCompat: { compat?: unknown } | ModelCompatConfig | undefined,
-): ReadonlySet<string> {
-  const keywords = extractModelCompat(modelOrCompat)?.unsupportedToolSchemaKeywords ?? [];
-  return new Set(
-    normalizeStringEntries(
-      keywords.filter((keyword): keyword is string => typeof keyword === "string"),
-    ),
-  );
-}
+// Tool-schema compat predicates moved into @openclaw/ai (agent-tools-parameter-schema);
+// re-export so existing core/plugin callers keep one canonical import site.
+export { resolveUnsupportedToolSchemaKeywords };
 
-export function shouldOmitEmptyArrayItems(
-  modelOrCompat: { compat?: unknown } | ModelCompatConfig | undefined,
-): boolean {
-  const compat = extractModelCompat(modelOrCompat) as
-    | (ModelCompatConfig & { omitEmptyArrayItems?: unknown })
-    | undefined;
-  return compat?.omitEmptyArrayItems === true;
-}
-
-function isOpenAiCompletionsModel(model: Model<Api>): model is Model<"openai-completions"> {
+function isOpenAiCompletionsModel(model: Model): model is Model<"openai-completions"> {
   return model.api === "openai-completions";
 }
 
-function isAnthropicMessagesModel(model: Model<Api>): model is Model<"anthropic-messages"> {
+function isAnthropicMessagesModel(model: Model): model is Model<"anthropic-messages"> {
   return model.api === "anthropic-messages";
 }
 
@@ -86,7 +71,7 @@ function normalizeAnthropicBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/v1\/?$/, "");
 }
 
-export function normalizeModelCompat(model: Model<Api>): Model<Api> {
+export function normalizeModelCompat(model: Model): Model {
   const baseUrl = model.baseUrl ?? "";
 
   if (isAnthropicMessagesModel(model) && baseUrl) {

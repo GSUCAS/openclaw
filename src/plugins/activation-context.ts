@@ -1,7 +1,7 @@
+// Builds plugin activation context from config, discovery, and manifests.
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
-  withBundledPluginAllowlistCompat,
   withBundledPluginEnablementCompat,
   withBundledPluginVitestCompat,
 } from "./bundled-compat.js";
@@ -14,19 +14,17 @@ import {
 import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
 import type { PluginDiscoveryResult } from "./discovery.js";
 
-export type PluginActivationCompatConfig = {
-  allowlistPluginIds?: readonly string[];
+type PluginActivationCompatConfig = {
   enablementPluginIds?: readonly string[];
   vitestPluginIds?: readonly string[];
 };
 
 export type PluginActivationBundledCompatMode = {
-  allowlist?: boolean;
-  enablement?: "always" | "allowlist";
+  enablement?: "always";
   vitest?: boolean;
 };
 
-export type PluginActivationInputs = {
+type PluginActivationInputs = {
   rawConfig?: OpenClawConfig;
   config?: OpenClawConfig;
   normalized: NormalizedPluginsConfig;
@@ -35,21 +33,11 @@ export type PluginActivationInputs = {
   autoEnabledReasons: Record<string, string[]>;
 };
 
-export type PluginActivationSnapshot = Pick<
-  PluginActivationInputs,
-  | "rawConfig"
-  | "config"
-  | "normalized"
-  | "activationSourceConfig"
-  | "activationSource"
-  | "autoEnabledReasons"
->;
-
-export type BundledPluginCompatibleActivationInputs = PluginActivationInputs & {
+type BundledPluginCompatibleActivationInputs = PluginActivationInputs & {
   compatPluginIds: string[];
 };
 
-export type BundledPluginCompatibleLoadValues = Pick<
+type BundledPluginCompatibleLoadValues = Pick<
   BundledPluginCompatibleActivationInputs,
   "rawConfig" | "config" | "activationSourceConfig" | "autoEnabledReasons" | "compatPluginIds"
 >;
@@ -82,9 +70,7 @@ export function withActivatedPluginIds(params: {
     return params.config;
   }
   const originalAllow = params.config?.plugins?.allow ?? [];
-  // Empty allowlists are still open; only explicit compat widens configured allowlists.
-  const useAllowlistDiscovery =
-    params.config?.plugins?.bundledDiscovery !== "compat" && originalAllow.length > 0;
+  const useAllowlistDiscovery = originalAllow.length > 0;
   const originalAllowSet = useAllowlistDiscovery ? new Set(originalAllow) : undefined;
   const allow = new Set(originalAllow);
   const entries = {
@@ -118,23 +104,17 @@ export function withActivatedPluginIds(params: {
   };
 }
 
-export function applyPluginCompatibilityOverrides(params: {
+function applyPluginCompatibilityOverrides(params: {
   config?: OpenClawConfig;
   compat?: PluginActivationCompatConfig;
   env: NodeJS.ProcessEnv;
 }): OpenClawConfig | undefined {
-  const allowlistCompat = params.compat?.allowlistPluginIds?.length
-    ? withBundledPluginAllowlistCompat({
-        config: params.config,
-        pluginIds: params.compat.allowlistPluginIds,
-      })
-    : params.config;
   const enablementCompat = params.compat?.enablementPluginIds?.length
     ? withBundledPluginEnablementCompat({
-        config: allowlistCompat,
+        config: params.config,
         pluginIds: params.compat.enablementPluginIds,
       })
-    : allowlistCompat;
+    : params.config;
   const vitestCompat = params.compat?.vitestPluginIds?.length
     ? withBundledPluginVitestCompat({
         config: enablementCompat,
@@ -147,28 +127,17 @@ export function applyPluginCompatibilityOverrides(params: {
 
 function shouldResolveBundledCompatPluginIds(params: {
   compatMode: PluginActivationBundledCompatMode;
-  allowlistCompatEnabled: boolean;
 }): boolean {
-  return (
-    params.allowlistCompatEnabled ||
-    params.compatMode.enablement === "always" ||
-    (params.compatMode.enablement === "allowlist" && params.allowlistCompatEnabled) ||
-    params.compatMode.vitest === true
-  );
+  return params.compatMode.enablement === "always" || params.compatMode.vitest === true;
 }
 
 function createBundledPluginCompatConfig(params: {
   compatMode: PluginActivationBundledCompatMode;
-  allowlistCompatEnabled: boolean;
   compatPluginIds: string[];
 }): PluginActivationCompatConfig {
   return {
-    allowlistPluginIds: params.allowlistCompatEnabled ? params.compatPluginIds : undefined,
     enablementPluginIds:
-      params.compatMode.enablement === "always" ||
-      (params.compatMode.enablement === "allowlist" && params.allowlistCompatEnabled)
-        ? params.compatPluginIds
-        : undefined,
+      params.compatMode.enablement === "always" ? params.compatPluginIds : undefined,
     vitestPluginIds: params.compatMode.vitest ? params.compatPluginIds : undefined,
   };
 }
@@ -204,7 +173,7 @@ function applyPluginAutoEnableForActivation(params: {
   });
 }
 
-export function resolvePluginActivationSnapshot(params: {
+function resolvePluginActivationSnapshot(params: {
   rawConfig?: OpenClawConfig;
   resolvedConfig?: OpenClawConfig;
   autoEnabledReasons?: Record<string, string[]>;
@@ -212,7 +181,7 @@ export function resolvePluginActivationSnapshot(params: {
   workspaceDir?: string;
   applyAutoEnable?: boolean;
   discovery?: PluginDiscoveryResult;
-}): PluginActivationSnapshot {
+}): PluginActivationInputs {
   const env = params.env ?? process.env;
   const rawConfig = params.rawConfig ?? params.resolvedConfig;
   let resolvedConfig = params.resolvedConfig ?? params.rawConfig;
@@ -241,7 +210,7 @@ export function resolvePluginActivationSnapshot(params: {
   };
 }
 
-export function resolvePluginActivationInputs(params: {
+function resolvePluginActivationInputs(params: {
   rawConfig?: OpenClawConfig;
   resolvedConfig?: OpenClawConfig;
   autoEnabledReasons?: Record<string, string[]>;
@@ -289,10 +258,8 @@ export function resolveBundledPluginCompatibleActivationInputs(
     applyAutoEnable: params.applyAutoEnable,
     discovery: params.discovery,
   });
-  const allowlistCompatEnabled = params.compatMode.allowlist === true;
   const shouldResolveCompatPluginIds = shouldResolveBundledCompatPluginIds({
     compatMode: params.compatMode,
-    allowlistCompatEnabled,
   });
   const compatPluginIds = shouldResolveCompatPluginIds
     ? params.resolveCompatPluginIds({
@@ -310,7 +277,6 @@ export function resolveBundledPluginCompatibleActivationInputs(
     workspaceDir: params.workspaceDir,
     compat: createBundledPluginCompatConfig({
       compatMode: params.compatMode,
-      allowlistCompatEnabled,
       compatPluginIds,
     }),
     discovery: params.discovery,
@@ -341,10 +307,8 @@ export function resolveBundledPluginCompatibleLoadValues(
     autoEnabledReasons = autoEnabled.autoEnabledReasons;
   }
 
-  const allowlistCompatEnabled = params.compatMode.allowlist === true;
   const shouldResolveCompatPluginIds = shouldResolveBundledCompatPluginIds({
     compatMode: params.compatMode,
-    allowlistCompatEnabled,
   });
   const compatPluginIds = shouldResolveCompatPluginIds
     ? params.resolveCompatPluginIds({
@@ -358,7 +322,6 @@ export function resolveBundledPluginCompatibleLoadValues(
     config: resolvedConfig,
     compat: createBundledPluginCompatConfig({
       compatMode: params.compatMode,
-      allowlistCompatEnabled,
       compatPluginIds,
     }),
     env,

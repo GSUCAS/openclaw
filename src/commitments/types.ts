@@ -1,3 +1,4 @@
+// Defines commitment records, kinds, and scheduling state.
 export type CommitmentKind = "event_check_in" | "deadline_check" | "care_check_in" | "open_loop";
 
 export type CommitmentSensitivity = "routine" | "personal" | "care";
@@ -16,7 +17,7 @@ export type CommitmentScope = {
   senderId?: string;
 };
 
-export type CommitmentDueWindow = {
+type CommitmentDueWindow = {
   earliestMs: number;
   latestMs: number;
   timezone: string;

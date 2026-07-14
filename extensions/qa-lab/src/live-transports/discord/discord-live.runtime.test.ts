@@ -1,10 +1,13 @@
+// Qa Lab tests cover discord live plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LIVE_TRANSPORT_BASELINE_STANDARD_SCENARIO_IDS,
   findMissingLiveTransportStandardScenarios,
-} from "../shared/live-transport-scenarios.js";
-import { testing } from "./discord-live.runtime.js";
+} from "openclaw/plugin-sdk/qa-live-transport-scenarios";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { discordQaLiveRuntime } from "./discord-live.runtime.js";
+
+const { testing } = discordQaLiveRuntime;
 
 describe("discord live qa runtime", () => {
   afterEach(() => {
@@ -183,6 +186,7 @@ describe("discord live qa runtime", () => {
 
     expect(next.channels?.discord?.voice).toEqual({
       enabled: true,
+      mode: "stt-tts",
       autoJoin: [
         {
           guildId: "123456789012345678",
@@ -358,7 +362,7 @@ describe("discord live qa runtime", () => {
 
   it("renders a human-readable status reaction timeline artifact", () => {
     const html = testing.renderDiscordStatusReactionHtml({
-      scenarioTitle: "Discord status reactions",
+      scenarioTitle: "Discord's status reactions",
       expectedSequence: ["👀", "🤔", "👍"],
       seenSequence: ["👀", "🤔"],
       snapshots: [
@@ -370,7 +374,7 @@ describe("discord live qa runtime", () => {
       ],
     });
 
-    expect(html).toContain("Discord status reactions");
+    expect(html).toContain("Discord&#39;s status reactions");
     expect(html).toContain("Expected: 👀 → 🤔 → 👍");
     expect(html).toContain("Seen: 👀 → 🤔");
   });
@@ -379,13 +383,14 @@ describe("discord live qa runtime", () => {
     const html = testing.renderDiscordThreadReplyAttachmentHtml({
       attachmentFilenames: [],
       expectedAttachmentFilename: "mantis-thread-report.md",
-      messageContent: "Mantis thread attachment reply",
+      messageContent: "Mantis' thread attachment reply",
       scenarioTitle: "Discord thread reply preserves filePath attachment",
       status: "fail",
       threadName: "mantis-thread-filepath-1234",
     });
 
     expect(html).toContain("Attachment missing");
+    expect(html).toContain("Mantis&#39; thread attachment reply");
     expect(html).toContain("No attachments on the SUT thread reply");
     expect(html).toContain("mantis-thread-report.md");
   });
@@ -426,7 +431,7 @@ describe("discord live qa runtime", () => {
       await vi.advanceTimersByTimeAsync(600);
 
       await expect(readyPromise).resolves.toBeUndefined();
-      expect(gateway.call).toHaveBeenCalledTimes(2);
+      expect(gateway["call"]).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
@@ -484,7 +489,7 @@ describe("discord live qa runtime", () => {
       "fetch",
       vi.fn(async (_input: string | URL | globalThis.Request, init?: RequestInit) => {
         expect(init?.headers).toBeInstanceOf(Headers);
-        expect((init?.headers as Headers).get("authorization")).toBe("Bot token");
+        expect((init!.headers as Headers).get("authorization")).toBe("Bot token");
         return new Response(
           JSON.stringify([
             { id: "623456789012345678", name: "help" },
@@ -609,31 +614,32 @@ describe("discord live qa runtime", () => {
     }
   });
 
-  it("uses the Discord API helper timeout for identity probes", async () => {
-    const controller = new AbortController();
-    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+  it("aborts Discord identity probes after the API helper timeout", async () => {
+    vi.useFakeTimers();
     let signal: AbortSignal | undefined;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: string | URL | globalThis.Request, init?: RequestInit) => {
-        signal = init?.signal as AbortSignal | undefined;
-        return new Response(JSON.stringify({ id: "423456789012345678" }), {
-          status: 200,
-          headers: {
-            "content-type": "application/json",
-          },
-        });
-      }),
-    );
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_input: string | URL | globalThis.Request, init?: RequestInit) => {
+          signal = init?.signal as AbortSignal | undefined;
+          return new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new Error("request aborted")), {
+              once: true,
+            });
+          });
+        }),
+      );
 
-    await expect(testing.getCurrentDiscordUser("token")).resolves.toEqual({
-      id: "423456789012345678",
-    });
-    expect(timeoutSpy).toHaveBeenCalledWith(15_000);
-    expect(signal).toBe(controller.signal);
-    expect(signal?.aborted).toBe(false);
-    controller.abort();
-    expect(signal?.aborted).toBe(true);
+      const request = testing.getCurrentDiscordUser("token");
+      const rejection = expect(request).rejects.toBeInstanceOf(Error);
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries Discord REST requests after a 429 rate limit", async () => {

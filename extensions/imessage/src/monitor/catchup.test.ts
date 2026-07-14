@@ -1,41 +1,45 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Imessage tests cover catchup plugin behavior.
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getIMessageRuntime } from "../runtime.js";
+import { installIMessageStateRuntimeForTest } from "../test-support/runtime.js";
 import {
   advanceIMessageCatchupCursor,
   capFailureRetriesMap,
-  loadIMessageCatchupCursor,
+  IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
+  IMESSAGE_CATCHUP_CURSOR_NAMESPACE,
   performIMessageCatchup,
   resolveCatchupConfig,
-  saveIMessageCatchupCursor,
+  resolveIMessageCatchupCursorKey,
   type CatchupDispatchFn,
   type CatchupFetchFn,
+  type IMessageCatchupCursor,
   type IMessageCatchupRow,
 } from "./catchup.js";
 
-let tempStateDir: string;
-let priorStateDir: string | undefined;
-
-beforeAll(() => {
-  tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-imsg-catchup-"));
-  priorStateDir = process.env.OPENCLAW_STATE_DIR;
-  process.env.OPENCLAW_STATE_DIR = tempStateDir;
-});
-
-afterAll(() => {
-  if (priorStateDir === undefined) {
-    delete process.env.OPENCLAW_STATE_DIR;
-  } else {
-    process.env.OPENCLAW_STATE_DIR = priorStateDir;
-  }
-  fs.rmSync(tempStateDir, { recursive: true, force: true });
-});
-
 beforeEach(() => {
-  // Wipe per-account cursor state between tests so each test starts clean.
-  fs.rmSync(path.join(tempStateDir, "imessage", "catchup"), { recursive: true, force: true });
+  installIMessageStateRuntimeForTest();
 });
+
+function openCatchupCursorStore() {
+  return getIMessageRuntime().state.openSyncKeyedStore<IMessageCatchupCursor>({
+    namespace: IMESSAGE_CATCHUP_CURSOR_NAMESPACE,
+    maxEntries: IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
+  });
+}
+
+async function loadIMessageCatchupCursor(accountId: string): Promise<IMessageCatchupCursor | null> {
+  return openCatchupCursorStore().lookup(resolveIMessageCatchupCursorKey(accountId)) ?? null;
+}
+
+async function saveIMessageCatchupCursor(
+  accountId: string,
+  cursor: Omit<IMessageCatchupCursor, "updatedAt">,
+): Promise<void> {
+  openCatchupCursorStore().register(resolveIMessageCatchupCursorKey(accountId), {
+    ...cursor,
+    updatedAt: Date.now(),
+  });
+}
 
 describe("resolveCatchupConfig", () => {
   it("falls back to defaults when raw is undefined", () => {
@@ -74,57 +78,7 @@ describe("resolveCatchupConfig", () => {
   });
 });
 
-describe("loadIMessageCatchupCursor / saveIMessageCatchupCursor", () => {
-  it("returns null when no cursor exists", async () => {
-    const cursor = await loadIMessageCatchupCursor("primary");
-    expect(cursor).toBeNull();
-  });
-
-  it("round-trips a cursor without failureRetries", async () => {
-    await saveIMessageCatchupCursor("primary", {
-      lastSeenMs: 1_700_000_000_000,
-      lastSeenRowid: 42,
-    });
-    const cursor = await loadIMessageCatchupCursor("primary");
-    if (!cursor) {
-      throw new Error("expected iMessage catchup cursor");
-    }
-    expect(cursor.lastSeenMs).toBe(1_700_000_000_000);
-    expect(cursor.lastSeenRowid).toBe(42);
-    expect(cursor.failureRetries).toBeUndefined();
-  });
-
-  it("round-trips a cursor with failureRetries", async () => {
-    await saveIMessageCatchupCursor("primary", {
-      lastSeenMs: 1_700_000_000_000,
-      lastSeenRowid: 42,
-      failureRetries: { "GUID-A": 3 },
-    });
-    const cursor = await loadIMessageCatchupCursor("primary");
-    expect(cursor?.failureRetries).toEqual({ "GUID-A": 3 });
-  });
-
-  it("drops malformed failureRetries entries on load", async () => {
-    await saveIMessageCatchupCursor("primary", {
-      lastSeenMs: 1_700_000_000_000,
-      lastSeenRowid: 42,
-      failureRetries: {
-        "GUID-A": 3,
-        "GUID-B": -1,
-        "GUID-C": Number.NaN,
-      } as Record<string, number>,
-    });
-    const cursor = await loadIMessageCatchupCursor("primary");
-    expect(cursor?.failureRetries).toEqual({ "GUID-A": 3 });
-  });
-
-  it("isolates state per accountId", async () => {
-    await saveIMessageCatchupCursor("a", { lastSeenMs: 100, lastSeenRowid: 1 });
-    await saveIMessageCatchupCursor("b", { lastSeenMs: 200, lastSeenRowid: 2 });
-    expect((await loadIMessageCatchupCursor("a"))?.lastSeenRowid).toBe(1);
-    expect((await loadIMessageCatchupCursor("b"))?.lastSeenRowid).toBe(2);
-  });
-
+describe("advanceIMessageCatchupCursor", () => {
   it("advances monotonically from a live-handled row and preserves given-up retry state", async () => {
     const config = resolveCatchupConfig({ enabled: true, maxFailureRetries: 3 });
     await saveIMessageCatchupCursor("primary", {
@@ -217,6 +171,17 @@ describe("capFailureRetriesMap", () => {
     // Both b and d at 9; tiebreak by guid string (alphabetical) → b, d
     expect(Object.keys(capped).toSorted()).toEqual(["b", "d"]);
   });
+
+  it("keeps the persisted retry map under the plugin-state value budget", () => {
+    const map = Object.fromEntries(
+      Array.from({ length: 800 }, (_, index) => [`GUID-${index}-${"x".repeat(120)}`, index + 1]),
+    );
+
+    const capped = capFailureRetriesMap(map);
+
+    expect(Object.keys(capped).length).toBeLessThanOrEqual(512);
+    expect(new TextEncoder().encode(JSON.stringify(capped)).byteLength).toBeLessThanOrEqual(48_000);
+  });
 });
 
 describe("performIMessageCatchup", () => {
@@ -268,6 +233,7 @@ describe("performIMessageCatchup", () => {
 
   it("skips is_from_me rows but still advances the cursor past them", async () => {
     const dispatch = alwaysOk();
+    const observeSkippedFromMe = vi.fn();
     const fetch = fetchOf([
       row({ guid: "A", rowid: 10, isFromMe: true }),
       row({ guid: "B", rowid: 11, isFromMe: false }),
@@ -279,12 +245,16 @@ describe("performIMessageCatchup", () => {
       now,
       fetch,
       dispatch,
+      observeSkippedFromMe,
     });
 
     expect(summary.skippedFromMe).toBe(1);
     expect(summary.replayed).toBe(1);
     expect(summary.cursorAfter.lastSeenRowid).toBe(11);
     expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(observeSkippedFromMe).toHaveBeenCalledWith(
+      expect.objectContaining({ guid: "A", rowid: 10, isFromMe: true }),
+    );
   });
 
   it("drops rows older than the maxAgeMinutes ceiling and advances past them", async () => {
@@ -419,9 +389,9 @@ describe("performIMessageCatchup", () => {
     // clamped to `earliestHeldFailureRow.rowid - 1` (== 9) so the next pass
     // refetches row 10.
     let dispatchCount = 0;
-    const dispatch = vi.fn<CatchupDispatchFn>(async (row) => {
+    const dispatch = vi.fn<CatchupDispatchFn>(async (rowLocal) => {
       dispatchCount += 1;
-      if (row.guid === "A") {
+      if (rowLocal.guid === "A") {
         return { ok: false };
       }
       return { ok: true };
@@ -446,6 +416,33 @@ describe("performIMessageCatchup", () => {
     // cursor lands at rowid 9 so the next pass refetches row 10.
     expect(summary.cursorAfter.lastSeenRowid).toBe(9);
     expect(dispatchCount).toBe(2);
+
+    const cursor = await loadIMessageCatchupCursor("primary");
+    expect(cursor?.lastSeenRowid).toBe(9);
+    expect(cursor?.failureRetries?.A).toBe(1);
+  });
+
+  it("keeps held failure state when a live monitor advances the same cursor mid-pass", async () => {
+    const dispatch = vi.fn<CatchupDispatchFn>(async () => {
+      await advanceIMessageCatchupCursor(
+        "primary",
+        { lastSeenMs: now - 10_000, lastSeenRowid: 50 },
+        config,
+      );
+      return { ok: false };
+    });
+    const fetch = fetchOf([row({ guid: "A", rowid: 10, date: now - 40_000 })]);
+
+    const summary = await performIMessageCatchup({
+      accountId: "primary",
+      config,
+      now,
+      fetch,
+      dispatch,
+    });
+
+    expect(summary.failed).toBe(1);
+    expect(summary.cursorAfter.lastSeenRowid).toBe(9);
 
     const cursor = await loadIMessageCatchupCursor("primary");
     expect(cursor?.lastSeenRowid).toBe(9);

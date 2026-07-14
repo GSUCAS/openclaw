@@ -1,3 +1,8 @@
+/**
+ * Internal channel ingress access graph types.
+ *
+ * Defines redacted identifiers, allowlist diagnostics, route facts, and decision gates.
+ */
 import type { AccessGroupConfig } from "../../config/types.access-groups.js";
 import type { ChatChannelId } from "../ids.js";
 import type { InboundImplicitMentionKind, InboundMentionFacts } from "../mention-gating.js";
@@ -58,7 +63,7 @@ export type RedactedIngressMatch = {
 };
 
 /** Public normalization result for a set of allowlist entries. */
-export type ChannelIngressNormalizeResult = {
+type ChannelIngressNormalizeResult = {
   matchable: ChannelIngressNormalizedEntry[];
   invalid: RedactedIngressEntryDiagnostic[];
   disabled: RedactedIngressEntryDiagnostic[];

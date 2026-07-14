@@ -1,19 +1,16 @@
+// Google Meet plugin module implements node host behavior.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import {
-  asRecord,
-  normalizeOptionalString as readString,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   DEFAULT_GOOGLE_MEET_AUDIO_INPUT_COMMAND,
   DEFAULT_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND,
 } from "./config.js";
+import { normalizeMeetUrl } from "./meet-url.js";
 import {
   GOOGLE_MEET_SYSTEM_PROFILER_COMMAND,
   outputMentionsBlackHole2ch,
-} from "./transports/chrome.js";
+} from "./transports/chrome-audio-device.js";
 
 type NodeBridgeSession = {
   id: string;
@@ -45,6 +42,20 @@ function readStringArray(value: unknown): string[] | undefined {
     (entry): entry is string => typeof entry === "string" && entry.length > 0,
   );
   return result.length > 0 ? result : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function readNumber(value: unknown, fallback: number): number {
@@ -97,32 +108,28 @@ function wake(session: NodeBridgeSession) {
 }
 
 function stopSession(session: NodeBridgeSession) {
-  const wasClosed = session.closed;
+  // Process and stream errors can arrive together during teardown. Close once
+  // so the same children do not get duplicate termination timers.
+  if (session.closed) {
+    return;
+  }
   session.closed = true;
-  session.closedAt ??= new Date().toISOString();
+  session.closedAt = new Date().toISOString();
   terminateChild(session.input);
   terminateChild(session.output);
-  if (!wasClosed) {
-    wake(session);
-  }
+  wake(session);
 }
 
 function attachOutputProcessHandlers(session: NodeBridgeSession, outputProcess: ChildProcess) {
-  outputProcess.on("exit", () => {
+  const stopIfCurrent = () => {
     if (session.output === outputProcess) {
       stopSession(session);
     }
-  });
-  outputProcess.on("error", () => {
-    if (session.output === outputProcess) {
-      stopSession(session);
-    }
-  });
-  outputProcess.stdin?.on?.("error", () => {
-    if (session.output === outputProcess) {
-      stopSession(session);
-    }
-  });
+  };
+  outputProcess.on("exit", stopIfCurrent);
+  outputProcess.on("error", stopIfCurrent);
+  outputProcess.stdin?.on("error", stopIfCurrent);
+  outputProcess.stderr?.on("error", stopIfCurrent);
 }
 
 function startOutputProcess(command: { command: string; args: string[] }) {
@@ -168,9 +175,12 @@ function startCommandPair(params: {
     }
     wake(session);
   });
-  inputProcess.on("exit", () => stopSession(session));
+  const stop = () => stopSession(session);
+  inputProcess.on("exit", stop);
+  inputProcess.on("error", stop);
+  inputProcess.stdout?.on("error", stop);
+  inputProcess.stderr?.on("error", stop);
   attachOutputProcessHandlers(session, outputProcess);
-  inputProcess.on("error", () => stopSession(session));
   sessions.set(session.id, session);
   return session;
 }
@@ -269,10 +279,7 @@ function clearAudio(params: Record<string, unknown>) {
 }
 
 function startChrome(params: Record<string, unknown>) {
-  const url = readString(params.url);
-  if (!url) {
-    throw new Error("url required");
-  }
+  const url = normalizeMeetUrl(params.url);
   const timeoutMs = readNumber(params.joinTimeoutMs, 30_000);
   const mode = readString(params.mode);
 
@@ -322,12 +329,11 @@ function startChrome(params: Record<string, unknown>) {
   }
 
   if (params.launch !== false) {
-    const argv = ["open", "-a", "Google Chrome"];
+    const argv = ["open", "-a", "Google Chrome", url];
     const browserProfile = readString(params.browserProfile);
     if (browserProfile) {
       argv.push("--args", `--profile-directory=${browserProfile}`);
     }
-    argv.push(url);
     const result = runCommandWithTimeout(argv, timeoutMs);
     if (result.code !== 0) {
       if (bridgeId) {

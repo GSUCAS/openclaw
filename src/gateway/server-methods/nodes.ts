@@ -1,47 +1,12 @@
+// Node gateway methods manage paired node discovery, pairing lifecycle, command
+// invocation, wake delivery, events, pending work, and node metadata updates.
 import { randomUUID } from "node:crypto";
-import { getRuntimeConfig } from "../../config/io.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { listDevicePairing } from "../../infra/device-pairing.js";
-import { formatErrorMessage } from "../../infra/errors.js";
-import {
-  approveNodePairing,
-  listNodePairing,
-  rejectNodePairing,
-  removePairedNode,
-  renamePairedNode,
-  requestNodePairing,
-  verifyNodeToken,
-} from "../../infra/node-pairing.js";
-import {
-  clearApnsRegistrationIfCurrent,
-  loadApnsRegistration,
-  sendApnsAlert,
-  sendApnsBackgroundWake,
-  shouldClearStoredApnsRegistration,
-  resolveApnsAuthConfigFromEnv,
-  resolveApnsRelayConfigFromEnv,
-} from "../../infra/push-apns.js";
-import {
-  recordRemoteNodeInfo,
-  refreshRemoteNodeBins,
-  removeRemoteNodeInfo,
-} from "../../infra/skills-remote.js";
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../../shared/string-coerce.js";
-import { normalizeUniqueTrimmedStringList } from "../../shared/string-normalization.js";
-import { createKnownNodeCatalog, getKnownNode, listKnownNodes } from "../node-catalog.js";
-import {
-  isForegroundRestrictedPluginNodeCommand,
-  isNodeCommandAllowed,
-  normalizeDeclaredNodeCommands,
-  resolveNodeCommandAllowlist,
-} from "../node-command-policy.js";
-import { applyPluginNodeInvokePolicy } from "../node-invoke-plugin-policy.js";
-import { sanitizeNodeInvokeParamsForForwarding } from "../node-invoke-sanitize.js";
-import type { NodeSession } from "../node-registry.js";
-import { refreshClientPluginNodeCapability } from "../plugin-node-capability.js";
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import {
   type ConnectParams,
   ErrorCodes,
@@ -55,11 +20,65 @@ import {
   validateNodePairListParams,
   validateNodePairRejectParams,
   validateNodePairRemoveParams,
-  validateNodePairRequestParams,
-  validateNodePairVerifyParams,
+  validateNodePluginToolsUpdateParams,
+  validateNodeSkillsUpdateParams,
   validateNodeRenameParams,
-} from "../protocol/index.js";
+} from "../../../packages/gateway-protocol/src/index.js";
+import { getRuntimeConfig } from "../../config/io.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  getPairedDevice,
+  listApprovedPairedDeviceRoles,
+  listDevicePairing,
+  removePairedDeviceRole,
+} from "../../infra/device-pairing.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { NODE_ADMIN_ONLY_INVOKE_COMMANDS } from "../../infra/node-commands.js";
+import {
+  approveNodePairing,
+  listNodePairing,
+  rejectNodePairing,
+  renamePairedNode,
+} from "../../infra/node-pairing.js";
+import {
+  clearApnsRegistrationIfCurrent,
+  loadApnsRegistration,
+  sendApnsAlert,
+  sendApnsBackgroundWake,
+  shouldClearStoredApnsRegistration,
+  resolveApnsAuthConfigFromEnv,
+  resolveApnsRelayConfigFromEnv,
+} from "../../infra/push-apns.js";
+import type { NodeListNode } from "../../shared/node-list-types.js";
+import { replaceRemoteNodeSkills } from "../../skills/runtime/remote-skills.js";
+import {
+  recordRemoteNodeInfo,
+  refreshRemoteNodeBins,
+  removeRemoteNodeInfo,
+} from "../../skills/runtime/remote.js";
+import { createKnownNodeCatalog, getKnownNode, listKnownNodes } from "../node-catalog.js";
+import {
+  isForegroundRestrictedPluginNodeCommand,
+  isNodeCommandAllowed,
+  normalizeDeclaredNodeCommands,
+  resolveNodeCommandAllowlist,
+  resolveNodePairingCommandAllowlist,
+} from "../node-command-policy.js";
+import { applyPluginNodeInvokePolicy } from "../node-invoke-plugin-policy.js";
+import { sanitizeNodeInvokeParamsForForwarding } from "../node-invoke-sanitize.js";
+import type { NodeSession } from "../node-registry.js";
+import { ADMIN_SCOPE } from "../operator-scopes.js";
+import { refreshClientPluginNodeCapability } from "../plugin-node-capability.js";
 import type { NodeEventContext } from "../server-node-events-types.js";
+import {
+  deniesCrossDeviceManagement,
+  pairedDeviceHasNonOperatorRole,
+  resolveDeviceManagementAuthz,
+  type DeviceManagementAuthz,
+} from "./device-management-authz.js";
+import { emitDeviceManagementSecurityEvent } from "./device-management-security.js";
+import { buildNodeCommandRejectionHint } from "./node-command-rejection-hint.js";
+import { nodeInvokePolicy } from "./nodes-policy.js";
 import {
   NODE_WAKE_RECONNECT_POLL_MS,
   NODE_WAKE_RECONNECT_RETRY_WAIT_MS,
@@ -68,6 +87,7 @@ import {
   nodeWakeNudgeById,
   type NodeWakeAttempt,
 } from "./nodes-wake-state.js";
+import { handleNodeInvokeProgress } from "./nodes.handlers.invoke-progress.js";
 import { handleNodeInvokeResult } from "./nodes.handlers.invoke-result.js";
 import {
   respondInvalidParams,
@@ -84,16 +104,13 @@ export {
   NODE_WAKE_RECONNECT_WAIT_MS,
 } from "./nodes-wake-state.js";
 
-const NODE_WAKE_THROTTLE_MS = 15_000;
-const NODE_WAKE_NUDGE_THROTTLE_MS = 10 * 60_000;
-const NODE_PENDING_ACTION_TTL_MS = 10 * 60_000;
-const NODE_PENDING_ACTION_MAX_PER_NODE = 64;
 const TALK_PTT_COMMANDS = new Set([
   "talk.ptt.start",
   "talk.ptt.stop",
   "talk.ptt.cancel",
   "talk.ptt.once",
 ]);
+const ADMIN_ONLY_NODE_INVOKE_COMMANDS = new Set<string>(NODE_ADMIN_ONLY_INVOKE_COMMANDS);
 const talkPttEventSeqBySessionId = new Map<string, number>();
 
 type NodeWakeNudgeAttempt = {
@@ -111,10 +128,61 @@ type PendingNodeAction = {
   command: string;
   paramsJSON?: string;
   idempotencyKey: string;
+
   enqueuedAtMs: number;
 };
 
 const pendingNodeActionsById = new Map<string, PendingNodeAction[]>();
+
+function safeNodeReadProjection(
+  node: NodeListNode,
+  ownDeviceId: string | undefined,
+): NodeListNode | null {
+  if (!node.paired && !node.connected) {
+    return null;
+  }
+  const {
+    pendingRequestId,
+    pendingDeclaredCaps: _pendingDeclaredCaps,
+    pendingDeclaredCommands: _pendingDeclaredCommands,
+    pendingDeclaredPermissions: _pendingDeclaredPermissions,
+    ...safeNode
+  } = node;
+  // A read-scoped mobile client may guide its user to approve this phone, but must not expose
+  // another node's approval target or any pending capability declaration.
+  return node.nodeId === ownDeviceId && pendingRequestId
+    ? { ...safeNode, pendingRequestId }
+    : safeNode;
+}
+
+function nodeReadCallerDeviceId(client: GatewayClient | null): string | undefined {
+  return normalizeOptionalString(client?.connect?.device?.id);
+}
+
+function isVisibleNode(node: NodeListNode | null): node is NodeListNode {
+  return node !== null;
+}
+
+function listNodesForClient(params: {
+  client: GatewayClient | null;
+  pairedDevices: Awaited<ReturnType<typeof listDevicePairing>>["paired"];
+  pairedNodes: Awaited<ReturnType<typeof listNodePairing>>["paired"];
+  pendingNodes: Awaited<ReturnType<typeof listNodePairing>>["pending"];
+  connectedNodes: readonly NodeSession[];
+}): NodeListNode[] {
+  const catalog = createKnownNodeCatalog({
+    pairedDevices: params.pairedDevices,
+    pairedNodes: params.pairedNodes,
+    pendingNodes: params.pendingNodes,
+    connectedNodes: params.connectedNodes,
+  });
+  const nodes = listKnownNodes(catalog);
+  if (nodeInvokePolicy.canReadPendingNodePairing(params.client)) {
+    return nodes;
+  }
+  const ownDeviceId = nodeReadCallerDeviceId(params.client);
+  return nodes.map((node) => safeNodeReadProjection(node, ownDeviceId)).filter(isVisibleNode);
+}
 
 function normalizeBrowserProxyPath(value: string): string {
   const trimmed = value.trim();
@@ -199,8 +267,16 @@ async function resolveDirectNodePushConfig() {
     : { ok: false as const, error: auth.error };
 }
 
-function resolveRelayNodePushConfig(cfg: OpenClawConfig) {
-  const relay = resolveApnsRelayConfigFromEnv(process.env, cfg.gateway);
+function resolveRelayNodePushConfig(
+  cfg: OpenClawConfig,
+  registration: Extract<
+    NonNullable<Awaited<ReturnType<typeof loadApnsRegistration>>>,
+    { transport: "relay" }
+  >,
+) {
+  const relay = resolveApnsRelayConfigFromEnv(process.env, cfg.gateway, {
+    registrationRelayOrigin: registration.relayOrigin,
+  });
   return relay.ok
     ? { ok: true as const, relayConfig: relay.value }
     : { ok: false as const, error: relay.error };
@@ -226,7 +302,9 @@ async function clearStaleApnsRegistrationIfNeeded(
 }
 
 async function delayMs(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function isForegroundRestrictedIosCommand(command: string): boolean {
@@ -243,6 +321,8 @@ function shouldQueueAsPendingForegroundAction(params: {
   command: string;
   error: unknown;
 }): boolean {
+  // iOS cannot run camera/screen/Talk commands in the background. Queue only
+  // those foreground-only commands when the node explicitly reports that state.
   const platform = normalizeLowercaseStringOrEmpty(params.platform);
   if (!platform.startsWith("ios") && !platform.startsWith("ipados")) {
     return false;
@@ -261,7 +341,7 @@ function shouldQueueAsPendingForegroundAction(params: {
 
 function prunePendingNodeActions(nodeId: string, nowMs: number): PendingNodeAction[] {
   const queue = pendingNodeActionsById.get(nodeId) ?? [];
-  const minTimestampMs = nowMs - NODE_PENDING_ACTION_TTL_MS;
+  const minTimestampMs = nowMs - nodeInvokePolicy.pendingActionTtlMs;
   const live = queue.filter((entry) => entry.enqueuedAtMs >= minTimestampMs);
   if (live.length === 0) {
     pendingNodeActionsById.delete(nodeId);
@@ -269,6 +349,128 @@ function prunePendingNodeActions(nodeId: string, nowMs: number): PendingNodeActi
   }
   pendingNodeActionsById.set(nodeId, live);
   return live;
+}
+
+function clearRemovedNodeRuntimeState(params: {
+  nodeId: string;
+  context: Pick<GatewayRequestContext, "nodeRegistry">;
+}) {
+  pendingNodeActionsById.delete(params.nodeId);
+  params.context.nodeRegistry.updateSurface(params.nodeId, {
+    caps: [],
+    commands: [],
+    permissions: undefined,
+  });
+  removeRemoteNodeInfo(params.nodeId);
+}
+
+function broadcastRemovedNodePairing(params: {
+  context: Pick<GatewayRequestContext, "broadcast">;
+  nodeId: string;
+}) {
+  params.context.broadcast(
+    "node.pair.resolved",
+    {
+      requestId: "",
+      nodeId: params.nodeId,
+      decision: "removed",
+      ts: Date.now(),
+    },
+    { dropIfSlow: true },
+  );
+}
+
+function emitNodeRoleRemovalSecurityEvent(params: {
+  authz: DeviceManagementAuthz;
+  deviceId: string;
+  reason?: string;
+  removedDevice?: boolean;
+}): void {
+  const denied = params.reason !== undefined;
+  emitDeviceManagementSecurityEvent({
+    action: denied ? "device.role.removal_denied" : "device.role.removed",
+    outcome: denied ? "denied" : "success",
+    severity: "medium",
+    authz: params.authz,
+    targetDeviceId: params.deviceId,
+    policyId: "gateway.device-pairing",
+    decision: denied ? "deny" : "allow",
+    controlId: "node.pair.remove",
+    ...(params.reason ? { reason: params.reason } : {}),
+    attributes: {
+      role: "node",
+      ...(params.removedDevice !== undefined ? { removed_device: params.removedDevice } : {}),
+    },
+  });
+}
+
+async function removePairedDeviceBackedNode(params: {
+  nodeId: string;
+  client: GatewayClient | null;
+  context: Pick<
+    GatewayRequestContext,
+    "disconnectClientsForDevice" | "invalidateClientsForDevice" | "logGateway"
+  >;
+}): Promise<
+  | { status: "removed"; nodeId: string; disconnectDeviceId: string }
+  | { status: "denied"; message: string }
+  | { status: "unknown" }
+> {
+  const nodeId = params.nodeId.trim();
+  if (!nodeId) {
+    return { status: "unknown" };
+  }
+  const paired = await getPairedDevice(nodeId);
+  if (!paired || !listApprovedPairedDeviceRoles(paired).includes("node")) {
+    return { status: "unknown" };
+  }
+
+  const authz = resolveDeviceManagementAuthz(params.client, nodeId);
+  if (deniesCrossDeviceManagement(authz)) {
+    params.context.logGateway.warn(
+      `node pairing removal denied node=${nodeId} reason=device-ownership-mismatch`,
+    );
+    emitNodeRoleRemovalSecurityEvent({
+      authz,
+      deviceId: nodeId,
+      reason: "device-ownership-mismatch",
+    });
+    return { status: "denied", message: "node pairing removal denied" };
+  }
+  // Mirror device.pair.remove: the admin requirement for mixed-role rows only
+  // applies to device-token self-service callers (callerDeviceId set). Shared-auth
+  // / CLI operators holding operator.pairing manage pairings on others' behalf and
+  // are allowed to remove non-operator (e.g. node) rows without operator.admin.
+  if (authz.callerDeviceId && !authz.isAdminCaller && pairedDeviceHasNonOperatorRole(paired)) {
+    params.context.logGateway.warn(
+      `node pairing removal denied node=${nodeId} reason=role-management-requires-admin`,
+    );
+    emitNodeRoleRemovalSecurityEvent({
+      authz,
+      deviceId: nodeId,
+      reason: "role-management-requires-admin",
+    });
+    return { status: "denied", message: "node pairing removal denied" };
+  }
+
+  const removed = await removePairedDeviceRole({ deviceId: nodeId, role: "node" });
+  if (!removed) {
+    return { status: "unknown" };
+  }
+  params.context.logGateway.info(`node pairing removed device-backed node=${removed.deviceId}`);
+  emitNodeRoleRemovalSecurityEvent({
+    authz,
+    deviceId: removed.deviceId,
+    removedDevice: removed.removedDevice,
+  });
+  // Match device.pair.remove: invalidate before responding so pipelined frames
+  // on the affected device token are rejected. The caller queues the hard close
+  // only after the success response is emitted.
+  params.context.invalidateClientsForDevice?.(removed.deviceId, {
+    role: "node",
+    reason: "device-pair-removed",
+  });
+  return { status: "removed", nodeId: removed.deviceId, disconnectDeviceId: removed.deviceId };
 }
 
 function enqueuePendingNodeAction(params: {
@@ -281,6 +483,8 @@ function enqueuePendingNodeAction(params: {
   const queue = prunePendingNodeActions(params.nodeId, nowMs);
   const existing = queue.find((entry) => entry.idempotencyKey === params.idempotencyKey);
   if (existing) {
+    // Keep retries idempotent so callers do not create duplicate foreground
+    // actions while the node is still backgrounded.
     return existing;
   }
   const entry: PendingNodeAction = {
@@ -292,8 +496,8 @@ function enqueuePendingNodeAction(params: {
     enqueuedAtMs: nowMs,
   };
   queue.push(entry);
-  if (queue.length > NODE_PENDING_ACTION_MAX_PER_NODE) {
-    queue.splice(0, queue.length - NODE_PENDING_ACTION_MAX_PER_NODE);
+  if (queue.length > nodeInvokePolicy.pendingActionMaxPerNode) {
+    queue.splice(0, queue.length - nodeInvokePolicy.pendingActionMaxPerNode);
   }
   pendingNodeActionsById.set(params.nodeId, queue);
   return entry;
@@ -312,6 +516,7 @@ function refreshConnectedNodeSurfaceCaches(params: {
   const { nodeSession } = params;
   recordRemoteNodeInfo({
     nodeId: nodeSession.nodeId,
+    connId: nodeSession.connId,
     displayName: nodeSession.displayName,
     platform: nodeSession.platform,
     deviceFamily: nodeSession.deviceFamily,
@@ -324,7 +529,7 @@ function refreshConnectedNodeSurfaceCaches(params: {
     deviceFamily: nodeSession.deviceFamily,
     commands: nodeSession.commands,
     cfg,
-  }).catch((err) =>
+  }).catch((err: unknown) =>
     params.context.logGateway.warn(
       `remote bin probe failed for ${nodeSession.nodeId}: ${formatErrorMessage(err)}`,
     ),
@@ -340,6 +545,8 @@ function resolveAllowedPendingNodeActions(params: {
   if (pending.length === 0) {
     return pending;
   }
+  // Re-filter queued actions against the node's current declared commands and
+  // allowlist; app upgrades or permission changes can make old actions unsafe.
   const connect = params.client?.connect;
   const declaredCommands = Array.isArray(connect?.commands) ? connect.commands : [];
   const allowlist = resolveNodeCommandAllowlist(params.cfg, {
@@ -468,7 +675,11 @@ export async function maybeWakeNodeWithApns(
 
   const now = Date.now();
   const force = opts?.force === true;
-  if (!force && state.lastWakeAtMs > 0 && now - state.lastWakeAtMs < NODE_WAKE_THROTTLE_MS) {
+  if (
+    !force &&
+    state.lastWakeAtMs > 0 &&
+    now - state.lastWakeAtMs < nodeInvokePolicy.wakeThrottleMs
+  ) {
     return { available: true, throttled: true, path: "throttled", durationMs: 0 };
   }
 
@@ -493,7 +704,7 @@ export async function maybeWakeNodeWithApns(
 
       let wakeResult;
       if (registration.transport === "relay") {
-        const relay = resolveRelayNodePushConfig(opts?.cfg ?? getRuntimeConfig());
+        const relay = resolveRelayNodePushConfig(opts?.cfg ?? getRuntimeConfig(), registration);
         if (!relay.ok) {
           return withDuration({
             available: false,
@@ -584,7 +795,7 @@ export async function maybeSendNodeWakeNudge(
   });
 
   const lastNudgeAtMs = nodeWakeNudgeById.get(nodeId) ?? 0;
-  if (lastNudgeAtMs > 0 && Date.now() - lastNudgeAtMs < NODE_WAKE_NUDGE_THROTTLE_MS) {
+  if (lastNudgeAtMs > 0 && Date.now() - lastNudgeAtMs < nodeInvokePolicy.wakeNudgeThrottleMs) {
     return withDuration({ sent: false, throttled: true, reason: "throttled" });
   }
 
@@ -595,7 +806,7 @@ export async function maybeSendNodeWakeNudge(
   try {
     let result;
     if (registration.transport === "relay") {
-      const relay = resolveRelayNodePushConfig(opts?.cfg ?? getRuntimeConfig());
+      const relay = resolveRelayNodePushConfig(opts?.cfg ?? getRuntimeConfig(), registration);
       if (!relay.ok) {
         return withDuration({
           sent: false,
@@ -664,8 +875,8 @@ export async function waitForNodeReconnect(params: {
   timeoutMs?: number;
   pollMs?: number;
 }): Promise<boolean> {
-  const timeoutMs = Math.max(250, params.timeoutMs ?? NODE_WAKE_RECONNECT_WAIT_MS);
-  const pollMs = Math.max(50, params.pollMs ?? NODE_WAKE_RECONNECT_POLL_MS);
+  const timeoutMs = resolveTimerTimeoutMs(params.timeoutMs, NODE_WAKE_RECONNECT_WAIT_MS, 250);
+  const pollMs = resolveTimerTimeoutMs(params.pollMs, NODE_WAKE_RECONNECT_POLL_MS, 50);
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -678,53 +889,6 @@ export async function waitForNodeReconnect(params: {
 }
 
 export const nodeHandlers: GatewayRequestHandlers = {
-  "node.pair.request": async ({ params, respond, context }) => {
-    if (!validateNodePairRequestParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.pair.request",
-        validator: validateNodePairRequestParams,
-      });
-      return;
-    }
-    const p = params as Parameters<typeof requestNodePairing>[0];
-    await respondUnavailableOnThrow(respond, async () => {
-      const result = await requestNodePairing({
-        nodeId: p.nodeId,
-        displayName: p.displayName,
-        platform: p.platform,
-        version: p.version,
-        coreVersion: p.coreVersion,
-        uiVersion: p.uiVersion,
-        deviceFamily: p.deviceFamily,
-        modelIdentifier: p.modelIdentifier,
-        caps: p.caps,
-        commands: p.commands,
-        permissions: p.permissions,
-        remoteIp: p.remoteIp,
-        silent: p.silent,
-      });
-      const resolvedAt = Date.now();
-      for (const superseded of result.superseded ?? []) {
-        context.broadcast(
-          "node.pair.resolved",
-          {
-            requestId: superseded.requestId,
-            nodeId: superseded.nodeId,
-            decision: "rejected",
-            ts: resolvedAt,
-          },
-          { dropIfSlow: true },
-        );
-      }
-      if (result.status === "pending" && result.created) {
-        context.broadcast("node.pair.requested", result.request, {
-          dropIfSlow: true,
-        });
-      }
-      respond(true, result, undefined);
-    });
-  },
   "node.pair.list": async ({ params, respond }) => {
     if (!validateNodePairListParams(params)) {
       respondInvalidParams({
@@ -771,7 +935,10 @@ export const nodeHandlers: GatewayRequestHandlers = {
       }
       const approvedNode = approved.node;
       const cfg = context.getRuntimeConfig();
-      const currentAllowlist = resolveNodeCommandAllowlist(cfg, {
+      // Pairing allowlist, matching connect-time reconciliation: approved
+      // dangerous surfaces (e.g. computer.act) stay on the live session so a
+      // later arming works without a reconnect; invoke policy still gates use.
+      const currentAllowlist = resolveNodePairingCommandAllowlist(cfg, {
         platform: approvedNode.platform,
         deviceFamily: approvedNode.deviceFamily,
         caps: approvedNode.caps,
@@ -832,7 +999,15 @@ export const nodeHandlers: GatewayRequestHandlers = {
       respond(true, rejected, undefined);
     });
   },
-  "node.pair.remove": async ({ params, respond, context }) => {
+  // Remove a node pairing (CLI: `openclaw nodes remove`). This revokes the
+  // device's `node` role in devices/paired.json, which drops the approved node
+  // surface with it, and disconnects the device's node-role sessions: a
+  // mixed-role device keeps its row and only loses the `node` role, a
+  // node-only device row is deleted. Authz mirrors device.pair.remove:
+  // operator.pairing may remove non-operator node rows; a device-token caller
+  // revoking its own node role on a mixed-role device additionally needs
+  // operator.admin (see removePairedDeviceBackedNode).
+  "node.pair.remove": async ({ params, respond, context, client }) => {
     if (!validateNodePairRemoveParams(params)) {
       respondInvalidParams({
         respond,
@@ -843,47 +1018,28 @@ export const nodeHandlers: GatewayRequestHandlers = {
     }
     const { nodeId } = params as { nodeId: string };
     await respondUnavailableOnThrow(respond, async () => {
-      const removed = await removePairedNode(nodeId);
-      if (!removed) {
+      const deviceBacked = await removePairedDeviceBackedNode({ nodeId, client, context });
+      if (deviceBacked.status === "denied") {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, deviceBacked.message));
+        return;
+      }
+      if (deviceBacked.status !== "removed") {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"));
         return;
       }
-      pendingNodeActionsById.delete(removed.nodeId);
-      context.nodeRegistry.updateSurface(removed.nodeId, {
-        caps: [],
-        commands: [],
-        permissions: undefined,
-      });
-      removeRemoteNodeInfo(removed.nodeId);
-      context.broadcast(
-        "node.pair.resolved",
-        {
-          requestId: "",
-          nodeId: removed.nodeId,
-          decision: "removed",
-          ts: Date.now(),
-        },
-        { dropIfSlow: true },
-      );
-      respond(true, removed, undefined);
-    });
-  },
-  "node.pair.verify": async ({ params, respond }) => {
-    if (!validateNodePairVerifyParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.pair.verify",
-        validator: validateNodePairVerifyParams,
-      });
-      return;
-    }
-    const { nodeId, token } = params as {
-      nodeId: string;
-      token: string;
-    };
-    await respondUnavailableOnThrow(respond, async () => {
-      const result = await verifyNodeToken(nodeId, token);
-      respond(true, result, undefined);
+      try {
+        clearRemovedNodeRuntimeState({ nodeId: deviceBacked.nodeId, context });
+        broadcastRemovedNodePairing({ nodeId: deviceBacked.nodeId, context });
+        respond(true, { nodeId: deviceBacked.nodeId }, undefined);
+      } finally {
+        // Preserve response-first shutdown on success, while guaranteeing the
+        // hard close when runtime cleanup or later bookkeeping throws.
+        queueMicrotask(() => {
+          context.disconnectClientsForDevice?.(deviceBacked.disconnectDeviceId, {
+            role: "node",
+          });
+        });
+      }
     });
   },
   "node.rename": async ({ params, respond }) => {
@@ -913,7 +1069,7 @@ export const nodeHandlers: GatewayRequestHandlers = {
       respond(true, { nodeId: updated.nodeId, displayName: updated.displayName }, undefined);
     });
   },
-  "node.list": async ({ params, respond, context }) => {
+  "node.list": async ({ params, respond, client, context }) => {
     if (!validateNodeListParams(params)) {
       respondInvalidParams({
         respond,
@@ -927,16 +1083,21 @@ export const nodeHandlers: GatewayRequestHandlers = {
         listDevicePairing(),
         listNodePairing(),
       ]);
-      const catalog = createKnownNodeCatalog({
+      const nodes = listNodesForClient({
+        client,
         pairedDevices: devicePairing.paired,
         pairedNodes: nodePairing.paired,
+        pendingNodes: nodePairing.pending,
         connectedNodes: context.nodeRegistry.listConnected(),
       });
-      const nodes = listKnownNodes(catalog);
-      respond(true, { ts: Date.now(), nodes }, undefined);
+      const activeNodeId = context.nodeRegistry.getActiveNode()?.nodeId;
+      const nodesWithPresence = activeNodeId
+        ? nodes.map((node) => (node.nodeId === activeNodeId ? { ...node, active: true } : node))
+        : nodes;
+      respond(true, { ts: Date.now(), activeNodeId, nodes: nodesWithPresence }, undefined);
     });
   },
-  "node.describe": async ({ params, respond, context }) => {
+  "node.describe": async ({ params, respond, client, context }) => {
     if (!validateNodeDescribeParams(params)) {
       respondInvalidParams({
         respond,
@@ -959,14 +1120,29 @@ export const nodeHandlers: GatewayRequestHandlers = {
       const catalog = createKnownNodeCatalog({
         pairedDevices: devicePairing.paired,
         pairedNodes: nodePairing.paired,
+        pendingNodes: nodePairing.pending,
         connectedNodes: context.nodeRegistry.listConnected(),
       });
-      const node = getKnownNode(catalog, id);
+      const catalogNode = getKnownNode(catalog, id);
+      const node =
+        catalogNode && nodeInvokePolicy.canReadPendingNodePairing(client)
+          ? catalogNode
+          : catalogNode
+            ? safeNodeReadProjection(catalogNode, nodeReadCallerDeviceId(client))
+            : null;
       if (!node) {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"));
         return;
       }
-      respond(true, { ts: Date.now(), ...node }, undefined);
+      respond(
+        true,
+        {
+          ts: Date.now(),
+          ...node,
+          ...(context.nodeRegistry.getActiveNode()?.nodeId === id ? { active: true } : {}),
+        },
+        undefined,
+      );
     });
   },
   "node.pluginSurface.refresh": async ({ params, respond, client }) => {
@@ -980,6 +1156,61 @@ export const nodeHandlers: GatewayRequestHandlers = {
       client,
       respond,
     });
+  },
+  "node.pluginTools.update": async ({ params, respond, client, context }) => {
+    if (!validateNodePluginToolsUpdateParams(params)) {
+      respondInvalidParams({
+        respond,
+        method: "node.pluginTools.update",
+        validator: validateNodePluginToolsUpdateParams,
+      });
+      return;
+    }
+    const nodeId = normalizeOptionalString(
+      client?.connect?.device?.id ?? client?.connect?.client?.id,
+    );
+    if (!nodeId) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "nodeId required"));
+      return;
+    }
+    const updated = context.nodeRegistry.updateNodePluginTools(
+      nodeId,
+      client?.connId,
+      params.tools,
+    );
+    if (!updated) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"));
+      return;
+    }
+    respond(true, { nodeId, tools: updated.nodePluginTools }, undefined);
+  },
+  "node.skills.update": async ({ params, respond, client, context }) => {
+    if (!validateNodeSkillsUpdateParams(params)) {
+      respondInvalidParams({
+        respond,
+        method: "node.skills.update",
+        validator: validateNodeSkillsUpdateParams,
+      });
+      return;
+    }
+    const nodeId = normalizeOptionalString(
+      client?.connect?.device?.id ?? client?.connect?.client?.id,
+    );
+    if (!nodeId) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "nodeId required"));
+      return;
+    }
+    const updated = context.nodeRegistry.updateNodeSkills(nodeId, client?.connId, params.skills);
+    if (!updated) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"));
+      return;
+    }
+    replaceRemoteNodeSkills({
+      nodeId,
+      displayName: updated.displayName,
+      skills: updated.nodeSkills,
+    });
+    respond(true, { nodeId, skills: updated.nodeSkills }, undefined);
   },
   "node.pending.pull": async ({ params, respond, client, context }) => {
     if (!validateNodeListParams(params)) {
@@ -1058,6 +1289,10 @@ export const nodeHandlers: GatewayRequestHandlers = {
       params?: unknown;
       timeoutMs?: number;
       idempotencyKey: string;
+      turnSourceChannel?: string;
+      turnSourceTo?: string;
+      turnSourceAccountId?: string;
+      turnSourceThreadId?: string | number;
     };
     const nodeId = normalizeOptionalString(p.nodeId) ?? "";
     const command = normalizeOptionalString(p.command) ?? "";
@@ -1081,6 +1316,9 @@ export const nodeHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    if (nodeInvokePolicy.rejectClaudeAgentRun(command, respond)) {
+      return;
+    }
     if (command === "browser.proxy" && isForbiddenBrowserProxyMutation(p.params)) {
       respond(
         false,
@@ -1093,7 +1331,17 @@ export const nodeHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-
+    if (
+      ADMIN_ONLY_NODE_INVOKE_COMMANDS.has(command) &&
+      !nodeInvokePolicy.clientHasOperatorAdminScope(client)
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, `missing scope: ${ADMIN_SCOPE}`),
+      );
+      return;
+    }
     await respondUnavailableOnThrow(respond, async () => {
       const cfg = context.getRuntimeConfig();
       let nodeSession = context.nodeRegistry.get(nodeId);
@@ -1177,25 +1425,34 @@ export const nodeHandlers: GatewayRequestHandlers = {
           `node wake done node=${nodeId} req=${wakeReqId} connected=true totalMs=${totalDurationMs}`,
         );
       }
-      const allowlist = resolveNodeCommandAllowlist(cfg, {
-        ...nodeSession,
-        approvedCommands: nodeSession.commands,
-      });
-      const allowed = isNodeCommandAllowed({
-        command,
-        declaredCommands: nodeSession.commands,
-        allowlist,
-      });
-      if (!allowed.ok) {
-        const hint = buildNodeCommandRejectionHint(allowed.reason, command, nodeSession);
-        respond(
-          false,
-          undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, hint, {
-            details: { reason: allowed.reason, command },
-          }),
-        );
-        return;
+      // A reload may revoke authority for an in-flight request, but it must not
+      // retroactively grant one that was denied when admitted before node wake.
+      for (const authorizationCfg of [cfg, context.getRuntimeConfig()]) {
+        const allowlist = resolveNodeCommandAllowlist(authorizationCfg, {
+          ...nodeSession,
+          approvedCommands: nodeSession.commands,
+        });
+        const allowed = isNodeCommandAllowed({
+          command,
+          declaredCommands: nodeSession.commands,
+          allowlist,
+        });
+        if (!allowed.ok) {
+          const hint = buildNodeCommandRejectionHint(
+            allowed.reason,
+            command,
+            nodeSession,
+            authorizationCfg,
+          );
+          respond(
+            false,
+            undefined,
+            errorShape(ErrorCodes.INVALID_REQUEST, hint, {
+              details: { reason: allowed.reason, command },
+            }),
+          );
+          return;
+        }
       }
 
       const forwardedParams = sanitizeNodeInvokeParamsForForwarding({
@@ -1221,10 +1478,18 @@ export const nodeHandlers: GatewayRequestHandlers = {
         nodeSession,
         command,
         params: forwardedParams.params,
+        turnSource: {
+          channel: p.turnSourceChannel,
+          to: p.turnSourceTo,
+          accountId: p.turnSourceAccountId,
+          threadId: p.turnSourceThreadId,
+        },
         timeoutMs: p.timeoutMs,
         idempotencyKey: p.idempotencyKey,
       });
       if (policyResult) {
+        // Plugin policies can satisfy an invocation without crossing the raw
+        // node command channel; still emit mirrored Talk events for UI state.
         if (!policyResult.ok) {
           const errorCode = policyResult.unavailable
             ? ErrorCodes.UNAVAILABLE
@@ -1263,8 +1528,48 @@ export const nodeHandlers: GatewayRequestHandlers = {
         );
         return;
       }
+      const dispatchSession = context.nodeRegistry.get(nodeId);
+      if (!dispatchSession || dispatchSession.connId !== nodeSession.connId) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.UNAVAILABLE, "node connection changed before dispatch", {
+            retryable: true,
+            details: { code: "ROUTE_CHANGED" },
+          }),
+        );
+        return;
+      }
+      const dispatchCfg = context.getRuntimeConfig();
+      const dispatchAllowlist = resolveNodeCommandAllowlist(dispatchCfg, {
+        ...dispatchSession,
+        approvedCommands: dispatchSession.commands,
+      });
+      const dispatchAllowed = isNodeCommandAllowed({
+        command,
+        declaredCommands: dispatchSession.commands,
+        allowlist: dispatchAllowlist,
+      });
+      if (!dispatchAllowed.ok) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            buildNodeCommandRejectionHint(
+              dispatchAllowed.reason,
+              command,
+              dispatchSession,
+              dispatchCfg,
+            ),
+            { details: { reason: dispatchAllowed.reason, command } },
+          ),
+        );
+        return;
+      }
       const res = await context.nodeRegistry.invoke({
         nodeId,
+        expectedConnId: nodeSession.connId,
         command,
         params: forwardedParams.params,
         timeoutMs: p.timeoutMs,
@@ -1278,6 +1583,8 @@ export const nodeHandlers: GatewayRequestHandlers = {
             error: res.error,
           })
         ) {
+          // Foreground-only iOS commands become pullable pending actions instead
+          // of failing permanently while the device is locked/backgrounded.
           const paramsJSON = toPendingParamsJSON(forwardedParams.params);
           const queued = enqueuePendingNodeAction({
             nodeId,
@@ -1342,6 +1649,7 @@ export const nodeHandlers: GatewayRequestHandlers = {
       );
     });
   },
+  "node.invoke.progress": handleNodeInvokeProgress,
   "node.invoke.result": handleNodeInvokeResult,
   "node.event": async ({ params, respond, context, client }) => {
     if (!validateNodeEventParams(params)) {
@@ -1362,6 +1670,11 @@ export const nodeHandlers: GatewayRequestHandlers = {
     await respondUnavailableOnThrow(respond, async () => {
       const { handleNodeEvent } = await import("../server-node-events.js");
       const nodeId = client?.connect?.device?.id ?? client?.connect?.client?.id ?? "node";
+      const nodeSession = context.nodeRegistry.get(nodeId);
+      const presenceAllowed =
+        nodeSession !== undefined &&
+        nodeSession.connId === client?.connId &&
+        nodeSession.permissions?.accessibility === true;
       const nodeContext: NodeEventContext = {
         deps: context.deps,
         broadcast: context.broadcast,
@@ -1388,6 +1701,15 @@ export const nodeHandlers: GatewayRequestHandlers = {
             sessionKey: eventParams.sessionKey,
             terminal: eventParams.terminal,
           }),
+        updateNodePresenceActivity: (activity) => {
+          const updated = context.nodeRegistry.updatePresenceActivity(activity);
+          return updated?.lastActiveAtMs !== undefined && updated.presenceUpdatedAtMs !== undefined
+            ? {
+                lastActiveAtMs: updated.lastActiveAtMs,
+                presenceUpdatedAtMs: updated.presenceUpdatedAtMs,
+              }
+            : null;
+        },
         logGateway: { warn: context.logGateway.warn },
       };
       const result = await handleNodeEvent(
@@ -1397,30 +1719,13 @@ export const nodeHandlers: GatewayRequestHandlers = {
           event: p.event,
           payloadJSON,
         },
-        { connId: client?.connId, deviceId: client?.connect?.device?.id },
+        {
+          connId: client?.connId,
+          deviceId: client?.connect?.device?.id,
+          presenceAllowed,
+        },
       );
       respond(true, result ?? { ok: true }, undefined);
     });
   },
 };
-
-function buildNodeCommandRejectionHint(
-  reason: string,
-  command: string,
-  node: { platform?: string } | undefined,
-): string {
-  const platform = node?.platform ?? "unknown";
-  if (reason === "command not declared by node") {
-    return `node command not allowed: the node (platform: ${platform}) does not support "${command}"`;
-  }
-  if (reason === "command not allowlisted") {
-    if (command.startsWith("talk.")) {
-      return `node command not allowed: "${command}" requires a trusted Talk-capable node`;
-    }
-    return `node command not allowed: "${command}" is not in the allowlist for platform "${platform}"`;
-  }
-  if (reason === "node did not declare commands") {
-    return `node command not allowed: the node did not declare any supported commands`;
-  }
-  return `node command not allowed: ${reason}`;
-}

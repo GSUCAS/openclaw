@@ -1,11 +1,12 @@
+// Telegram plugin module implements lane delivery text deliverer behavior.
 import {
   createPreviewMessageReceipt,
   type MessageReceipt,
-} from "openclaw/plugin-sdk/channel-message";
+} from "openclaw/plugin-sdk/channel-outbound";
 import {
   isPotentialTruncatedFinal,
   selectLongerFinalText,
-} from "openclaw/plugin-sdk/channel-streaming";
+} from "openclaw/plugin-sdk/channel-outbound";
 import {
   buildTtsSupplementMediaPayload,
   getReplyPayloadTtsSupplement,
@@ -14,6 +15,7 @@ import {
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { TelegramInlineButtons } from "./button-types.js";
 import type { TelegramDraftStream } from "./draft-stream.js";
+import type { TelegramPromptContextProjectionSequence } from "./prompt-context-projection.js";
 
 export type LaneName = "answer" | "reasoning";
 
@@ -22,11 +24,11 @@ export type DraftLaneState = {
   lastPartialText: string;
   hasStreamedMessage: boolean;
   finalized: boolean;
+  retainedPromptContextPages: Array<{ messageId: number; text: string }>;
 };
 
 type LanePreviewFinalizedDelivery = {
   content: string;
-  promptContextContent?: string;
   messageId: number;
   buttonsAttached?: boolean;
   receipt: MessageReceipt;
@@ -45,13 +47,15 @@ export type LaneDeliveryResult =
 
 type CreateLaneTextDelivererParams = {
   lanes: Record<LaneName, DraftLaneState>;
-  draftMaxChars: number;
   applyTextToPayload: (payload: ReplyPayload, text: string) => ReplyPayload;
-  applyTextToFollowUpPayload?: (payload: ReplyPayload, text: string) => ReplyPayload;
-  splitFinalTextForStream?: (text: string) => readonly string[];
   sendPayload: (
     payload: ReplyPayload,
-    options?: { durable?: boolean; silent?: boolean },
+    options?: {
+      afterAcceptedDraft?: boolean;
+      durable?: boolean;
+      promptContextSequence?: TelegramPromptContextProjectionSequence;
+      textMode?: "html";
+    },
   ) => Promise<boolean>;
   flushDraftLane: (lane: DraftLaneState) => Promise<void>;
   stopDraftLane: (lane: DraftLaneState) => Promise<void>;
@@ -60,8 +64,10 @@ type CreateLaneTextDelivererParams = {
     laneName: LaneName;
     messageId: number;
     text: string;
+    textMode?: "html" | "markdown";
     buttons?: TelegramInlineButtons;
   }) => Promise<void>;
+  createPromptContextSequence: () => TelegramPromptContextProjectionSequence;
   resolveFinalTextCandidate?: (params: {
     finalText: string;
     laneName: LaneName;
@@ -76,6 +82,10 @@ type DeliverLaneTextParams = {
   payload: ReplyPayload;
   infoKind: string;
   buttons?: TelegramInlineButtons;
+  finalizePreview?: boolean;
+  durable?: boolean;
+  allowStream?: boolean;
+  promptContextSequence?: TelegramPromptContextProjectionSequence;
 };
 
 function result(
@@ -95,31 +105,7 @@ function result(
   return { kind };
 }
 
-function compactChunks(chunks: readonly string[]): string[] {
-  const out: string[] = [];
-  let whitespace = "";
-  for (const chunk of chunks) {
-    if (!chunk) {
-      continue;
-    }
-    if (chunk.trim().length === 0) {
-      whitespace += chunk;
-      continue;
-    }
-    out.push(`${whitespace}${chunk}`);
-    whitespace = "";
-  }
-  if (whitespace && out.length > 0) {
-    out[out.length - 1] = `${out[out.length - 1]}${whitespace}`;
-  }
-  return out;
-}
-
 export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
-  const followUpPayload = (payload: ReplyPayload, text: string) =>
-    params.applyTextToFollowUpPayload
-      ? params.applyTextToFollowUpPayload(payload, text)
-      : params.applyTextToPayload(payload, text);
   const textOnlyPayload = (payload: ReplyPayload): ReplyPayload => {
     const {
       mediaUrl: _mediaUrl,
@@ -169,7 +155,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
   };
   const withFallbackTelegramButtons = (
     payload: ReplyPayload,
-    buttons?: TelegramInlineButtons,
+    buttons: TelegramInlineButtons | undefined,
   ): ReplyPayload => {
     if (!buttons) {
       return payload;
@@ -249,134 +235,141 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
     lane.hasStreamedMessage = false;
   };
 
+  const discardUnmaterializedStream = async (lane: DraftLaneState) => {
+    const stream = lane.stream;
+    if (stream) {
+      await stream.discard?.();
+      stream.forceNewMessage();
+    }
+    lane.lastPartialText = "";
+    lane.hasStreamedMessage = false;
+    lane.finalized = false;
+  };
+
+  const rotateFinalizedStream = (lane: DraftLaneState) => {
+    if (!lane.stream || !lane.finalized) {
+      return;
+    }
+    lane.stream.forceNewMessage();
+    lane.lastPartialText = "";
+    lane.hasStreamedMessage = false;
+    lane.finalized = false;
+  };
+
+  const recordRetainedPromptContextPages = async (
+    lane: DraftLaneState,
+    sequence: TelegramPromptContextProjectionSequence,
+  ): Promise<void> => {
+    for (const page of lane.retainedPromptContextPages.splice(0)) {
+      await sequence.accept(page);
+    }
+  };
+
   const streamText = async (
     laneName: LaneName,
     lane: DraftLaneState,
     text: string,
     payload: ReplyPayload,
-    isFinal: boolean,
-    buttons?: TelegramInlineButtons,
+    useFinalTextRecovery: boolean,
+    finalizePreview: boolean,
+    buttons: TelegramInlineButtons | undefined,
+    promptContextSequence: TelegramPromptContextProjectionSequence,
+    followedByDurablePayload = false,
   ): Promise<LaneDeliveryResult | undefined> => {
     const stream = lane.stream;
     if (!stream || text.length === 0 || payload.isError) {
       return undefined;
     }
+    rotateFinalizedStream(lane);
 
-    const chunks =
-      text.length > params.draftMaxChars
-        ? compactChunks(params.splitFinalTextForStream?.(text) ?? [])
-        : [text];
-    const [firstChunk, ...remainingChunks] = chunks;
-    if (!firstChunk || firstChunk.length > params.draftMaxChars) {
-      return undefined;
+    const finalText = text.trimEnd();
+    const candidateTexts = [stream.lastDeliveredText?.(), lane.lastPartialText];
+    if (useFinalTextRecovery && isPotentialTruncatedFinal(finalText)) {
+      const resolvedFullCandidate = await params.resolveFinalTextCandidate?.({
+        finalText: text,
+        laneName,
+      });
+      if (resolvedFullCandidate) {
+        candidateTexts.push(resolvedFullCandidate);
+      }
     }
-
-    const retainedPreview =
-      isFinal && remainingChunks.length === 0 && isPotentialTruncatedFinal(text)
-        ? selectLongerFinalText({
-            finalText: text,
-            candidateTexts: [
-              await params.resolveFinalTextCandidate?.({ finalText: text, laneName }),
-              stream.lastDeliveredText?.(),
-              lane.lastPartialText,
-            ],
-          })
-        : undefined;
-    if (retainedPreview && (!buttons || retainedPreview.length <= params.draftMaxChars)) {
-      const previewText = retainedPreview;
-      lane.lastPartialText = previewText;
-      lane.hasStreamedMessage = true;
-      await params.stopDraftLane(lane);
-      const messageId = stream.messageId();
-      if (typeof messageId !== "number") {
-        if (stream.sendMayHaveLanded?.()) {
-          lane.finalized = true;
-          params.markDelivered();
-          return result("preview-retained");
-        }
-        return undefined;
-      }
-      const deliveredStreamText = stream.lastDeliveredText?.();
-      if (deliveredStreamText !== undefined && deliveredStreamText !== previewText) {
-        return undefined;
-      }
-      let buttonsAttached = false;
-      if (buttons) {
-        try {
-          await params.editStreamMessage({ laneName, messageId, text: previewText, buttons });
-          buttonsAttached = true;
-        } catch (err) {
-          params.log(`telegram: ${laneName} stream button edit failed: ${String(err)}`);
-        }
-      }
-      for (const chunk of remainingChunks) {
-        if (chunk.trim().length === 0) {
-          continue;
-        }
-        await params.sendPayload(followUpPayload(payload, chunk));
-      }
-      lane.finalized = true;
-      params.markDelivered();
-      return result("preview-finalized", { content: previewText, messageId, buttonsAttached });
-    }
-
-    lane.lastPartialText = firstChunk;
+    const previewText =
+      useFinalTextRecovery && isPotentialTruncatedFinal(finalText)
+        ? (selectLongerFinalText({ finalText, candidateTexts }) ?? finalText)
+        : finalText;
+    lane.lastPartialText = previewText;
     lane.hasStreamedMessage = true;
     lane.finalized = false;
-    stream.update(firstChunk);
-    if (isFinal) {
+    if (stream.lastDeliveredText?.() !== previewText) {
+      stream.update(previewText);
+    }
+    if (finalizePreview) {
       await params.stopDraftLane(lane);
     } else {
       await params.flushDraftLane(lane);
     }
-
     const messageId = stream.messageId();
     if (typeof messageId !== "number") {
-      if (isFinal && stream.sendMayHaveLanded?.()) {
+      if (finalizePreview && stream.sendMayHaveLanded?.()) {
+        await recordRetainedPromptContextPages(lane, promptContextSequence);
+        await promptContextSequence.fail();
         lane.finalized = true;
         params.markDelivered();
         return result("preview-retained");
       }
+      if (!finalizePreview) {
+        await discardUnmaterializedStream(lane);
+      }
       return undefined;
     }
-
-    const deliveredStreamText = stream.lastDeliveredText?.();
-    if (
-      isFinal &&
-      deliveredStreamText !== undefined &&
-      deliveredStreamText !== firstChunk.trimEnd()
-    ) {
+    if (finalizePreview && stream.lastDeliveredText?.() !== previewText) {
+      // Retained pagination pages stay concrete while normal delivery resumes
+      // the suffix, so their shared projection sequence remains valid.
+      if (
+        !lane.retainedPromptContextPages.length ||
+        !stream.remainingFinalContent?.()?.text.trimEnd()
+      ) {
+        promptContextSequence.invalidate();
+      }
       return undefined;
     }
 
     params.markDelivered();
+    const activeSnapshot =
+      finalizePreview || buttons ? stream.currentMessageSnapshot?.() : undefined;
     let buttonsAttached = false;
-    if (buttons) {
+    if (buttons && activeSnapshot) {
       try {
-        await params.editStreamMessage({ laneName, messageId, text: firstChunk, buttons });
+        await params.editStreamMessage({
+          laneName,
+          messageId,
+          text: activeSnapshot.sourceText,
+          ...(activeSnapshot.sourceTextMode ? { textMode: activeSnapshot.sourceTextMode } : {}),
+          buttons,
+        });
         buttonsAttached = true;
       } catch (err) {
         params.log(`telegram: ${laneName} stream button edit failed: ${String(err)}`);
       }
     }
-
-    if (isFinal) {
-      lane.finalized = true;
-      for (const chunk of remainingChunks) {
-        if (chunk.trim().length === 0) {
-          continue;
-        }
-        await params.sendPayload(followUpPayload(payload, chunk));
-      }
-      return result("preview-finalized", {
-        content: text,
-        promptContextContent: firstChunk,
-        messageId,
-        buttonsAttached,
-      });
+    if (!finalizePreview) {
+      return result("preview-updated");
     }
-
-    return result("preview-updated");
+    if (!activeSnapshot) {
+      promptContextSequence.invalidate();
+      return undefined;
+    }
+    lane.finalized = true;
+    await recordRetainedPromptContextPages(lane, promptContextSequence);
+    await promptContextSequence.accept({ messageId, text: activeSnapshot.text });
+    if (!followedByDurablePayload) {
+      await promptContextSequence.finish();
+    }
+    return result("preview-finalized", {
+      content: previewText,
+      messageId,
+      buttonsAttached,
+    });
   };
 
   return async ({
@@ -385,19 +378,37 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
     payload,
     infoKind,
     buttons,
+    finalizePreview: requestedFinalizePreview,
+    durable: requestedDurable,
+    allowStream = true,
+    promptContextSequence: suppliedPromptContextSequence,
   }: DeliverLaneTextParams): Promise<LaneDeliveryResult> => {
     const lane = params.lanes[laneName];
+    const promptContextSequence =
+      suppliedPromptContextSequence ?? params.createPromptContextSequence();
     const reply = resolveSendableOutboundReplyParts(payload, { text });
-    const isFinal = infoKind === "final";
-    const streamed = !reply.hasMedia
-      ? await streamText(laneName, lane, text, payload, isFinal, buttons)
-      : undefined;
+    const isDurableFinal = infoKind === "final";
+    const finalizePreview = requestedFinalizePreview ?? isDurableFinal;
+    const durable = requestedDurable ?? isDurableFinal;
+    const streamed =
+      allowStream && !reply.hasMedia
+        ? await streamText(
+            laneName,
+            lane,
+            text,
+            payload,
+            isDurableFinal,
+            finalizePreview,
+            buttons,
+            promptContextSequence,
+          )
+        : undefined;
     if (streamed) {
       return streamed;
     }
 
     if (
-      isFinal &&
+      finalizePreview &&
       reply.hasMedia &&
       lane.stream &&
       lane.hasStreamedMessage &&
@@ -409,8 +420,11 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         lane,
         text,
         textOnlyPayload(payload),
+        isDurableFinal,
         true,
         buttons,
+        promptContextSequence,
+        true,
       );
       if (finalizedPreview) {
         const stripButtons =
@@ -424,21 +438,39 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
             fallbackButtons: stripButtons ? undefined : buttons,
           }),
           {
-            durable: true,
+            afterAcceptedDraft: true,
+            durable,
+            promptContextSequence,
           },
         );
         return finalizedPreview;
       }
     }
 
-    if (isFinal) {
+    const retainedFinalContent =
+      finalizePreview && lane.retainedPromptContextPages.length > 0
+        ? lane.stream?.remainingFinalContent?.()
+        : undefined;
+    const afterAcceptedDraft =
+      retainedFinalContent !== undefined || lane.stream?.hasConsumedReplyTarget?.() === true;
+
+    if (finalizePreview) {
+      await recordRetainedPromptContextPages(lane, promptContextSequence);
       await clearUnfinalizedStream(lane);
     }
 
-    const delivered = await params.sendPayload(params.applyTextToPayload(payload, text), {
-      durable: isFinal,
-    });
-    if (delivered && isFinal) {
+    // Accepted pagination pages remain visible. If bounded final retries exhaust,
+    // deliver only the unaccepted suffix so fallback cannot duplicate the prefix.
+    const delivered = await params.sendPayload(
+      params.applyTextToPayload(payload, retainedFinalContent?.sourceText ?? text),
+      {
+        afterAcceptedDraft,
+        durable,
+        promptContextSequence,
+        ...(retainedFinalContent?.sourceTextMode === "html" ? { textMode: "html" } : {}),
+      },
+    );
+    if (delivered && finalizePreview) {
       lane.finalized = true;
     }
     return delivered ? result("sent") : result("skipped");

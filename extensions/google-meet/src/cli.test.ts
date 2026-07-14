@@ -1,9 +1,12 @@
+// Google Meet tests cover cli plugin behavior.
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Command } from "commander";
+import JSZip from "jszip";
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { registerGoogleMeetCli } from "./cli.js";
+import { registerGoogleMeetCli, testing } from "./cli.js";
 import { resolveGoogleMeetConfig } from "./config.js";
 import type { GoogleMeetRuntime } from "./runtime.js";
 
@@ -500,6 +503,31 @@ describe("google-meet CLI", () => {
     }
   });
 
+  it.each(["0", "1.5", "9007199254740993"])(
+    "rejects invalid Meet API page sizes: %s",
+    async (pageSize) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(
+        setupCli({}).parseAsync(
+          [
+            "googlemeet",
+            "artifacts",
+            "--access-token",
+            "token",
+            "--conference-record",
+            "rec-1",
+            "--page-size",
+            pageSize,
+          ],
+          { from: "user" },
+        ),
+      ).rejects.toThrow("page-size must be a positive integer");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("prints markdown artifact and attendance output", async () => {
     stubMeetArtifactsApi();
     const tempDir = mkdtempSync(path.join(tmpdir(), "openclaw-google-meet-artifacts-"));
@@ -647,7 +675,8 @@ describe("google-meet CLI", () => {
       expectFields(firstRecord(firstRecord(artifacts.artifacts).transcripts), {
         documentText: "Transcript document body.",
       });
-      expect(readFileSync(`${tempDir}.zip`).subarray(0, 4).toString("hex")).toBe("504b0304");
+      const zip = await JSZip.loadAsync(readFileSync(`${tempDir}.zip`));
+      expect(await zip.file("summary.md")?.async("string")).toContain("# Google Meet Artifacts");
     } finally {
       stdout.restore();
       rmSync(tempDir, { recursive: true, force: true });
@@ -708,6 +737,7 @@ describe("google-meet CLI", () => {
                 state: "active",
                 transport: "twilio",
                 mode: "agent",
+                agentId: "main",
                 participantIdentity: "Twilio PSTN participant",
                 createdAt: "2026-04-25T00:00:00.000Z",
                 updatedAt: "2026-04-25T00:00:01.000Z",
@@ -739,6 +769,7 @@ describe("google-meet CLI", () => {
           state: "active",
           transport: "chrome-node",
           mode: "agent",
+          agentId: "main",
           participantIdentity: "signed-in Google Chrome profile on a paired node",
           createdAt: "2026-04-25T00:00:00.000Z",
           updatedAt: "2026-04-25T00:00:01.000Z",
@@ -774,6 +805,79 @@ describe("google-meet CLI", () => {
     }
   });
 
+  it("prints cursor-based transcripts from the gateway-owned runtime", async () => {
+    const callGatewayFromCli = vi.fn(async () => ({
+      found: true,
+      sessionId: "meet_gateway",
+      startIndex: 3,
+      nextIndex: 4,
+      droppedLines: 2,
+      lines: [{ at: "2026-07-12T06:00:00.000Z", speaker: "Alice", text: "fourth line" }],
+    }));
+    const stdout = captureStdout();
+    try {
+      await setupCli({ callGatewayFromCli }).parseAsync(
+        ["googlemeet", "transcript", "meet_gateway", "--since", "3"],
+        { from: "user" },
+      );
+      expect(callGatewayFromCli).toHaveBeenCalledWith(
+        "googlemeet.transcript",
+        { json: true, timeout: "5000" },
+        { sessionId: "meet_gateway", sinceIndex: 3 },
+        { progress: false },
+      );
+      expect(stdout.output()).toContain("# 2 earlier lines dropped by the transcript cap");
+      expect(stdout.output()).toContain("Alice: fourth line");
+      expect(stdout.output()).toContain("# nextIndex: 4");
+    } finally {
+      stdout.restore();
+    }
+  });
+
+  it.each([
+    ["0", 0],
+    ["3", 3],
+    ["+3", 3],
+    [" 3 ", 3],
+    [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ] as const)("accepts base-10 safe transcript cursors: %s", async (since, expected) => {
+    const callGatewayFromCli = vi.fn(async () => ({
+      found: true,
+      sessionId: "meet_gateway",
+      startIndex: expected,
+      nextIndex: expected,
+      lines: [],
+    }));
+
+    await setupCli({ callGatewayFromCli }).parseAsync(
+      ["googlemeet", "transcript", "meet_gateway", "--since", since],
+      { from: "user" },
+    );
+
+    expect(callGatewayFromCli).toHaveBeenCalledWith(
+      "googlemeet.transcript",
+      { json: true, timeout: "5000" },
+      { sessionId: "meet_gateway", sinceIndex: expected },
+      { progress: false },
+    );
+  });
+
+  it.each(["", " ", "-1", "0x10", "0o10", "0b10", "1e0", "1.5", "9007199254740992"])(
+    "rejects non-decimal transcript cursors before gateway delegation: %s",
+    async (since) => {
+      const callGatewayFromCli = vi.fn();
+
+      await expect(
+        setupCli({ callGatewayFromCli }).parseAsync(
+          ["googlemeet", "transcript", "meet_gateway", "--since", since],
+          { from: "user" },
+        ),
+      ).rejects.toThrow("--since must be a non-negative safe integer");
+
+      expect(callGatewayFromCli).not.toHaveBeenCalled();
+    },
+  );
+
   it("delegates join to the gateway-owned runtime when available", async () => {
     const callGatewayFromCli = vi.fn(async () => ({
       session: {
@@ -782,6 +886,7 @@ describe("google-meet CLI", () => {
         state: "active",
         transport: "chrome-node",
         mode: "realtime",
+        agentId: "main",
         participantIdentity: "signed-in Google Chrome profile on a paired node",
         createdAt: "2026-04-25T00:00:00.000Z",
         updatedAt: "2026-04-25T00:00:01.000Z",
@@ -855,6 +960,7 @@ describe("google-meet CLI", () => {
         state: "active",
         transport: "chrome",
         mode: "bidi",
+        agentId: "main",
         participantIdentity: "signed-in Google Chrome profile",
         createdAt: "2026-04-25T00:00:00.000Z",
         updatedAt: "2026-04-25T00:00:01.000Z",
@@ -917,6 +1023,7 @@ describe("google-meet CLI", () => {
         state: "active" as const,
         transport: "chrome-node" as const,
         mode: "transcribe" as const,
+        agentId: "main",
         participantIdentity: "signed-in Google Chrome profile on a paired node",
         createdAt: "2026-04-25T00:00:00.000Z",
         updatedAt: "2026-04-25T00:00:01.000Z",
@@ -952,6 +1059,52 @@ describe("google-meet CLI", () => {
     } finally {
       stdout.restore();
     }
+  });
+
+  it.each(["0x10", "1e3"])("rejects non-decimal listen timeouts: %s", async (timeoutMs) => {
+    const testListen = vi.fn();
+
+    await expect(
+      setupCli({
+        runtime: { testListen },
+      }).parseAsync(
+        [
+          "googlemeet",
+          "test-listen",
+          "https://meet.google.com/abc-defg-hij",
+          "--timeout-ms",
+          timeoutMs,
+        ],
+        { from: "user" },
+      ),
+    ).rejects.toThrow("timeout-ms must be a positive number");
+
+    expect(testListen).not.toHaveBeenCalled();
+  });
+
+  it.each(["0", "-1", "1e3"])("rejects invalid auth callback timeouts: %s", async (timeoutSec) => {
+    await expect(
+      setupCli({}).parseAsync(
+        ["googlemeet", "auth", "login", "--client-id", "client-id", "--timeout-sec", timeoutSec],
+        { from: "user" },
+      ),
+    ).rejects.toThrow("timeout-sec must be a positive number");
+  });
+
+  it("caps auth callback timeout seconds", () => {
+    expect(testing.resolveGoogleMeetOAuthCallbackTimeoutMs(undefined)).toBe(300_000);
+    expect(testing.resolveGoogleMeetOAuthCallbackTimeoutMs("1.5")).toBe(1_500);
+    expect(testing.resolveGoogleMeetOAuthCallbackTimeoutMs(String(Number.MAX_SAFE_INTEGER))).toBe(
+      MAX_TIMER_TIMEOUT_MS,
+    );
+  });
+
+  it("caps gateway command timeout milliseconds", () => {
+    expect(testing.resolveGoogleMeetGatewayTimeoutMs(undefined)).toBe(5_000);
+    expect(testing.resolveGoogleMeetGatewayTimeoutMs(1.5)).toBe(2);
+    expect(testing.resolveGoogleMeetGatewayTimeoutMs(Number.MAX_SAFE_INTEGER)).toBe(
+      MAX_TIMER_TIMEOUT_MS,
+    );
   });
 
   it("prints a dry-run export manifest without writing files", async () => {
@@ -1020,6 +1173,7 @@ describe("google-meet CLI", () => {
               state: "active",
               transport: "chrome-node",
               mode: "agent",
+              agentId: "main",
               participantIdentity: "signed-in Google Chrome profile on a paired node",
               createdAt: "2026-04-25T00:00:00.000Z",
               updatedAt: "2026-04-25T00:00:01.000Z",
@@ -1076,6 +1230,7 @@ describe("google-meet CLI", () => {
               state: "active",
               transport: "twilio",
               mode: "agent",
+              agentId: "main",
               participantIdentity: "Twilio phone participant",
               createdAt: "2026-04-25T00:00:00.000Z",
               updatedAt: "2026-04-25T00:00:01.000Z",

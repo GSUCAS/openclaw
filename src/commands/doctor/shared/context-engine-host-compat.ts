@@ -1,29 +1,36 @@
+// Doctor checks for context engine host requirements against configured agent runtimes.
+import { parseModelCatalogRef } from "@openclaw/model-catalog-core/model-catalog-refs";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { normalizeEmbeddedAgentRuntime } from "../../../agents/agent-runtime-id.js";
 import { resolveDefaultAgentDir } from "../../../agents/agent-scope-config.js";
 import { resolveCliBackendConfig } from "../../../agents/cli-backends.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../../agents/defaults.js";
 import { resolveAgentHarnessPolicy } from "../../../agents/harness/policy.js";
 import { getRegisteredAgentHarness } from "../../../agents/harness/registry.js";
-import { normalizeEmbeddedAgentRuntime } from "../../../agents/pi-embedded-runner/runtime.js";
-import { normalizeProviderId } from "../../../agents/provider-id.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import {
   buildGenericCliContextEngineHostSupport,
   CODEX_APP_SERVER_CONTEXT_ENGINE_HOST,
   evaluateContextEngineHostSupport,
-  PI_EMBEDDED_CONTEXT_ENGINE_HOST,
+  OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
   type ContextEngineHostSupport,
 } from "../../../context-engine/host-compat.js";
 import { ensureContextEnginesInitialized } from "../../../context-engine/init.js";
-import { getContextEngineFactory, resolveContextEngine } from "../../../context-engine/registry.js";
+import {
+  getContextEngineRegistration,
+  resolveContextEngine,
+} from "../../../context-engine/registry.js";
 import type { ContextEngineInfo } from "../../../context-engine/types.js";
 import { ensurePluginRegistryLoaded } from "../../../plugins/runtime/runtime-registry-loader.js";
 import { defaultSlotIdForKey } from "../../../plugins/slots.js";
-import { uniqueStrings } from "../../../shared/string-normalization.js";
 import { isRecord, resolveUserPath } from "../../../utils.js";
 
-export type HostCandidate = {
+type HostCandidate = {
+  /** Runtime or harness id that will host an agent run. */
   runtimeId: string;
+  /** Context-engine host capability descriptor for the runtime. */
   host: ContextEngineHostSupport;
+  /** Config paths that caused doctor to consider this host. */
   paths: string[];
 };
 
@@ -46,18 +53,7 @@ function normalizeRuntimeId(value: unknown): string | undefined {
 }
 
 function parseModelRef(value: unknown): { provider: string; modelId: string } | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  const slash = trimmed.indexOf("/");
-  if (slash <= 0 || slash >= trimmed.length - 1) {
-    return undefined;
-  }
-  return {
-    provider: normalizeProviderId(trimmed.slice(0, slash)),
-    modelId: trimmed.slice(slash + 1).trim(),
-  };
+  return typeof value === "string" ? (parseModelCatalogRef(value) ?? undefined) : undefined;
 }
 
 function listModelRefs(value: unknown): string[] {
@@ -163,8 +159,8 @@ function runtimeHostCandidate(params: {
   paths: string[];
 }): HostCandidate {
   const runtimeId = normalizeRuntimeId(params.runtimeId) ?? params.runtimeId;
-  if (runtimeId === "pi" || runtimeId === "auto") {
-    return { runtimeId, host: PI_EMBEDDED_CONTEXT_ENGINE_HOST, paths: params.paths };
+  if (runtimeId === "openclaw" || runtimeId === "auto") {
+    return { runtimeId, host: OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST, paths: params.paths };
   }
   if (runtimeId === "codex") {
     return { runtimeId, host: CODEX_APP_SERVER_CONTEXT_ENGINE_HOST, paths: params.paths };
@@ -194,12 +190,11 @@ function runtimeHostCandidate(params: {
   };
 }
 
-/** Collect effective agent-run host candidates from config and environment runtime policy. */
+/** Collect effective agent-run host candidates from provider/model runtime policy. */
 export function collectConfiguredContextEngineAgentRunHosts(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
 }): HostCandidate[] {
-  const envRuntime = normalizeRuntimeId(params.env?.OPENCLAW_AGENT_RUNTIME);
   const runtimePaths = new Map<string, string[]>();
   const push = (runtimeId: string | undefined, path: string) => {
     if (!runtimeId) {
@@ -210,13 +205,6 @@ export function collectConfiguredContextEngineAgentRunHosts(params: {
     paths.push(path);
     runtimePaths.set(normalized, paths);
   };
-
-  if (envRuntime) {
-    push(envRuntime, "OPENCLAW_AGENT_RUNTIME");
-    return [...runtimePaths.entries()].map(([runtimeId, paths]) =>
-      runtimeHostCandidate({ cfg: params.cfg, runtimeId, paths }),
-    );
-  }
 
   for (const ref of collectExplicitRuntimeRefs(params.cfg)) {
     push(ref.runtimeId, ref.path);
@@ -258,7 +246,7 @@ async function resolveSelectedContextEngineInfo(params: {
   }
 
   ensureContextEnginesInitialized();
-  if (!getContextEngineFactory(engineId)) {
+  if (getContextEngineRegistration(engineId)?.lifecycle !== "runtime") {
     try {
       ensurePluginRegistryLoaded({
         scope: "all",
@@ -267,7 +255,7 @@ async function resolveSelectedContextEngineInfo(params: {
         onlyPluginIds: [engineId],
       });
     } catch (error) {
-      if (!getContextEngineFactory(engineId)) {
+      if (getContextEngineRegistration(engineId)?.lifecycle !== "runtime") {
         const message = error instanceof Error ? error.message : String(error);
         return {
           warnings: [
@@ -276,7 +264,7 @@ async function resolveSelectedContextEngineInfo(params: {
         };
       }
     }
-    if (!getContextEngineFactory(engineId)) {
+    if (getContextEngineRegistration(engineId)?.lifecycle !== "runtime") {
       return {
         warnings: [
           `- plugins.slots.contextEngine: could not inspect context engine "${engineId}" host requirements because it is not registered.`,

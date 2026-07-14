@@ -1,27 +1,27 @@
+// Verifies session config cache invalidation and reload behavior.
 import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import * as jsonFiles from "../infra/json-files.js";
+import { createCanonicalFixtureSkill } from "../skills/test-support/test-helpers.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import {
-  getSerializedSessionStore,
-  getSerializedSessionStoreCacheStatsForTest,
-  getSessionStoreSnapshotCacheStatsForTest,
-  getSessionStoreStringInternStatsForTest,
+  getSerializedSessionStorePromptRefs,
   readSessionStoreCache,
   setSerializedSessionStore,
+  setSerializedSessionStorePromptRefs,
   writeSessionStoreCache,
 } from "./sessions/store-cache.js";
 import {
   clearSessionStoreCacheForTest,
   loadSessionStore,
-  readSessionEntries,
-  readSessionEntry,
-  readSessionStoreSnapshot,
-  readSessionUpdatedAt,
   saveSessionStore,
   updateSessionStore,
+  updateSessionStoreEntry,
 } from "./sessions/store.js";
 import type { SessionEntry } from "./sessions/types.js";
+import type { SessionSkillPromptRef } from "./sessions/types.js";
 
 function createSessionEntry(overrides: Partial<SessionEntry> = {}): SessionEntry {
   return {
@@ -69,32 +69,22 @@ describe("Session Store Cache", () => {
     delete process.env.OPENCLAW_SESSION_SERIALIZED_CACHE_MAX_BYTES;
   });
 
-  it("bounds the serialized session store cache by total bytes", () => {
-    process.env.OPENCLAW_SESSION_SERIALIZED_CACHE_MAX_BYTES = "64";
-    clearSessionStoreCacheForTest();
+  it("keeps serialized prompt refs on the serialized cache entry lifecycle", () => {
+    const promptRef: SessionSkillPromptRef = {
+      version: 1,
+      algorithm: "sha256",
+      hash: "a".repeat(64),
+      bytes: 123,
+    };
+    const refs = new Map([["session:1", promptRef]]);
 
-    setSerializedSessionStore("store:1", "a".repeat(40));
-    setSerializedSessionStore("store:2", "b".repeat(40));
+    setSerializedSessionStore("store:refs", "{}");
+    setSerializedSessionStorePromptRefs("store:refs", refs);
 
-    expect(getSerializedSessionStore("store:1")).toBeUndefined();
-    expect(getSerializedSessionStore("store:2")).toBe("b".repeat(40));
-    expect(getSerializedSessionStoreCacheStatsForTest().entries).toBe(1);
-    expect(getSerializedSessionStoreCacheStatsForTest().totalBytes).toBe(40);
-  });
+    expect(getSerializedSessionStorePromptRefs("store:refs")).toBe(refs);
 
-  it("bounds the serialized session store cache by path count", () => {
-    const maxEntries = getSerializedSessionStoreCacheStatsForTest().maxEntries;
-
-    for (let index = 0; index < maxEntries + 2; index += 1) {
-      setSerializedSessionStore(`store:${index}`, `serialized:${index}`);
-    }
-
-    expect(getSerializedSessionStore("store:0")).toBeUndefined();
-    expect(getSerializedSessionStore("store:1")).toBeUndefined();
-    expect(getSerializedSessionStore(`store:${maxEntries + 1}`)).toBe(
-      `serialized:${maxEntries + 1}`,
-    );
-    expect(getSerializedSessionStoreCacheStatsForTest().entries).toBe(maxEntries);
+    setSerializedSessionStore("store:refs", "{}");
+    expect(getSerializedSessionStorePromptRefs("store:refs")).toBeUndefined();
   });
 
   it("should load session store from disk on first call", async () => {
@@ -106,6 +96,47 @@ describe("Session Store Cache", () => {
     // Load it
     const loaded = loadSessionStore(storePath);
     expect(loaded).toEqual(testStore);
+  });
+
+  it("retries transient session store read failures", async () => {
+    const testStore = createSingleSessionStore();
+    await saveSessionStore(storePath, testStore);
+    clearSessionStoreCacheForTest();
+
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    let storeReads = 0;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
+      if (file === storePath) {
+        storeReads += 1;
+        if (storeReads === 1) {
+          throw Object.assign(
+            new Error("Unknown system error -11: Unknown system error -11, read"),
+            { code: "EAGAIN", errno: -11 },
+          );
+        }
+      }
+      return originalReadFileSync(file, ...(args as [Parameters<typeof fs.readFileSync>[1]]));
+    });
+
+    try {
+      expect(loadSessionStore(storePath, { skipCache: true })).toEqual(testStore);
+      expect(storeReads).toBe(2);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("does not retry permanent session store read failures", () => {
+    clearSessionStoreCacheForTest();
+    const missingPath = path.join(testDir, "missing-sessions.json");
+    const readSpy = vi.spyOn(fs, "readFileSync");
+
+    try {
+      expect(loadSessionStore(missingPath, { skipCache: true })).toEqual({});
+      expect(readSpy).toHaveBeenCalledOnce();
+    } finally {
+      readSpy.mockRestore();
+    }
   });
 
   it("should serve freshly saved session stores from cache without disk reads", async () => {
@@ -140,14 +171,23 @@ describe("Session Store Cache", () => {
     await saveSessionStore(storePath, testStore);
 
     const loaded1 = loadSessionStore(storePath);
-    loaded1["session:1"].origin = { provider: "mutated" };
-    if (loaded1["session:1"].skillsSnapshot?.skills?.length) {
-      loaded1["session:1"].skillsSnapshot.skills[0].name = "mutated";
+    expectDefined(loaded1["session:1"], 'loaded1["session:1"] test invariant').origin = {
+      provider: "mutated",
+    };
+    for (const skill of expectDefined(loaded1["session:1"], "loaded session").skillsSnapshot
+      ?.skills ?? []) {
+      skill.name = "mutated";
+      break;
     }
 
     const loaded2 = loadSessionStore(storePath);
-    expect(loaded2["session:1"].origin?.provider).toBe("openai");
-    expect(loaded2["session:1"].skillsSnapshot?.skills?.[0]?.name).toBe("alpha");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').origin?.provider,
+    ).toBe("openai");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').skillsSnapshot
+        ?.skills?.[0]?.name,
+    ).toBe("alpha");
   });
 
   it("honors explicit clone:false on cache hits", async () => {
@@ -164,11 +204,15 @@ describe("Session Store Cache", () => {
     const loaded1 = loadSessionStore(storePath, { clone: false });
     expect(parseSpy).not.toHaveBeenCalled();
 
-    loaded1["session:1"].origin = { provider: "mutated" };
+    expectDefined(loaded1["session:1"], 'loaded1["session:1"] test invariant').origin = {
+      provider: "mutated",
+    };
 
     const loaded2 = loadSessionStore(storePath, { clone: false });
     expect(loaded2).toBe(loaded1);
-    expect(loaded2["session:1"].origin?.provider).toBe("mutated");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').origin?.provider,
+    ).toBe("mutated");
     expect(parseSpy).not.toHaveBeenCalled();
 
     parseSpy.mockRestore();
@@ -233,20 +277,29 @@ describe("Session Store Cache", () => {
     await saveSessionStore(storePath, testStore);
 
     const loaded1 = loadSessionStore(storePath);
-    loaded1["session:1"].origin = { provider: "mutated" };
-    if (loaded1["session:1"].skillsSnapshot?.skills?.length) {
-      loaded1["session:1"].skillsSnapshot.skills[0].name = "mutated";
+    expectDefined(loaded1["session:1"], 'loaded1["session:1"] test invariant').origin = {
+      provider: "mutated",
+    };
+    for (const skill of expectDefined(loaded1["session:1"], "loaded session").skillsSnapshot
+      ?.skills ?? []) {
+      skill.name = "mutated";
+      break;
     }
 
     const loaded2 = loadSessionStore(storePath);
-    expect(loaded2["session:1"].origin?.provider).toBe("openai");
-    expect(loaded2["session:1"].skillsSnapshot?.skills?.[0]?.name).toBe("alpha");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').origin?.provider,
+    ).toBe("openai");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').skillsSnapshot
+        ?.skills?.[0]?.name,
+    ).toBe("alpha");
     expect(structuredCloneSpy).not.toHaveBeenCalled();
 
     structuredCloneSpy.mockRestore();
   });
 
-  it("does not parse serialized stores when writing or reading object-cache hits", () => {
+  it("parses serialized stores only when cloning object-cache hits", () => {
     const testStore = createSingleSessionStore(
       createSessionEntry({
         origin: { provider: "openai" },
@@ -255,17 +308,29 @@ describe("Session Store Cache", () => {
     const serialized = JSON.stringify(testStore);
     const parseSpy = vi.spyOn(JSON, "parse");
 
-    writeSessionStoreCache({ storePath, store: testStore, serialized });
+    try {
+      writeSessionStoreCache({
+        storePath,
+        store: testStore,
+        serialized,
+        cloneSerialized: serialized,
+      });
 
-    expect(parseSpy).not.toHaveBeenCalled();
+      expect(parseSpy).not.toHaveBeenCalled();
 
-    testStore["session:1"].origin = { provider: "mutated" };
-    const cached = readSessionStoreCache({ storePath });
+      expectDefined(testStore["session:1"], 'testStore["session:1"] test invariant').origin = {
+        provider: "mutated",
+      };
+      const cached = readSessionStoreCache({ storePath });
 
-    expect(cached?.["session:1"].origin?.provider).toBe("openai");
-    expect(parseSpy).not.toHaveBeenCalled();
-
-    parseSpy.mockRestore();
+      expect(
+        expectDefined(cached?.["session:1"], 'cached?.["session:1"] test invariant').origin
+          ?.provider,
+      ).toBe("openai");
+      expect(parseSpy).toHaveBeenCalledOnce();
+    } finally {
+      parseSpy.mockRestore();
+    }
   });
 
   it("clones cached session records without invoking prototype setters", () => {
@@ -278,8 +343,11 @@ describe("Session Store Cache", () => {
     const entry = cached?.["session:1"] as (SessionEntry & { polluted?: boolean }) | undefined;
 
     expect(entry).toBeDefined();
+    if (!entry) {
+      throw new Error("Expected cached entry");
+    }
     expect(entry?.polluted).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(entry, "__proto__")).toBe(true);
+    expect(Object.hasOwn(entry as object, "__proto__")).toBe(true);
     expect(Object.prototype).not.toHaveProperty("polluted");
   });
 
@@ -304,9 +372,8 @@ describe("Session Store Cache", () => {
     writeSessionStoreCache({ storePath, store: testStore });
 
     const cached = readSessionStoreCache({ storePath });
-    const cachedState = cached?.["session:1"].pluginExtensions?.demo?.pluginState as
-      | Record<string, unknown>
-      | undefined;
+    const cachedState = expectDefined(cached?.["session:1"], 'cached?.["session:1"] test invariant')
+      .pluginExtensions?.demo?.pluginState as Record<string, unknown> | undefined;
 
     expect(cachedState).toBeTruthy();
     expect(Object.hasOwn(cachedState ?? {}, "__proto__")).toBe(true);
@@ -336,252 +403,242 @@ describe("Session Store Cache", () => {
     expect(loaded).toEqual(testStore);
     expect(stringifySpy).not.toHaveBeenCalled();
 
-    loaded["session:1"].origin = { provider: "mutated" };
-    if (loaded["session:1"].skillsSnapshot?.skills?.length) {
-      loaded["session:1"].skillsSnapshot.skills[0].name = "mutated";
+    expectDefined(loaded["session:1"], 'loaded["session:1"] test invariant').origin = {
+      provider: "mutated",
+    };
+    for (const skill of expectDefined(loaded["session:1"], "loaded session").skillsSnapshot
+      ?.skills ?? []) {
+      skill.name = "mutated";
+      break;
     }
 
     const reloaded = loadSessionStore(storePath, { skipCache: true });
-    expect(reloaded["session:1"].origin?.provider).toBe("openai");
-    expect(reloaded["session:1"].skillsSnapshot?.skills?.[0]?.name).toBe("alpha");
+    expect(
+      expectDefined(reloaded["session:1"], 'reloaded["session:1"] test invariant').origin?.provider,
+    ).toBe("openai");
+    expect(
+      expectDefined(reloaded["session:1"], 'reloaded["session:1"] test invariant').skillsSnapshot
+        ?.skills?.[0]?.name,
+    ).toBe("alpha");
 
     stringifySpy.mockRestore();
   });
 
-  it("interns duplicate large skillsSnapshot prompts across cached loads", async () => {
-    const largePrompt = "skill prompt ".repeat(200);
-    const testStore = {
-      "session:1": createSessionEntry({
-        skillsSnapshot: {
-          prompt: largePrompt,
-          skills: [{ name: "alpha" }],
-        },
-      }),
-      "session:2": createSessionEntry({
-        sessionId: "id-2",
-        displayName: "Test Session 2",
-        skillsSnapshot: {
-          prompt: largePrompt,
-          skills: [{ name: "beta" }],
-        },
-      }),
-    };
-
-    await saveSessionStore(storePath, testStore);
-    clearSessionStoreCacheForTest();
-
-    const loaded1 = loadSessionStore(storePath);
-    const afterFirstLoad = getSessionStoreStringInternStatsForTest();
-    expect(afterFirstLoad.poolSize).toBe(1);
-    expect(afterFirstLoad.stored).toBe(1);
-    expect(afterFirstLoad.reused).toBeGreaterThanOrEqual(1);
-
-    if (loaded1["session:1"].skillsSnapshot?.skills?.length) {
-      loaded1["session:1"].skillsSnapshot.skills[0].name = "mutated";
-    }
-
-    const loaded2 = loadSessionStore(storePath);
-    const afterSecondLoad = getSessionStoreStringInternStatsForTest();
-    expect(afterSecondLoad.poolSize).toBe(1);
-    expect(afterSecondLoad.reused).toBeGreaterThanOrEqual(afterFirstLoad.reused + 2);
-    expect(loaded2["session:1"].skillsSnapshot?.skills?.[0]?.name).toBe("alpha");
-  });
-
-  it("does not intern short skillsSnapshot prompts", async () => {
-    const testStore = {
-      "session:1": createSessionEntry({
-        skillsSnapshot: {
-          prompt: "short prompt",
-          skills: [{ name: "alpha" }],
-        },
-      }),
-      "session:2": createSessionEntry({
-        sessionId: "id-2",
-        displayName: "Test Session 2",
-        skillsSnapshot: {
-          prompt: "short prompt",
-          skills: [{ name: "beta" }],
-        },
-      }),
-    };
-
-    await saveSessionStore(storePath, testStore);
-    clearSessionStoreCacheForTest();
-
-    loadSessionStore(storePath);
-
-    const stats = getSessionStoreStringInternStatsForTest();
-    expect(stats.poolSize).toBe(0);
-    expect(stats.skippedSmall).toBeGreaterThanOrEqual(2);
-  });
-
-  it("reads updatedAt from immutable session snapshots without cloning cached stores", async () => {
-    const updatedAt = Date.now();
-    const testStore = createSingleSessionStore(
-      createSessionEntry({
-        updatedAt,
-      }),
-      "agent:main:main",
-    );
-
-    await saveSessionStore(storePath, testStore);
-    clearSessionStoreCacheForTest();
-    readSessionStoreSnapshot(storePath);
-    expect(readSessionEntry(storePath, "agent:main:main")?.updatedAt).toBe(updatedAt);
-
-    const parseSpy = vi.spyOn(JSON, "parse");
-
-    expect(readSessionUpdatedAt({ storePath, sessionKey: "agent:main:main" })).toBe(updatedAt);
-    expect(parseSpy).not.toHaveBeenCalled();
-
-    parseSpy.mockRestore();
-  });
-
-  it("builds a snapshot from disk without reparsing the mutable clone", async () => {
-    const testStore = createSingleSessionStore(
-      createSessionEntry({
-        skillsSnapshot: {
-          prompt: "snapshot skill prompt ".repeat(200),
-          skills: [{ name: "alpha" }],
-        },
-      }),
-    );
-
-    await saveSessionStore(storePath, testStore);
-    clearSessionStoreCacheForTest();
-
-    const parseSpy = vi.spyOn(JSON, "parse");
-
-    const snapshot = readSessionStoreSnapshot(storePath);
-
-    expect(snapshot["session:1"].sessionId).toBe("id-1");
-    expect(parseSpy).toHaveBeenCalledTimes(1);
-
-    parseSpy.mockRestore();
-  });
-
-  it("serves immutable session snapshots without cloning cache hits", async () => {
-    const testStore = createSingleSessionStore(
-      createSessionEntry({
-        origin: { provider: "openai" },
-        skillsSnapshot: {
-          prompt: "snapshot skill prompt ".repeat(200),
-          skills: [{ name: "alpha" }],
-        },
-      }),
-    );
-
-    await saveSessionStore(storePath, testStore);
-    clearSessionStoreCacheForTest();
-
-    const snapshot1 = readSessionStoreSnapshot(storePath);
-    const snapshot2 = readSessionStoreSnapshot(storePath);
-
-    expect(snapshot2).toBe(snapshot1);
-    expect(Object.isFrozen(snapshot1)).toBe(true);
-    expect(Object.isFrozen(snapshot1["session:1"])).toBe(true);
-    expect(Object.isFrozen(snapshot1["session:1"].skillsSnapshot?.skills)).toBe(true);
-    expect(readSessionEntry(storePath, "session:1")?.sessionId).toBe("id-1");
-    expect(readSessionEntries(storePath).map(([key]) => key)).toEqual(["session:1"]);
-
-    expect(() => {
-      (snapshot1 as Record<string, SessionEntry>)["session:2"] = createSessionEntry({
-        sessionId: "id-2",
-      });
-    }).toThrow(TypeError);
-
-    const mutable = loadSessionStore(storePath);
-    mutable["session:1"].origin = { provider: "mutated" };
-
-    expect(readSessionStoreSnapshot(storePath)["session:1"].origin?.provider).toBe("openai");
-  });
-
-  it("does not tag snapshots with stats from writes racing after a disk read", async () => {
-    await saveSessionStore(
-      storePath,
-      createSingleSessionStore(createSessionEntry({ displayName: "Before race" })),
-    );
-    clearSessionStoreCacheForTest();
-
-    const afterRaceStore = createSingleSessionStore(
-      createSessionEntry({ displayName: "After cross-process race" }),
-    );
-    const originalReadFileSync = fs.readFileSync.bind(fs);
-    let wroteAfterRead = false;
-    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
-      const result = originalReadFileSync(
-        file,
-        ...(args as [Parameters<typeof fs.readFileSync>[1]]),
-      );
-      if (file === storePath && !wroteAfterRead) {
-        wroteAfterRead = true;
-        fs.writeFileSync(storePath, JSON.stringify(afterRaceStore, null, 2));
-        const bumped = new Date(Date.now() + 2_000);
-        fs.utimesSync(storePath, bumped, bumped);
-      }
-      return result;
-    });
-
-    const first = readSessionStoreSnapshot(storePath);
-    expect(first["session:1"].displayName).toBe("Before race");
-
-    readSpy.mockRestore();
-
-    const second = readSessionStoreSnapshot(storePath);
-    expect(second["session:1"].displayName).toBe("After cross-process race");
-  });
-
-  it("publishes a new immutable snapshot after session store writes", async () => {
+  it("keeps whole-store update results detached from the mutable cache by default", async () => {
     await saveSessionStore(storePath, createSingleSessionStore());
 
-    const before = readSessionStoreSnapshot(storePath);
-
-    await updateSessionStore(
+    const persisted = await updateSessionStore(
       storePath,
       (store) => {
-        store["session:1"] = {
-          ...store["session:1"],
+        const next = {
+          ...expectDefined(store["session:1"], 'store["session:1"] test invariant'),
           displayName: "Updated Session",
           updatedAt: Date.now() + 1,
         };
+        store["session:1"] = next;
+        return next;
       },
       { skipMaintenance: true },
     );
 
-    const after = readSessionStoreSnapshot(storePath);
+    persisted.displayName = "Mutated after write";
 
-    expect(after).not.toBe(before);
-    expect(before["session:1"].displayName).toBe("Test Session 1");
-    expect(after["session:1"].displayName).toBe("Updated Session");
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:1"]).not.toBe(persisted);
+    expect(
+      expectDefined(cached["session:1"], 'cached["session:1"] test invariant').displayName,
+    ).toBe("Updated Session");
   });
 
-  it("builds immutable session snapshots lazily after writes", async () => {
+  it("can publish writer-owned session updates directly into the object cache", async () => {
     await saveSessionStore(storePath, createSingleSessionStore());
 
-    expect(getSessionStoreSnapshotCacheStatsForTest().entries).toBe(0);
-
-    const first = readSessionStoreSnapshot(storePath);
-    const statsAfterRead = getSessionStoreSnapshotCacheStatsForTest();
-    const second = readSessionStoreSnapshot(storePath);
-
-    expect(first).toBe(second);
-    expect(Object.isFrozen(first)).toBe(true);
-    expect(statsAfterRead.entries).toBe(1);
-
-    await updateSessionStore(
+    const persisted = await updateSessionStore(
       storePath,
       (store) => {
-        store["session:1"] = {
-          ...store["session:1"],
-          displayName: "Updated lazily",
+        const next = {
+          ...expectDefined(store["session:1"], 'store["session:1"] test invariant'),
+          displayName: "Writer owned",
           updatedAt: Date.now() + 1,
         };
+        store["session:1"] = next;
+        return next;
       },
-      { skipMaintenance: true },
+      { takeCacheOwnership: true },
     );
 
-    expect(getSessionStoreSnapshotCacheStatsForTest().entries).toBe(0);
-    expect(readSessionStoreSnapshot(storePath)["session:1"].displayName).toBe("Updated lazily");
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:1"]).toBe(persisted);
+    expect(
+      expectDefined(cached["session:1"], 'cached["session:1"] test invariant').displayName,
+    ).toBe("Writer owned");
+  });
+
+  it("can publish writer-owned entry patches directly into the object cache", async () => {
+    await saveSessionStore(storePath, createSingleSessionStore());
+
+    const persisted = await updateSessionStoreEntry({
+      storePath,
+      sessionKey: "session:1",
+      takeCacheOwnership: true,
+      update: async () => ({
+        displayName: "Entry writer owned",
+        updatedAt: Date.now() + 1,
+      }),
+    });
+
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:1"]).toBe(persisted);
+    expect(
+      expectDefined(cached["session:1"], 'cached["session:1"] test invariant').displayName,
+    ).toBe("Entry writer owned");
+  });
+
+  it("publishes high-level entry patches without cloning the whole object cache", async () => {
+    await saveSessionStore(storePath, {
+      "session:1": createSessionEntry({ sessionId: "id-1" }),
+      "session:2": createSessionEntry({ sessionId: "id-2" }),
+    });
+    const before = loadSessionStore(storePath, { clone: false });
+    const untouched = before["session:2"];
+
+    const persisted = await updateSessionStoreEntry({
+      storePath,
+      sessionKey: "session:1",
+      update: async () => ({
+        displayName: "Entry writer owned by default",
+        updatedAt: Date.now() + 1,
+      }),
+    });
+
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:2"]).toBe(untouched);
+    expect(cached["session:1"]).not.toBe(persisted);
+    persisted!.displayName = "Mutated returned entry";
+    expect(
+      expectDefined(cached["session:1"], 'cached["session:1"] test invariant').displayName,
+    ).toBe("Entry writer owned by default");
+  });
+
+  it("detaches caller-owned patch objects before publishing writer-owned caches", async () => {
+    await saveSessionStore(storePath, {
+      "session:1": createSessionEntry({ sessionId: "id-1" }),
+      "session:2": createSessionEntry({ sessionId: "id-2" }),
+    });
+    const before = loadSessionStore(storePath, { clone: false });
+    const untouched = before["session:2"];
+    const deliveryContext = { channel: "telegram", to: "chat-1" };
+
+    await updateSessionStoreEntry({
+      storePath,
+      sessionKey: "session:1",
+      update: async () => ({ deliveryContext }),
+    });
+    deliveryContext.to = "mutated-after-persist";
+
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(cached["session:2"]).toBe(untouched);
+    expect(
+      expectDefined(cached["session:1"], 'cached["session:1"] test invariant').deliveryContext?.to,
+    ).toBe("chat-1");
+  });
+  it("falls back to full projection when untouched entries need prompt blob repair", async () => {
+    const prompt = "skill prompt ".repeat(80);
+    await saveSessionStore(storePath, {
+      "session:1": createSessionEntry({ sessionId: "id-1", displayName: "Before" }),
+      "session:2": createSessionEntry({
+        sessionId: "id-2",
+        skillsSnapshot: {
+          prompt,
+          skills: [{ name: "alpha" }],
+        },
+      }),
+    });
+    const cached = loadSessionStore(storePath, { clone: false });
+    expect(
+      expectDefined(cached["session:2"], 'cached["session:2"] test invariant').skillsSnapshot
+        ?.prompt,
+    ).toBe(prompt);
+    await fs.promises.rm(path.join(testDir, "skills-prompts"), {
+      recursive: true,
+      force: true,
+    });
+
+    await updateSessionStoreEntry({
+      storePath,
+      sessionKey: "session:1",
+      update: async () => ({ displayName: "After" }),
+      takeCacheOwnership: true,
+    });
+
+    clearSessionStoreCacheForTest();
+    const loaded = loadSessionStore(storePath);
+    expect(
+      expectDefined(loaded["session:1"], 'loaded["session:1"] test invariant').displayName,
+    ).toBe("After");
+    expect(
+      expectDefined(loaded["session:2"], 'loaded["session:2"] test invariant').skillsSnapshot
+        ?.prompt,
+    ).toBe(prompt);
+  });
+
+  it("serializes the normalized entry when applying the one-entry fast path", async () => {
+    await saveSessionStore(storePath, {
+      "session:1": createSessionEntry({ sessionId: "id-1", displayName: "Before" }),
+      "session:2": createSessionEntry({ sessionId: "id-2", displayName: "Untouched" }),
+    });
+
+    await updateSessionStoreEntry({
+      storePath,
+      sessionKey: "session:1",
+      update: async () => ({
+        displayName: "After",
+        skillsSnapshot: {
+          prompt: "short prompt",
+          skills: [{ name: "alpha" }],
+          resolvedSkills: [
+            createCanonicalFixtureSkill({
+              name: "alpha",
+              description: "alpha skill",
+              filePath: "/skills/alpha/SKILL.md",
+              baseDir: "/skills/alpha",
+              source: "transient",
+            }),
+          ],
+        } as SessionEntry["skillsSnapshot"],
+      }),
+      takeCacheOwnership: true,
+    });
+
+    const disk = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, SessionEntry>;
+    expect(expectDefined(disk["session:1"], 'disk["session:1"] test invariant').displayName).toBe(
+      "After",
+    );
+    expect(
+      expectDefined(disk["session:1"], 'disk["session:1"] test invariant').skillsSnapshot?.prompt,
+    ).toBe("short prompt");
+    expect(
+      "resolvedSkills" in
+        (expectDefined(disk["session:1"], 'disk["session:1"] test invariant').skillsSnapshot ?? {}),
+    ).toBe(false);
+  });
+
+  it("restores the writer-owned cache when update result proves the store unchanged", async () => {
+    await saveSessionStore(storePath, {
+      "session:1": createSessionEntry({ sessionId: "id-1" }),
+      "session:2": createSessionEntry({ sessionId: "id-2" }),
+    });
+    const before = loadSessionStore(storePath, { clone: false });
+    const writeSpy = vi.spyOn(jsonFiles, "writeTextAtomic");
+
+    const result = await updateSessionStore(storePath, () => 0, {
+      skipSaveWhenResult: (cleared) => cleared === 0,
+    });
+
+    const after = loadSessionStore(storePath, { clone: false });
+    expect(result).toBe(0);
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(after).toBe(before);
   });
 
   it("should refresh cache when store file changes on disk", async () => {
@@ -618,7 +675,7 @@ describe("Session Store Cache", () => {
     // Update store
     const updatedStore: Record<string, SessionEntry> = {
       "session:1": {
-        ...testStore["session:1"],
+        ...expectDefined(testStore["session:1"], 'testStore["session:1"] test invariant'),
         displayName: "Updated Session 1",
       },
     };
@@ -628,7 +685,9 @@ describe("Session Store Cache", () => {
 
     // Load again - should get new data from disk
     const loaded2 = loadSessionStore(storePath);
-    expect(loaded2["session:1"].displayName).toBe("Updated Session 1");
+    expect(
+      expectDefined(loaded2["session:1"], 'loaded2["session:1"] test invariant').displayName,
+    ).toBe("Updated Session 1");
   });
 
   it("should respect OPENCLAW_SESSION_CACHE_TTL_MS=0 to disable cache", async () => {
@@ -684,7 +743,9 @@ describe("Session Store Cache", () => {
 
     // Warm the cache
     const loaded1 = loadSessionStore(storePath);
-    expect(loaded1["session:1"].displayName).toBe("Original");
+    expect(
+      expectDefined(loaded1["session:1"], 'loaded1["session:1"] test invariant').displayName,
+    ).toBe("Original");
 
     // Rewrite the file directly (bypassing saveSessionStore's write-through
     // cache) with different content but preserve the same mtime so only size

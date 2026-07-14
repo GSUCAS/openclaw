@@ -1,3 +1,4 @@
+// Agent identity tests cover identity file creation, persistence, and command integration.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -100,6 +101,25 @@ describe("agents set-identity command", () => {
       emoji: ":)",
       avatar: "avatars/openclaw.png",
     });
+  });
+
+  it("resolves --from-identity against the selected agent workspace", async () => {
+    const { root, workspace } = await createIdentityWorkspace();
+    await writeIdentityFile(workspace, ["- Name: Workspace Agent"]);
+
+    configMocks.readConfigFileSnapshot.mockResolvedValue({
+      ...baseConfigSnapshot,
+      config: { agents: { list: [{ id: "main", workspace }] } },
+    });
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(root);
+
+    try {
+      await agentsSetIdentityCommand({ agent: "main", fromIdentity: true }, runtime);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+
+    expect(getWrittenMainIdentity()).toEqual({ name: "Workspace Agent" });
   });
 
   it("errors when multiple agents match the same workspace", async () => {

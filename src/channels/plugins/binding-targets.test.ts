@@ -1,3 +1,4 @@
+// Binding target tests cover channel binding target extraction and validation.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ensureConfiguredBindingTargetReady,
@@ -7,7 +8,6 @@ import {
 import type { ConfiguredBindingResolution } from "./binding-types.js";
 import {
   registerStatefulBindingTargetDriver,
-  unregisterStatefulBindingTargetDriver,
   type StatefulBindingTargetDriver,
 } from "./stateful-target-drivers.js";
 
@@ -95,8 +95,11 @@ function createBindingResolution(driverId: string): ConfiguredBindingResolution 
   };
 }
 
+let unregisterDriver: (() => void) | undefined;
+
 afterEach(() => {
-  unregisterStatefulBindingTargetDriver("test-driver");
+  unregisterDriver?.();
+  unregisterDriver = undefined;
 });
 
 describe("binding target drivers", () => {
@@ -111,7 +114,7 @@ describe("binding target drivers", () => {
       ensureReady,
       ensureSession,
     };
-    registerStatefulBindingTargetDriver(driver);
+    unregisterDriver = registerStatefulBindingTargetDriver(driver);
 
     const bindingResolution = createBindingResolution("test-driver");
     await expect(
@@ -159,7 +162,7 @@ describe("binding target drivers", () => {
       }),
       resetInPlace,
     };
-    registerStatefulBindingTargetDriver(driver);
+    unregisterDriver = registerStatefulBindingTargetDriver(driver);
 
     await expect(
       resetConfiguredBindingTargetInPlace({

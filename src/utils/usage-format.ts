@@ -1,4 +1,10 @@
+/**
+ * Shared token/cost formatting and pricing lookup helpers for CLI, TUI, gateway, and status output.
+ * Keep this module synchronous; request paths call it while rendering usage summaries.
+ */
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveDefaultAgentDir } from "../agents/agent-scope-config.js";
 import { modelKey, normalizeModelRef, normalizeProviderId } from "../agents/model-selection.js";
 import type { NormalizedUsage } from "../agents/usage.js";
@@ -7,7 +13,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getGatewayModelPricingCacheFingerprint } from "../gateway/model-pricing-cache-state.js";
 import { getCachedGatewayModelPricing } from "../gateway/model-pricing-cache.js";
 import { tryReadJsonSync } from "../infra/json-files.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+export { formatTokenCount } from "./token-format.js";
 
 /**
  * A single tier in a tiered-pricing schedule.  Prices are expressed as
@@ -17,7 +23,7 @@ import { normalizeOptionalString } from "../shared/string-coerce.js";
  * token counts.  The tiers MUST be sorted in ascending `range[0]` order
  * with no gaps.
  */
-export type PricingTier = {
+type PricingTier = {
   input: number;
   output: number;
   cacheRead: number;
@@ -34,6 +40,7 @@ type RawPricingTier = {
   range: [number, number] | [number];
 };
 
+/** Per-million-token model pricing used by usage summaries and cost estimates. */
 export type ModelCostConfig = {
   input: number;
   output: number;
@@ -46,7 +53,7 @@ export type ModelCostConfig = {
   tieredPricing?: PricingTier[];
 };
 
-export type UsageTotals = {
+type UsageTotals = {
   input?: number;
   output?: number;
   cacheRead?: number;
@@ -94,31 +101,10 @@ let providerCostIndexByConfig = new WeakMap<
 let modelKeyCache = new Map<string, string | null>();
 let sortedPricingTiersByInput = new WeakMap<PricingTier[], PricingTier[]>();
 
-export function formatTokenCount(value?: number): string {
-  if (value === undefined || !Number.isFinite(value)) {
-    return "0";
-  }
-  const safe = Math.max(0, value);
-  if (safe >= 1_000_000) {
-    return `${(safe / 1_000_000).toFixed(1)}m`;
-  }
-  if (safe >= 1_000) {
-    const precision = safe >= 10_000 ? 0 : 1;
-    const formattedThousands = (safe / 1_000).toFixed(precision);
-    if (Number(formattedThousands) >= 1_000) {
-      return `${(safe / 1_000_000).toFixed(1)}m`;
-    }
-    return `${formattedThousands}k`;
-  }
-  return String(Math.round(safe));
-}
-
+/** Formats a USD amount for usage summaries, keeping tiny costs visible. */
 export function formatUsd(value?: number): string | undefined {
   if (value === undefined || !Number.isFinite(value)) {
     return undefined;
-  }
-  if (value >= 1) {
-    return `$${value.toFixed(2)}`;
   }
   if (value >= 0.01) {
     return `$${value.toFixed(2)}`;
@@ -586,6 +572,10 @@ function serializeCostIndex(
   return Array.from(entries.entries()).toSorted(([a], [b]) => a.localeCompare(b));
 }
 
+/**
+ * Fingerprints all model-pricing sources that can affect usage cost estimates.
+ * Consumers cache this value to know when resolved cost entries need recomputation.
+ */
 export function resolveModelCostConfigFingerprint(config?: OpenClawConfig): string {
   return stableCostFingerprintValue({
     configuredRaw: serializeCostIndex(
@@ -598,6 +588,10 @@ export function resolveModelCostConfigFingerprint(config?: OpenClawConfig): stri
   });
 }
 
+/**
+ * Resolves pricing for a provider/model pair from local models.json, configured models, then gateway cache.
+ * Direct keys win before plugin normalization so configured pricing does not trigger provider discovery.
+ */
 export function resolveModelCostConfig(params: {
   provider?: string;
   model?: string;
@@ -668,7 +662,7 @@ function selectPricingTier(tiers: PricingTier[], input: number): PricingTier | u
   }
 
   for (let index = sortedTiers.length - 1; index >= 0; index -= 1) {
-    const tier = sortedTiers[index];
+    const tier = expectDefined(sortedTiers[index], "sorted tiers entry at index");
     if (input >= tier.range[0]) {
       return tier;
     }
@@ -707,6 +701,10 @@ function computeTieredCost(
   );
 }
 
+/**
+ * Estimates USD usage cost from normalized token totals.
+ * Tiered pricing selects one whole-request tier by input size; it does not blend tiers.
+ */
 export function estimateUsageCost(params: {
   usage?: NormalizedUsage | UsageTotals | null;
   cost?: ModelCostConfig;

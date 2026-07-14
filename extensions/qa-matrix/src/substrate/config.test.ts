@@ -1,3 +1,4 @@
+// Qa Matrix tests cover config plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
 import {
@@ -109,6 +110,7 @@ describe("matrix qa config", () => {
         allowBots: "mentions",
         configuredBotRoles: ["observer"],
         groupAllowFrom: ["@driver:matrix-qa.test", "@observer:matrix-qa.test"],
+        groupMentionPatterns: ["\\S"],
         groupsByKey: {
           secondary: {
             allowBots: false,
@@ -126,6 +128,10 @@ describe("matrix qa config", () => {
           spawnSessions: true,
         },
         threadReplies: "always",
+        audio: {
+          echoTranscript: false,
+          enabled: true,
+        },
         toolProfile: "coding",
       },
       observerAccessToken: "observer-token",
@@ -146,6 +152,11 @@ describe("matrix qa config", () => {
       minChars: 1,
     });
     expect(next.tools?.profile).toBe("coding");
+    expect(next.tools?.media?.audio).toEqual({
+      echoTranscript: false,
+      enabled: true,
+    });
+    expect(next.messages?.groupChat?.mentionPatterns).toEqual(["\\S"]);
     const observer = next.channels?.matrix?.accounts?.["qa-observer-bot-source"];
     expect(observer?.accessToken).toBe("observer-token");
     expect(observer?.enabled).toBe(false);
@@ -155,7 +166,7 @@ describe("matrix qa config", () => {
     expect(sut?.allowBots).toBe("mentions");
     expect(sut?.autoJoin).toBe("allowlist");
     expect(sut?.autoJoinAllowlist).toEqual(["!dm:matrix-qa.test", "#ops:matrix-qa.test"]);
-    expect(sut?.blockStreaming).toBe(true);
+    expect((sut?.streaming as { block?: { enabled?: boolean } })?.block?.enabled).toBe(true);
     expect(sut?.dm?.sessionScope).toBe("per-room");
     expect(sut?.dm?.threadReplies).toBe("off");
     expect(sut?.encryption).toBe(true);
@@ -173,7 +184,7 @@ describe("matrix qa config", () => {
       },
     });
     expect(sut?.replyToMode).toBe("all");
-    expect(sut?.streaming).toBe("quiet");
+    expect((sut?.streaming as { mode?: string })?.mode).toBe("quiet");
     expect(sut?.threadBindings).toEqual({
       enabled: true,
       idleHours: 1,
@@ -211,7 +222,6 @@ describe("matrix qa config", () => {
 
     expect(reset.channels?.matrix?.accounts?.sut?.autoJoin).toBeUndefined();
     expect(reset.channels?.matrix?.accounts?.sut?.autoJoinAllowlist).toBeUndefined();
-    expect(reset.channels?.matrix?.accounts?.sut?.blockStreaming).toBeUndefined();
     expect(reset.channels?.matrix?.accounts?.sut?.streaming).toBeUndefined();
   });
 
@@ -226,6 +236,7 @@ describe("matrix qa config", () => {
         dm: {
           sessionScope: "per-room",
         },
+        groupMentionPatterns: ["\\S"],
         groupPolicy: "open",
         streaming: true,
       },
@@ -254,6 +265,7 @@ describe("matrix qa config", () => {
       execApprovals: undefined,
       configuredBotRoles: [],
       groupAllowFrom: ["@driver:matrix-qa.test"],
+      groupMentionPatterns: ["\\S"],
       groupPolicy: "open",
       groupsByKey: {
         main: {
@@ -276,6 +288,7 @@ describe("matrix qa config", () => {
     });
     expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain("allowBots=<default>");
     expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain("configuredBotRoles=<none>");
+    expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain("groupMentionPatterns=\\S");
     expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain("autoJoin=allowlist");
     expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain("streaming=partial");
     expect(summarizeMatrixQaConfigSnapshot(snapshot)).toContain(
@@ -336,7 +349,7 @@ describe("matrix qa config", () => {
     expect(next.approvals?.exec).toEqual({ enabled: true, mode: "session" });
     expect(next.approvals?.plugin).toEqual({ enabled: true, mode: "session" });
     const sut = next.channels?.matrix?.accounts?.sut;
-    expect(sut?.chunkMode).toBe("length");
+    expect((sut?.streaming as { chunkMode?: string })?.chunkMode).toBe("length");
     expect(sut?.dm?.allowFrom).toEqual(["@driver:matrix-qa.test"]);
     expect(sut?.dm?.enabled).toBe(true);
     expect(sut?.execApprovals).toEqual({

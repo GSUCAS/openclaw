@@ -1,18 +1,20 @@
+// Defines WhatsApp provider schema fragments for config parsing.
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { z } from "zod";
 import { resolveAccountEntry } from "../routing/account-lookup.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
 import { ToolPolicySchema } from "./zod-schema.agent-runtime.js";
 import {
   ChannelHealthMonitorSchema,
   ChannelHeartbeatVisibilitySchema,
 } from "./zod-schema.channels.js";
 import {
-  BlockStreamingCoalesceSchema,
+  ChannelDeliveryStreamingConfigSchema,
   ContextVisibilityModeSchema,
   DmConfigSchema,
   DmPolicySchema,
   GroupPolicySchema,
   MarkdownConfigSchema,
+  MentionPatternsPolicySchema,
   ReplyToModeSchema,
 } from "./zod-schema.core.js";
 
@@ -48,6 +50,13 @@ const WhatsAppAckReactionSchema = z
   .strict()
   .optional();
 
+const WhatsAppPluginHooksSchema = z
+  .object({
+    messageReceived: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
 function stripDeprecatedWhatsAppNoopKeys(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return value;
@@ -79,14 +88,13 @@ function buildWhatsAppCommonShape(params: { useDefaults: boolean }) {
     groupPolicy: params.useDefaults
       ? GroupPolicySchema.optional().default("allowlist")
       : GroupPolicySchema.optional(),
+    mentionPatterns: MentionPatternsPolicySchema.optional(),
     contextVisibility: ContextVisibilityModeSchema.optional(),
     historyLimit: z.number().int().min(0).optional(),
     dmHistoryLimit: z.number().int().min(0).optional(),
     dms: z.record(z.string(), DmConfigSchema.optional()).optional(),
     textChunkLimit: z.number().int().positive().optional(),
-    chunkMode: z.enum(["length", "newline"]).optional(),
-    blockStreaming: z.boolean().optional(),
-    blockStreamingCoalesce: BlockStreamingCoalesceSchema.optional(),
+    streaming: ChannelDeliveryStreamingConfigSchema.optional(),
     groups: WhatsAppGroupsSchema,
     direct: WhatsAppDirectSchema,
     ackReaction: WhatsAppAckReactionSchema,
@@ -97,6 +105,7 @@ function buildWhatsAppCommonShape(params: { useDefaults: boolean }) {
     replyToMode: ReplyToModeSchema.optional(),
     heartbeat: ChannelHeartbeatVisibilitySchema,
     healthMonitor: ChannelHealthMonitorSchema,
+    pluginHooks: WhatsAppPluginHooksSchema,
   };
 }
 
@@ -153,7 +162,7 @@ const WhatsAppAccountObjectSchema = z
   })
   .strict();
 
-export const WhatsAppAccountSchema = z.preprocess(
+const WhatsAppAccountSchema = z.preprocess(
   stripDeprecatedWhatsAppNoopKeys,
   WhatsAppAccountObjectSchema,
 );
@@ -169,6 +178,7 @@ const WhatsAppConfigObjectSchema = z
         reactions: z.boolean().optional(),
         sendMessage: z.boolean().optional(),
         polls: z.boolean().optional(),
+        calls: z.boolean().optional(),
       })
       .strict()
       .optional(),

@@ -1,3 +1,4 @@
+// Plugin SDK subpath tests cover documented SDK subpath exports and package aliases.
 import fs, { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,10 +23,15 @@ import type {
   PluginRuntime as CorePluginRuntime,
 } from "openclaw/plugin-sdk/core";
 import * as providerEntrySdk from "openclaw/plugin-sdk/provider-entry";
+import type {
+  GetReplyOptions as ReplyRuntimeGetReplyOptions,
+  ReplyDispatchBeforeDeliverOptions as ReplyRuntimeBeforeDeliverOptions,
+  ReplyDispatcher as ReplyRuntimeDispatcher,
+} from "openclaw/plugin-sdk/reply-runtime";
 import * as zalouserSdk from "openclaw/plugin-sdk/zalouser";
 import ts from "typescript";
-import { describe, expect, expectTypeOf, it } from "vitest";
-import type { ChannelMessageActionContext } from "../../channels/plugins/types.js";
+import { beforeAll, describe, expect, expectTypeOf, it } from "vitest";
+import type { ChannelMessageActionContext } from "../../channels/plugins/types.public.js";
 import type {
   BaseProbeResult,
   BaseTokenResolution,
@@ -38,7 +44,7 @@ import type {
   ChannelStatusIssue,
   ChannelThreadingContext,
   ChannelThreadingToolContext,
-} from "../../channels/plugins/types.js";
+} from "../../channels/plugins/types.public.js";
 import * as channelActionsDirectSdk from "../../plugin-sdk/channel-actions.js";
 import * as channelLifecycleDirectSdk from "../../plugin-sdk/channel-lifecycle.js";
 import type {
@@ -477,6 +483,25 @@ function isGeneratedBundledFacadeSubpath(subpath: string): boolean {
 }
 
 describe("plugin-sdk subpath exports", () => {
+  let deprecatedChannelRuntimeMatches: string[] = [];
+
+  beforeAll(() => {
+    deprecatedChannelRuntimeMatches = findRepoFilesContaining({
+      roots: [
+        resolve(REPO_ROOT, "src"),
+        resolve(REPO_ROOT, "extensions"),
+        resolve(REPO_ROOT, "test"),
+      ],
+      pattern:
+        /(?:from\s+|import\s+(?:type\s+)?|import\s*\(\s*)["']openclaw\/plugin-sdk\/channel-runtime(?=["'])/u,
+      exclude: [
+        "src/plugins/compat/registry.ts",
+        "src/plugins/sdk-alias.test.ts",
+        "src/plugins/contracts/plugin-sdk-root-alias.test.ts",
+      ],
+    });
+  });
+
   it("keeps the curated public list free of internal implementation subpaths", () => {
     for (const deniedSubpath of [
       "acpx",
@@ -533,6 +558,10 @@ describe("plugin-sdk subpath exports", () => {
   });
 
   it("keeps helper subpaths aligned", () => {
+    expectSourceContract("expect-runtime", {
+      mentions: ["expectDefined"],
+      omits: ["first", "last"],
+    });
     expectSourceMentions("core", [
       "emptyPluginConfigSchema",
       "definePluginEntry",
@@ -572,8 +601,14 @@ describe("plugin-sdk subpath exports", () => {
     ]);
     expectSourceMentions("approval-auth-runtime", [
       "createResolvedApproverActionAuthAdapter",
+      "isImplicitSameChatApprovalAuthorization",
+      "markImplicitSameChatApprovalAuthorization",
       "resolveApprovalApprovers",
     ]);
+    expectSourceContract("approval-reference-runtime", {
+      mentions: ["buildApprovalResolutionRef"],
+      omits: ["resolveApprovalOverGateway", "withOperatorApprovalsGatewayClient"],
+    });
     expectSourceMentions("reply-chunking", [
       "chunkText",
       "chunkTextWithMode",
@@ -603,6 +638,8 @@ describe("plugin-sdk subpath exports", () => {
         "clearHistoryEntriesIfEnabled",
         "recordPendingHistoryEntryIfEnabled",
         "DEFAULT_GROUP_HISTORY_LIMIT",
+        "requestedSessionId",
+        "resumeRequestedSession",
       ],
     });
     expectSourceMentions("account-helpers", ["createAccountListHelpers"]);
@@ -840,21 +877,7 @@ describe("plugin-sdk subpath exports", () => {
   });
 
   it("keeps the deprecated channel-runtime shim unused in repo imports", () => {
-    const matches = findRepoFilesContaining({
-      roots: [
-        resolve(REPO_ROOT, "src"),
-        resolve(REPO_ROOT, "extensions"),
-        resolve(REPO_ROOT, "test"),
-      ],
-      pattern:
-        /(?:from\s+|import\s+(?:type\s+)?|import\s*\(\s*)["']openclaw\/plugin-sdk\/channel-runtime(?=["'])/u,
-      exclude: [
-        "src/plugins/compat/registry.ts",
-        "src/plugins/sdk-alias.test.ts",
-        "src/plugins/contracts/plugin-sdk-root-alias.test.ts",
-      ],
-    });
-    expect(matches).toStrictEqual([]);
+    expect(deprecatedChannelRuntimeMatches).toStrictEqual([]);
   });
 
   it("keeps deprecated comparable channel target helpers behind compatibility shims", () => {
@@ -1146,7 +1169,7 @@ describe("plugin-sdk subpath exports", () => {
       "attachChannelToResult",
       "buildChannelSendResult",
     ]);
-    expectSourceMentions("direct-dm", [
+    expectSourceMentions("channel-inbound", [
       "createDirectDmPreCryptoGuardPolicy",
       "createPreCryptoDirectDmAuthorizer",
       "dispatchInboundDirectDmWithRuntime",
@@ -1329,6 +1352,17 @@ describe("plugin-sdk subpath exports", () => {
     expectTypeOf<CoreOpenClawPluginApi>().toMatchTypeOf<SharedOpenClawPluginApi>();
     expectTypeOf<CorePluginRuntime>().toMatchTypeOf<SharedPluginRuntime>();
     expectTypeOf<CoreChannelMessageActionContext>().toMatchTypeOf<SharedChannelMessageActionContext>();
+    type PrivateResumeOptionKeys = Extract<
+      keyof ReplyRuntimeGetReplyOptions,
+      "requestedSessionId" | "resumeRequestedSession"
+    >;
+    expectTypeOf<PrivateResumeOptionKeys>().toEqualTypeOf<never>();
+    type ReplyRuntimeAppendBeforeDeliverOptions = Parameters<
+      NonNullable<ReplyRuntimeDispatcher["appendBeforeDeliver"]>
+    >[1];
+    expectTypeOf<ReplyRuntimeAppendBeforeDeliverOptions>().toEqualTypeOf<
+      ReplyRuntimeBeforeDeliverOptions | undefined
+    >();
   });
 
   it("keeps runtime entry subpaths importable", async () => {
@@ -1367,7 +1401,11 @@ describe("plugin-sdk subpath exports", () => {
     );
     expectSourceMentions("delivery-queue-runtime", ["drainPendingDeliveries"]);
     expectSourceContains("delivery-queue-runtime", "../infra/outbound/deliver-runtime.js");
-    expectSourceMentions("error-runtime", ["formatUncaughtError", "isApprovalNotFoundError"]);
+    expectSourceMentions("error-runtime", [
+      "formatUncaughtError",
+      "isApprovalNotFoundError",
+      "PlatformMessageNotDispatchedError",
+    ]);
 
     expect(channelLifecycleSdk.createDraftStreamLoop).toBe(
       channelLifecycleDirectSdk.createDraftStreamLoop,

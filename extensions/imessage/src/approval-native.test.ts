@@ -1,10 +1,14 @@
+// Imessage tests cover approval native plugin behavior.
 import type {
   ExecApprovalRequest,
   PluginApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
-import { imessageApprovalCapability, imessageNativeApprovalAdapter } from "./approval-native.js";
+import {
+  imessageApprovalCapability,
+  shouldSuppressLocalIMessageExecApprovalPrompt,
+} from "./approval-native.js";
 
 type IMessageConfig = NonNullable<NonNullable<OpenClawConfig["channels"]>["imessage"]>;
 
@@ -68,6 +72,7 @@ function buildPluginRequest(
 
 function nativeShouldHandle(params: {
   cfg: OpenClawConfig;
+  approvalKind: "exec" | "plugin";
   request: ExecApprovalRequest | PluginApprovalRequest;
   accountId?: string | null;
 }) {
@@ -75,8 +80,30 @@ function nativeShouldHandle(params: {
     cfg: params.cfg,
     accountId: params.accountId ?? "default",
     context: {},
+    approvalKind: params.approvalKind,
     request: params.request,
   });
+}
+
+function buildLocalApprovalPayload(
+  params: {
+    approvalKind?: "exec" | "plugin";
+    agentId?: string | null;
+    sessionKey?: string | null;
+  } = {},
+) {
+  return {
+    text: "Approval required.",
+    channelData: {
+      execApproval: {
+        approvalId: params.approvalKind === "plugin" ? "plugin:approval-1" : "exec-1",
+        approvalSlug: params.approvalKind === "plugin" ? "plugin:approval-1" : "exec-1",
+        approvalKind: params.approvalKind ?? "exec",
+        agentId: params.agentId,
+        sessionKey: params.sessionKey,
+      },
+    },
+  };
 }
 
 describe("imessage approval capability", () => {
@@ -86,7 +113,7 @@ describe("imessage approval capability", () => {
     const pluginRequest = buildPluginRequest("+15551230000");
 
     expect(
-      imessageNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      imessageApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -101,8 +128,8 @@ describe("imessage approval capability", () => {
         request: execRequest,
       }).enabled,
     ).toBe(false);
-    expect(nativeShouldHandle({ cfg, request: execRequest })).toBe(false);
-    expect(nativeShouldHandle({ cfg, request: pluginRequest })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request: execRequest })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "plugin", request: pluginRequest })).toBe(false);
   });
 
   it("allows session-mode exec delivery for matching iMessage origins", () => {
@@ -123,21 +150,33 @@ describe("imessage approval capability", () => {
       supportsApproverDmSurface: false,
       notifyOriginWhenDmOnly: true,
     });
-    expect(nativeShouldHandle({ cfg, request })).toBe(true);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(true);
   });
 
   it("keeps exec and plugin forwarding gates independent", () => {
     const execOnly = buildConfig({ approvals: { exec: { enabled: true } } });
     const pluginOnly = buildConfig({ approvals: { plugin: { enabled: true } } });
 
-    expect(nativeShouldHandle({ cfg: execOnly, request: buildPluginRequest("+15551230000") })).toBe(
-      false,
-    );
-    expect(nativeShouldHandle({ cfg: pluginOnly, request: buildExecRequest("+15551230000") })).toBe(
-      false,
-    );
     expect(
-      nativeShouldHandle({ cfg: pluginOnly, request: buildPluginRequest("+15551230000") }),
+      nativeShouldHandle({
+        cfg: execOnly,
+        approvalKind: "plugin",
+        request: buildPluginRequest("+15551230000"),
+      }),
+    ).toBe(false);
+    expect(
+      nativeShouldHandle({
+        cfg: pluginOnly,
+        approvalKind: "exec",
+        request: buildExecRequest("+15551230000"),
+      }),
+    ).toBe(false);
+    expect(
+      nativeShouldHandle({
+        cfg: pluginOnly,
+        approvalKind: "plugin",
+        request: buildPluginRequest("+15551230000"),
+      }),
     ).toBe(true);
   });
 
@@ -149,7 +188,7 @@ describe("imessage approval capability", () => {
       sessionKey: "agent:main:slack:channel:c123",
     });
 
-    expect(nativeShouldHandle({ cfg, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(false);
     expect(
       imessageApprovalCapability.native?.describeDeliveryCapabilities({
         cfg,
@@ -229,7 +268,7 @@ describe("imessage approval capability", () => {
     const request = buildExecRequest("+15551230000");
 
     expect(
-      imessageNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      imessageApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -243,7 +282,7 @@ describe("imessage approval capability", () => {
         context: {},
       }),
     ).toBe(false);
-    expect(nativeShouldHandle({ cfg, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(false);
   });
 
   it("disables delivery when the iMessage channel is disabled", () => {
@@ -261,7 +300,7 @@ describe("imessage approval capability", () => {
         request,
       }).enabled,
     ).toBe(false);
-    expect(nativeShouldHandle({ cfg, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg, approvalKind: "exec", request })).toBe(false);
   });
 
   it("renders thumbs-only reaction hints in exec approval prompts", () => {
@@ -372,7 +411,7 @@ describe("imessage approval capability", () => {
     });
 
     expect(
-      imessageNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      imessageApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -393,8 +432,10 @@ describe("imessage approval capability", () => {
       approvals: { exec: { enabled: true, sessionFilter: ["telegram"] } },
     });
 
-    expect(nativeShouldHandle({ cfg: blockedByAgent, request })).toBe(false);
-    expect(nativeShouldHandle({ cfg: blockedBySession, request })).toBe(false);
+    expect(nativeShouldHandle({ cfg: blockedByAgent, approvalKind: "exec", request })).toBe(false);
+    expect(nativeShouldHandle({ cfg: blockedBySession, approvalKind: "exec", request })).toBe(
+      false,
+    );
   });
 
   it("matches account-scoped top-level iMessage targets only for that account", () => {
@@ -414,7 +455,7 @@ describe("imessage approval capability", () => {
     });
 
     expect(
-      imessageNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      imessageApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "default",
         action: "approve",
@@ -422,7 +463,7 @@ describe("imessage approval capability", () => {
       }),
     ).toEqual({ kind: "disabled" });
     expect(
-      imessageNativeApprovalAdapter.auth?.getActionAvailabilityState?.({
+      imessageApprovalCapability?.getActionAvailabilityState?.({
         cfg,
         accountId: "work",
         action: "approve",
@@ -568,5 +609,234 @@ describe("imessage approval capability", () => {
       to: "chat_guid:iMessage;+;chat42",
       accountId: "default",
     });
+  });
+});
+
+describe("shouldSuppressLocalIMessageExecApprovalPrompt", () => {
+  const activeExecHint = {
+    kind: "approval-pending",
+    approvalKind: "exec",
+    nativeRouteActive: true,
+  } as const;
+
+  it("suppresses eligible session-mode exec approval prompts", () => {
+    const cfg = buildConfig({
+      imessage: { allowFrom: ["+15551230000"] },
+      approvals: {
+        exec: {
+          enabled: true,
+          agentFilter: ["main"],
+        },
+      },
+    });
+
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        accountId: "default",
+        payload: buildLocalApprovalPayload({
+          agentId: null,
+          sessionKey: "agent:main:imessage:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps local prompts for disabled, target-only, inactive, or non-exec cases", () => {
+    const enabledConfig = buildConfig({
+      imessage: { allowFrom: ["+15551230000"] },
+      approvals: { exec: { enabled: true } },
+    });
+    const payload = buildLocalApprovalPayload({
+      agentId: "main",
+      sessionKey: "agent:main:imessage:+15551230000",
+    });
+
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: buildConfig(),
+        payload,
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: buildConfig({
+          imessage: { allowFrom: ["+15551230000"] },
+          approvals: { exec: { enabled: false } },
+        }),
+        payload,
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: buildConfig({
+          imessage: { allowFrom: ["+15551230000"] },
+          approvals: {
+            exec: {
+              enabled: true,
+              mode: "targets",
+              targets: [{ channel: "imessage", to: "+15551230000" }],
+            },
+          },
+        }),
+        payload,
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: enabledConfig,
+        payload,
+        hint: { ...activeExecHint, nativeRouteActive: false },
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: enabledConfig,
+        payload: buildLocalApprovalPayload({ approvalKind: "plugin" }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg: enabledConfig,
+        payload: { text: "Approval required." },
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+  });
+
+  it("suppresses direct same-chat iMessage prompts without explicit approvers", () => {
+    const cfg = buildConfig({
+      approvals: { exec: { enabled: true } },
+    });
+
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        accountId: "default",
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:direct:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        accountId: "default",
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:default:direct:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps no-approver local prompts for ambiguous or group iMessage sessions", () => {
+    const cfg = buildConfig({
+      approvals: { exec: { enabled: true } },
+    });
+
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:group:test-group",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:chat_guid:iMessage;+;chat42",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:slack:C123",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        accountId: "work",
+        payload: buildLocalApprovalPayload({
+          agentId: "main",
+          sessionKey: "agent:main:imessage:default:direct:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+  });
+
+  it("applies top-level approval filters with agent fallback from session key", () => {
+    const cfg = buildConfig({
+      imessage: { allowFrom: ["+15551230000"] },
+      approvals: {
+        exec: {
+          enabled: true,
+          agentFilter: ["ops"],
+          sessionFilter: ["imessage"],
+        },
+      },
+    });
+
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: null,
+          sessionKey: "agent:ops:imessage:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: null,
+          sessionKey: "agent:main:imessage:+15551230000",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSuppressLocalIMessageExecApprovalPrompt({
+        cfg,
+        payload: buildLocalApprovalPayload({
+          agentId: null,
+          sessionKey: "agent:ops:slack:C123",
+        }),
+        hint: activeExecHint,
+      }),
+    ).toBe(false);
   });
 });

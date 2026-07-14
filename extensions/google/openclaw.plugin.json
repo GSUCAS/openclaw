@@ -1,10 +1,12 @@
 {
   "id": "google",
+  "icon": "https://cdn.simpleicons.org/google",
   "activation": {
     "onStartup": false
   },
   "enabledByDefault": true,
   "providers": ["google", "google-gemini-cli", "google-vertex"],
+  "providerCatalogEntry": "./provider-discovery.ts",
   "autoEnableWhenConfiguredProviders": ["google-gemini-cli"],
   "modelIdNormalization": {
     "providers": {
@@ -566,6 +568,16 @@
     },
     {
       "endpointClass": "google-vertex",
+      "hosts": ["aiplatform.eu.rep.googleapis.com"],
+      "googleVertexRegion": "eu"
+    },
+    {
+      "endpointClass": "google-vertex",
+      "hosts": ["aiplatform.us.rep.googleapis.com"],
+      "googleVertexRegion": "us"
+    },
+    {
+      "endpointClass": "google-vertex",
       "hostSuffixes": ["-aiplatform.googleapis.com"],
       "googleVertexRegionHostSuffix": "-aiplatform.googleapis.com"
     }
@@ -603,18 +615,20 @@
             "source": "gcloud adc"
           }
         ]
+      },
+      {
+        "id": "google",
+        "envVars": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
       }
     ]
   },
   "cliBackends": ["google-gemini-cli"],
-  "providerAuthEnvVars": {
-    "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
-  },
   "providerAuthChoices": [
     {
       "provider": "google",
       "method": "api-key",
       "choiceId": "gemini-api-key",
+      "appGuidedSecret": true,
       "choiceLabel": "Google Gemini API key",
       "groupId": "google",
       "groupLabel": "Google",
@@ -629,6 +643,7 @@
       "provider": "google-gemini-cli",
       "method": "oauth",
       "choiceId": "google-gemini-cli",
+      "appGuidedAuth": "oauth",
       "choiceLabel": "Gemini CLI OAuth",
       "choiceHint": "Google OAuth with project-aware token payload",
       "groupId": "google",
@@ -661,7 +676,8 @@
     "realtimeVoiceProviders": ["google"],
     "speechProviders": ["google"],
     "videoGenerationProviders": ["google"],
-    "webSearchProviders": ["gemini"]
+    "webSearchProviders": ["gemini"],
+    "usageProviders": ["google-gemini-cli"]
   },
   "mediaUnderstandingProviderMetadata": {
     "google": {

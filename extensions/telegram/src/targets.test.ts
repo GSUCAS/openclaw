@@ -1,3 +1,5 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+// Telegram tests cover targets plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   isNumericTelegramSenderUserId,
@@ -84,6 +86,17 @@ describe("parseTelegramTarget", () => {
   it("does not treat non-numeric suffix as topicId", () => {
     expect(parseTelegramTarget("-1001234567890:abc")).toEqual({
       chatId: "-1001234567890:abc",
+      chatType: "unknown",
+    });
+  });
+
+  it("does not route unsafe topic suffixes", () => {
+    expect(parseTelegramTarget("-1001234567890:9007199254740992")).toEqual({
+      chatId: "-1001234567890:9007199254740992",
+      chatType: "unknown",
+    });
+    expect(parseTelegramTarget("-1001234567890:topic:9007199254740992")).toEqual({
+      chatId: "-1001234567890:topic:9007199254740992",
       chatType: "unknown",
     });
   });
@@ -188,7 +201,7 @@ describe("telegram group policy", () => {
           },
         },
       },
-    } as any;
+    } as OpenClawConfig;
     expect(
       resolveTelegramGroupRequireMention({ cfg: telegramCfg, groupId: "-1001:topic:77" }),
     ).toBe(false);
@@ -230,7 +243,7 @@ describe("telegram group policy", () => {
           },
         },
       },
-    } as any;
+    } as OpenClawConfig;
 
     expect(
       resolveTelegramGroupRequireMention({

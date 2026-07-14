@@ -1,3 +1,4 @@
+// Evaluates tool descriptors against runtime availability constraints.
 import type {
   JsonObject,
   JsonPrimitive,
@@ -9,8 +10,14 @@ import type {
   ToolDescriptor,
 } from "./types.js";
 
+/**
+ * Tool availability evaluator for descriptor-driven tool planning.
+ *
+ * Descriptors express why a tool can be shown as small signals; this module
+ * turns those signals into diagnostics without knowing any concrete tool owner.
+ */
 function isRecord(value: JsonValue | undefined): value is JsonObject {
-  return !!value && typeof value === "object" && !Array.isArray(value);
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function resolveConfigPath(
@@ -37,6 +44,7 @@ function hasConfiguredValue(params: {
     return false;
   }
   if ((signal.check ?? "exists") === "available") {
+    // "available" delegates semantic checks, for example provider auth that is configured but stale.
     return (
       params.context.isConfigValueAvailable?.({
         value,
@@ -60,8 +68,71 @@ function hasConfiguredValue(params: {
   return true;
 }
 
-function hasAvailabilityExpressionShape(value: ToolAvailabilityExpression): boolean {
-  return "kind" in value || "allOf" in value || "anyOf" in value;
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isJsonPrimitive(value: unknown): value is JsonPrimitive {
+  return value === null || ["string", "number", "boolean"].includes(typeof value);
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && Array.from(value).every((entry) => typeof entry === "string");
+}
+
+function isAvailabilitySignal(
+  value: Record<string, unknown>,
+): value is Record<string, unknown> & ToolAvailabilitySignal {
+  switch (value.kind) {
+    case "always":
+      return true;
+    case "auth":
+      return isNonEmptyString(value.providerId);
+    case "config":
+      return (
+        isStringArray(value.path) &&
+        (value.check === undefined ||
+          value.check === "exists" ||
+          value.check === "non-empty" ||
+          value.check === "available")
+      );
+    case "env":
+      return isNonEmptyString(value.name);
+    case "plugin-enabled":
+      return isNonEmptyString(value.pluginId);
+    case "context":
+      return isNonEmptyString(value.key) && (!("equals" in value) || isJsonPrimitive(value.equals));
+    default:
+      return false;
+  }
+}
+
+function isAvailabilityExpression(
+  value: unknown,
+  active: WeakSet<object>,
+): value is ToolAvailabilityExpression {
+  if (!value || typeof value !== "object" || Array.isArray(value) || active.has(value)) {
+    return false;
+  }
+  active.add(value);
+  try {
+    const expression = value as Record<string, unknown>;
+    const shapeCount =
+      Number("kind" in expression) + Number("allOf" in expression) + Number("anyOf" in expression);
+    if (shapeCount !== 1) {
+      return false;
+    }
+    if ("kind" in expression) {
+      return isAvailabilitySignal(expression);
+    }
+    const entries = "allOf" in expression ? expression.allOf : expression.anyOf;
+    return (
+      Array.isArray(entries) &&
+      Array.from(entries).every((entry) => isAvailabilityExpression(entry, active))
+    );
+  } finally {
+    active.delete(value);
+  }
 }
 
 function diagnostic(
@@ -118,8 +189,8 @@ function evaluateExpression(
   context: ToolAvailabilityContext,
 ): readonly ToolAvailabilityDiagnostic[] {
   if ("kind" in expression) {
-    const diagnostic = evaluateSignal(expression, context);
-    return diagnostic ? [diagnostic] : [];
+    const diagnosticLocal = evaluateSignal(expression, context);
+    return diagnosticLocal ? [diagnosticLocal] : [];
   }
   if ("allOf" in expression) {
     if (expression.allOf.length === 0) {
@@ -142,7 +213,13 @@ function evaluateExpression(
       ];
     }
     const diagnostics = expression.anyOf.map((entry) => evaluateExpression(entry, context));
-    return diagnostics.some((entries) => entries.length === 0) ? [] : diagnostics.flat();
+    // "unsupported-signal" marks a malformed descriptor, not a runtime condition, so it must surface
+    // even when a sibling branch is available; otherwise an available branch masks an authoring error.
+    const unsupported = diagnostics.flat().filter((entry) => entry.reason === "unsupported-signal");
+    if (diagnostics.some((entries) => entries.length === 0)) {
+      return unsupported;
+    }
+    return diagnostics.flat();
   }
   return [
     {
@@ -152,13 +229,17 @@ function evaluateExpression(
   ];
 }
 
+/** Evaluate one descriptor against runtime context and return hidden-tool diagnostics. */
 export function evaluateToolAvailability(params: {
   descriptor: ToolDescriptor;
   context?: ToolAvailabilityContext;
 }): readonly ToolAvailabilityDiagnostic[] {
   const context = params.context ?? {};
-  const availability = params.descriptor.availability ?? { kind: "always" };
-  if (!hasAvailabilityExpressionShape(availability)) {
+  const availability = params.descriptor.availability;
+  if (availability === undefined) {
+    return [];
+  }
+  if (!isAvailabilityExpression(availability, new WeakSet())) {
     return [
       {
         reason: "unsupported-signal",

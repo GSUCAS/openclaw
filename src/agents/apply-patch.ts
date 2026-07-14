@@ -1,13 +1,19 @@
+/**
+ * Runtime apply_patch tool and parser.
+ * Parses OpenAI-style patch envelopes and applies add/update/delete/move hunks
+ * through guarded host or sandbox filesystem operations.
+ */
 import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
+import { createAbortError } from "../infra/abort-signal.js";
 import { openRootFile, type RootFileOpenResult } from "../infra/boundary-file-read.js";
 import { root as fsRoot } from "../infra/fs-safe.js";
 import { PATH_ALIAS_POLICIES, type PathAliasPolicy } from "../infra/path-alias-guards.js";
 import { applyUpdateHunk } from "./apply-patch-update.js";
 import { toRelativeSandboxPath, resolvePathFromInput } from "./path-policy.js";
+import type { AgentTool } from "./runtime/index.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 
@@ -57,11 +63,20 @@ export type ApplyPatchSummary = {
 type ApplyPatchResult = {
   summary: ApplyPatchSummary;
   text: string;
+  noOp?: boolean;
 };
 
 type ApplyPatchToolDetails = {
   summary: ApplyPatchSummary;
 };
+
+function normalizeUpdateComparison(content: string): string {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalized.length === 0 || normalized.endsWith("\n")) {
+    return normalized;
+  }
+  return `${normalized}\n`;
+}
 
 type SandboxApplyPatchConfig = {
   root: string;
@@ -82,6 +97,7 @@ const applyPatchSchema = Type.Object({
   }),
 });
 
+/** Create the agent tool wrapper for applying patch-envelope input. */
 export function createApplyPatchTool(
   options: { cwd?: string; sandbox?: SandboxApplyPatchConfig; workspaceOnly?: boolean } = {},
 ): AgentTool<typeof applyPatchSchema, ApplyPatchToolDetails> {
@@ -92,8 +108,7 @@ export function createApplyPatchTool(
   return {
     name: "apply_patch",
     label: "apply_patch",
-    description:
-      "Apply a patch to one or more files using the apply_patch format. The input should include *** Begin Patch and *** End Patch markers.",
+    description: "Patch one/many files. Input requires *** Begin Patch and *** End Patch.",
     parameters: applyPatchSchema,
     execute: async (_toolCallId, args, signal) => {
       const params = args as { input?: string };
@@ -102,9 +117,7 @@ export function createApplyPatchTool(
         throw new Error("Provide a patch input.");
       }
       if (signal?.aborted) {
-        const err = new Error("Aborted");
-        err.name = "AbortError";
-        throw err;
+        throw createAbortError("Aborted");
       }
 
       const result = await applyPatch(input, {
@@ -117,11 +130,13 @@ export function createApplyPatchTool(
       return {
         content: [{ type: "text", text: result.text }],
         details: { summary: result.summary },
+        ...(result.noOp ? { terminate: true } : {}),
       };
     },
   };
 }
 
+/** Parse and apply a patch envelope to the configured filesystem target. */
 export async function applyPatch(
   input: string,
   options: ApplyPatchOptions,
@@ -141,13 +156,12 @@ export async function applyPatch(
     modified: new Set<string>(),
     deleted: new Set<string>(),
   };
+  const noOpPaths = new Set<string>();
   const fileOps = resolvePatchFileOps(options);
 
   for (const hunk of parsed.hunks) {
     if (options.signal?.aborted) {
-      const err = new Error("Aborted");
-      err.name = "AbortError";
-      throw err;
+      throw createAbortError("Aborted");
     }
 
     if (hunk.kind === "add") {
@@ -168,7 +182,7 @@ export async function applyPatch(
 
     const target = await resolvePatchPath(hunk.path, options);
     const applied = await applyUpdateHunk(target.resolved, hunk.chunks, {
-      readFile: (path) => fileOps.readFile(path),
+      readFile: (pathLocal) => fileOps.readFile(pathLocal),
     });
 
     if (hunk.movePath) {
@@ -177,28 +191,47 @@ export async function applyPatch(
       await ensureDir(moveTarget.resolved, fileOps);
       const moveResolvesToSource =
         path.resolve(moveTarget.resolved) === path.resolve(target.resolved);
-      await fileOps.writeFile(
-        moveResolvesToSource ? target.resolved : moveTarget.resolved,
-        applied,
-      );
+      const destination = moveResolvesToSource ? target.resolved : moveTarget.resolved;
+      if (moveResolvesToSource) {
+        const existing = await fileOps.readFile(target.resolved);
+        if (normalizeUpdateComparison(existing) === normalizeUpdateComparison(applied)) {
+          noOpPaths.add(target.display);
+        } else {
+          noOpPaths.delete(target.display);
+          await fileOps.writeFile(destination, applied);
+        }
+      } else {
+        noOpPaths.delete(target.display);
+        await fileOps.writeFile(destination, applied);
+      }
       if (!moveResolvesToSource) {
         await fileOps.remove(target.resolved);
       }
-      recordSummary(
-        summary,
-        seen,
-        "modified",
-        moveResolvesToSource ? target.display : moveTarget.display,
-      );
+      if (!noOpPaths.has(target.display)) {
+        recordSummary(
+          summary,
+          seen,
+          "modified",
+          moveResolvesToSource ? target.display : moveTarget.display,
+        );
+      }
     } else {
-      await fileOps.writeFile(target.resolved, applied);
-      recordSummary(summary, seen, "modified", target.display);
+      const existing = await fileOps.readFile(target.resolved);
+      if (normalizeUpdateComparison(existing) === normalizeUpdateComparison(applied)) {
+        noOpPaths.add(target.display);
+      } else {
+        noOpPaths.delete(target.display);
+        await fileOps.writeFile(target.resolved, applied);
+        recordSummary(summary, seen, "modified", target.display);
+      }
     }
   }
 
+  const noOp = noOpPaths.size > 0 && Object.values(summary).every((paths) => paths.length === 0);
   return {
     summary,
-    text: formatSummary(summary),
+    text: noOp ? `No changes made to ${Array.from(noOpPaths).join(", ")}.` : formatSummary(summary),
+    ...(noOp ? { noOp: true } : {}),
   };
 }
 
@@ -505,7 +538,10 @@ function parseOneHunk(lines: string[], lineNumber: number): { hunk: Hunk; consum
   if (lines.length === 0) {
     throw new Error(`Invalid patch hunk at line ${lineNumber}: empty hunk`);
   }
-  const firstLine = lines[0].trim();
+  const firstLine = lines.at(0)?.trim();
+  if (firstLine === undefined) {
+    throw new Error(`Invalid patch hunk at line ${lineNumber}: empty hunk`);
+  }
   if (firstLine.startsWith(ADD_FILE_MARKER)) {
     const targetPath = firstLine.slice(ADD_FILE_MARKER.length);
     let contents = "";
@@ -547,12 +583,16 @@ function parseOneHunk(lines: string[], lineNumber: number): { hunk: Hunk; consum
 
     const chunks: UpdateFileChunk[] = [];
     while (remaining.length > 0) {
-      if (remaining[0].trim() === "") {
+      const firstRemaining = remaining.at(0);
+      if (firstRemaining === undefined) {
+        break;
+      }
+      if (firstRemaining.trim() === "") {
         remaining = remaining.slice(1);
         consumed += 1;
         continue;
       }
-      if (remaining[0].startsWith("***")) {
+      if (firstRemaining.startsWith("***")) {
         break;
       }
       const { chunk, consumed: chunkLines } = parseUpdateFileChunk(
@@ -600,14 +640,15 @@ function parseUpdateFileChunk(
 
   let changeContext: string | undefined;
   let startIndex = 0;
-  if (lines[0] === EMPTY_CHANGE_CONTEXT_MARKER) {
+  const firstLine = lines.at(0);
+  if (firstLine === EMPTY_CHANGE_CONTEXT_MARKER) {
     startIndex = 1;
-  } else if (lines[0].startsWith(CHANGE_CONTEXT_MARKER)) {
-    changeContext = lines[0].slice(CHANGE_CONTEXT_MARKER.length);
+  } else if (firstLine?.startsWith(CHANGE_CONTEXT_MARKER)) {
+    changeContext = firstLine.slice(CHANGE_CONTEXT_MARKER.length);
     startIndex = 1;
   } else if (!allowMissingContext) {
     throw new Error(
-      `Invalid patch hunk at line ${lineNumber}: Expected update hunk to start with a @@ context marker, got: '${lines[0]}'`,
+      `Invalid patch hunk at line ${lineNumber}: Expected update hunk to start with a @@ context marker, got: '${firstLine}'`,
     );
   }
 

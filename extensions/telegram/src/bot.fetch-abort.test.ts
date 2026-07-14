@@ -1,5 +1,6 @@
+// Telegram tests cover bot.fetch abort plugin behavior.
 import { describe, expect, it, vi } from "vitest";
-import { getTelegramNetworkErrorOrigin } from "./network-errors.js";
+import { isTelegramPollingNetworkError } from "./network-errors.js";
 
 const { botCtorSpy, telegramBotDepsForTest, telegramBotRuntimeForTest } =
   await import("./bot.create-telegram-bot.test-harness.js");
@@ -89,10 +90,7 @@ describe("createTelegramBot fetch abort", () => {
     await expect(clientFetch("https://api.telegram.org/bot123456:ABC/getUpdates")).rejects.toBe(
       fetchError,
     );
-    expect(getTelegramNetworkErrorOrigin(fetchError)).toEqual({
-      method: "getupdates",
-      url: "https://api.telegram.org/bot123456:ABC/getUpdates",
-    });
+    expect(isTelegramPollingNetworkError(fetchError)).toBe(true);
   });
 
   it("aborts wrapped getUpdates fetch after the hard polling timeout", async () => {
@@ -115,25 +113,28 @@ describe("createTelegramBot fetch abort", () => {
     vi.useRealTimers();
   });
 
-  it("uses the longer outbound text timeout for sendMessage", async () => {
-    vi.useFakeTimers();
-    const fetchSpy = vi.fn(
-      (_input: RequestInfo | URL, init?: RequestInit) =>
-        new Promise<AbortSignal>((resolve) => {
-          const signal = init?.signal as AbortSignal;
-          signal.addEventListener("abort", () => resolve(signal), { once: true });
-        }),
-    );
-    const { clientFetch } = createWrappedTelegramClientFetch(fetchSpy as unknown as typeof fetch);
+  it.each(["sendMessage", "answerCallbackQuery"])(
+    "uses the 60-second outbound guard for %s",
+    async (method) => {
+      vi.useFakeTimers();
+      const fetchSpy = vi.fn(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<AbortSignal>((resolve) => {
+            const signal = init?.signal as AbortSignal;
+            signal.addEventListener("abort", () => resolve(signal), { once: true });
+          }),
+      );
+      const { clientFetch } = createWrappedTelegramClientFetch(fetchSpy as unknown as typeof fetch);
 
-    const observedSignalPromise = clientFetch("https://api.telegram.org/bot123456:ABC/sendMessage");
-    await vi.advanceTimersByTimeAsync(60_000);
-    const observedSignal = (await observedSignalPromise) as AbortSignal;
+      const observedSignalPromise = clientFetch(`https://api.telegram.org/bot123456:ABC/${method}`);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const observedSignal = (await observedSignalPromise) as AbortSignal;
 
-    expect(observedSignal).toBeInstanceOf(AbortSignal);
-    expect(observedSignal.aborted).toBe(true);
-    vi.useRealTimers();
-  });
+      expect(observedSignal).toBeInstanceOf(AbortSignal);
+      expect(observedSignal.aborted).toBe(true);
+      vi.useRealTimers();
+    },
+  );
 
   it("lets configured timeoutSeconds extend outbound method guards", async () => {
     vi.useFakeTimers();
@@ -171,7 +172,11 @@ describe("createTelegramBot fetch abort", () => {
         (_input: RequestInfo | URL, init?: RequestInit) =>
           new Promise((_resolve, reject) => {
             const signal = init?.signal as AbortSignal;
-            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            signal.addEventListener(
+              "abort",
+              () => reject(toLintErrorObject(signal.reason, "Non-Error rejection")),
+              { once: true },
+            );
           }),
       )
       .mockResolvedValueOnce({ ok: true } as Response);
@@ -200,7 +205,11 @@ describe("createTelegramBot fetch abort", () => {
           (_input: RequestInfo | URL, init?: RequestInit) =>
             new Promise((_resolve, reject) => {
               const signal = init?.signal as AbortSignal;
-              signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              signal.addEventListener(
+                "abort",
+                () => reject(toLintErrorObject(signal.reason, "Non-Error rejection")),
+                { once: true },
+              );
             }),
         )
         .mockResolvedValueOnce({ ok: true } as Response);
@@ -228,7 +237,11 @@ describe("createTelegramBot fetch abort", () => {
         (_input: RequestInfo | URL, init?: RequestInit) =>
           new Promise((_resolve, reject) => {
             const signal = init?.signal as AbortSignal;
-            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            signal.addEventListener(
+              "abort",
+              () => reject(toLintErrorObject(signal.reason, "Non-Error rejection")),
+              { once: true },
+            );
           }),
       )
       .mockResolvedValueOnce({ ok: true } as Response);
@@ -293,13 +306,27 @@ describe("createTelegramBot fetch abort", () => {
       }),
     );
     const fetchSpy = vi.fn(async () => {
-      throw frozenError;
+      throw toLintErrorObject(frozenError, "Non-Error thrown");
     });
     const { clientFetch } = createWrappedTelegramClientFetch(fetchSpy as unknown as typeof fetch);
 
     await expect(clientFetch("https://api.telegram.org/bot123456:ABC/getUpdates")).rejects.toBe(
       frozenError,
     );
-    expect(getTelegramNetworkErrorOrigin(frozenError)).toBeNull();
+    expect(isTelegramPollingNetworkError(frozenError)).toBe(false);
   });
 });
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}

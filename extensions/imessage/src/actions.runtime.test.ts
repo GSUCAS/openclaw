@@ -1,37 +1,36 @@
-import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
+// Imessage tests cover actions plugin behavior.
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-const spawnMock = vi.hoisted(() => vi.fn());
+const createIMessageRpcClientMock = vi.hoisted(() => vi.fn());
+const runIMessageCliJsonCommandMock = vi.hoisted(() => vi.fn());
 
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  spawn: spawnMock,
+vi.mock("./cli-output.js", () => ({
+  runIMessageCliJsonCommand: runIMessageCliJsonCommandMock,
+}));
+
+vi.mock("./client.js", () => ({
+  createIMessageRpcClient: createIMessageRpcClientMock,
 }));
 
 const { imessageActionsRuntime, findChatGuidForTest, normalizeDirectChatIdentifierForTest } =
   await import("./actions.runtime.js");
 
-function mockSpawnJsonResponse(payload: Record<string, unknown> = { success: true }) {
-  spawnMock.mockImplementationOnce(() => {
-    const child = new EventEmitter() as EventEmitter & {
-      stdout: EventEmitter & { setEncoding: (encoding: string) => void };
-      stderr: EventEmitter & { setEncoding: (encoding: string) => void };
-      kill: (signal: string) => void;
-    };
-    child.stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
-    child.stderr = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
-    child.kill = vi.fn();
-    queueMicrotask(() => {
-      child.stdout.emit("data", `${JSON.stringify(payload)}\n`);
-      child.emit("close", 0);
-    });
-    return child;
-  });
+afterEach(() => {
+  vi.restoreAllMocks();
+  createIMessageRpcClientMock.mockReset();
+  runIMessageCliJsonCommandMock.mockReset();
+});
+
+function mockRpcChatList(chats: Array<Record<string, unknown>>) {
+  const request = vi.fn().mockResolvedValue({ chats });
+  const stop = vi.fn().mockResolvedValue(undefined);
+  createIMessageRpcClientMock.mockResolvedValueOnce({ request, stop });
+  return { request, stop };
 }
 
 describe("imessage actions runtime", () => {
   it("passes the configured Messages db path to private API bridge commands", async () => {
-    mockSpawnJsonResponse();
+    runIMessageCliJsonCommandMock.mockResolvedValue({ success: true });
 
     await imessageActionsRuntime.sendReaction({
       chatGuid: "iMessage;+;chat0000",
@@ -44,9 +43,11 @@ describe("imessage actions runtime", () => {
       },
     });
 
-    expect(spawnMock).toHaveBeenCalledWith(
-      "imsg",
-      [
+    expect(runIMessageCliJsonCommandMock).toHaveBeenCalledWith({
+      cliPath: "imsg",
+      dbPath: "/tmp/messages.db",
+      timeoutMs: undefined,
+      args: [
         "tapback",
         "--chat",
         "iMessage;+;chat0000",
@@ -56,12 +57,77 @@ describe("imessage actions runtime", () => {
         "like",
         "--part",
         "0",
-        "--db",
-        "/tmp/messages.db",
-        "--json",
       ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+    });
+  });
+
+  it("preserves canonical CLI wrapper errors", async () => {
+    const wrapperError = new Error("imsg failed");
+    runIMessageCliJsonCommandMock.mockRejectedValue(wrapperError);
+
+    await expect(
+      imessageActionsRuntime.sendReaction({
+        chatGuid: "iMessage;+;chat0000",
+        messageId: "message-guid",
+        reaction: "like",
+        options: {
+          cliPath: "imsg",
+          chatGuid: "iMessage;+;chat0000",
+        },
+      }),
+    ).rejects.toBe(wrapperError);
+  });
+
+  it("drops cached chats.list entries when the current clock is not a valid date timestamp", async () => {
+    vi.spyOn(Date, "now").mockReturnValueOnce(1_700_000_000_000).mockReturnValueOnce(Number.NaN);
+    const firstClient = mockRpcChatList([{ id: 1, guid: "iMessage;+;first" }]);
+    const secondClient = mockRpcChatList([{ id: 2, guid: "iMessage;+;second" }]);
+
+    await expect(
+      imessageActionsRuntime.resolveChatGuidForTarget({
+        target: { kind: "chat_id", chatId: 1 },
+        options: { cliPath: "imsg-invalid-clock" },
+      }),
+    ).resolves.toBe("iMessage;+;first");
+    await expect(
+      imessageActionsRuntime.resolveChatGuidForTarget({
+        target: { kind: "chat_id", chatId: 2 },
+        options: { cliPath: "imsg-invalid-clock" },
+      }),
+    ).resolves.toBe("iMessage;+;second");
+
+    expect(createIMessageRpcClientMock).toHaveBeenCalledTimes(2);
+    expect(firstClient.request).toHaveBeenCalledWith(
+      "chats.list",
+      { limit: 1000 },
+      { timeoutMs: undefined },
     );
+    expect(secondClient.request).toHaveBeenCalledWith(
+      "chats.list",
+      { limit: 1000 },
+      { timeoutMs: undefined },
+    );
+  });
+
+  it("does not cache chats.list when the expiry timestamp would exceed the valid date range", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(8_640_000_000_000_000);
+    mockRpcChatList([{ id: 1, guid: "iMessage;+;first" }]);
+    mockRpcChatList([{ id: 2, guid: "iMessage;+;second" }]);
+
+    await expect(
+      imessageActionsRuntime.resolveChatGuidForTarget({
+        target: { kind: "chat_id", chatId: 1 },
+        options: { cliPath: "imsg-overflow-clock" },
+      }),
+    ).resolves.toBe("iMessage;+;first");
+    await expect(
+      imessageActionsRuntime.resolveChatGuidForTarget({
+        target: { kind: "chat_id", chatId: 2 },
+        options: { cliPath: "imsg-overflow-clock" },
+      }),
+    ).resolves.toBe("iMessage;+;second");
+
+    expect(createIMessageRpcClientMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -133,6 +199,20 @@ describe("findChatGuid cross-format identifier resolution", () => {
   it("matches a group chat by chat_id", () => {
     const result = findChatGuidForTest(chatsList, { kind: "chat_id", chatId: 7 });
     expect(result).toBe("iMessage;+;chat0000");
+  });
+
+  it("does not coerce non-decimal chat ids from chats.list", () => {
+    const result = findChatGuidForTest(
+      [
+        {
+          id: "0x7",
+          identifier: "wrong",
+          guid: "iMessage;+;wrong",
+        },
+      ],
+      { kind: "chat_id", chatId: 7 },
+    );
+    expect(result).toBeNull();
   });
 
   it("returns null for a phone number that does not exist in chats.list", () => {

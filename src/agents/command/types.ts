@@ -1,11 +1,23 @@
+/**
+ * Public option and metadata types for agent command execution.
+ */
+import type { FastMode } from "@openclaw/normalization-core/string-coerce";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
 import type { SpawnedRunMetadata } from "../../agents/spawned-context.js";
 import type { PromptMode } from "../../agents/system-prompt.types.js";
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import type { ChannelOutboundTargetMode } from "../../channels/plugins/types.public.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
+import type { PluginHookChannelContext } from "../../plugins/hook-types.js";
+import type { RuntimePluginToolGrant } from "../../plugins/runtime/tool-grant.js";
 import type { InputProvenance } from "../../sessions/input-provenance.js";
+import type {
+  UserTurnInput,
+  UserTurnTranscriptRecorder,
+} from "../../sessions/user-turn-transcript.types.js";
 import type { ExecElevatedDefaults } from "../bash-tools.exec-types.js";
+import type { BootstrapContextRunKind } from "../bootstrap-mode.js";
+import type { CliSessionBindingFacts } from "../cli-runner/types.js";
 import type { AgentStreamParams, ClientToolDefinition } from "./shared-types.js";
 
 /** Image content block for Claude API multimodal messages. */
@@ -14,8 +26,8 @@ export type ImageContent = {
   data: string;
   mimeType: string;
 };
-export type { AgentStreamParams } from "./shared-types.js";
 
+/** Metadata overrides for trusted internal agent command callers. */
 export type AgentCommandResultMetaOverrides = {
   transport?: "embedded";
   fallbackFrom?: "gateway";
@@ -24,8 +36,10 @@ export type AgentCommandResultMetaOverrides = {
   fallbackSessionKey?: string;
 };
 
-export type AcpTurnSource = "manual_spawn";
+/** ACP turn source markers accepted by trusted command callsites. */
+type AcpTurnSource = "manual_spawn";
 
+/** Channel/account/thread context carried into an agent run. */
 export type AgentRunContext = {
   messageChannel?: string;
   accountId?: string;
@@ -33,15 +47,24 @@ export type AgentRunContext = {
   groupChannel?: string | null;
   groupSpace?: string | null;
   currentChannelId?: string;
+  /** Transport-native chat/conversation ID for plugin hook identity context. */
+  chatId?: string;
+  /** Channel-specific sender/chat metadata for plugin hook identity context. */
+  channelContext?: PluginHookChannelContext;
   currentThreadTs?: string;
+  currentInboundAudio?: boolean;
+  senderId?: string | null;
   replyToMode?: "off" | "first" | "all" | "batched";
   hasRepliedRef?: { value: boolean };
 };
 
+/** Full trusted option surface for running an agent command. */
 export type AgentCommandOpts = {
   message: string;
   /** User-visible transcript body; defaults to message and excludes runtime-only context. */
   transcriptMessage?: string;
+  /** Durable media metadata for the user-visible transcript turn. */
+  transcriptMedia?: UserTurnInput["media"];
   /** Optional image attachments for multimodal messages. */
   images?: ImageContent[];
   /** Original inline/offloaded attachment order for inbound images. */
@@ -81,6 +104,8 @@ export type AgentCommandOpts = {
   accountId?: string;
   /** Context for embedded run routing (channel/account/thread). */
   runContext?: AgentRunContext;
+  /** Device-scoped operator session allowed to review approvals initiated by this run. */
+  approvalReviewerDeviceId?: string;
   /** Internal trusted exec approval follow-up elevated defaults. */
   bashElevated?: ExecElevatedDefaults;
   /** Trusted sender identity bit for command/channel-action auth; defaults true for local CLI calls. */
@@ -89,6 +114,13 @@ export type AgentCommandOpts = {
   allowModelOverride?: boolean;
   /** Optional runtime tool allow-list; when set, only these tools are exposed for this run. */
   toolsAllow?: string[];
+  /** Trusted owner-scoped plugin tool grant; normal policy and deny rules still apply. */
+  runtimePluginToolGrant?: RuntimePluginToolGrant;
+  /** Internal marker for an auto-applied cap that CLI runtimes must omit. */
+  toolsAllowIsDefault?: boolean;
+  /** Preserve the originating run's message-tool policy across internal continuation turns. */
+  requireExplicitMessageTarget?: boolean;
+  cliSessionBindingFacts?: CliSessionBindingFacts;
   /** Group/spawn metadata for subagent policy inheritance and routing context. */
   groupId?: SpawnedRunMetadata["groupId"];
   groupChannel?: SpawnedRunMetadata["groupChannel"];
@@ -99,11 +131,13 @@ export type AgentCommandOpts = {
   abortSignal?: AbortSignal;
   lane?: string;
   runId?: string;
+  /** Immutable gateway lifecycle ownership captured when this run was admitted. */
+  lifecycleGeneration?: string;
   extraSystemPrompt?: string;
   /** Bootstrap workspace context injection mode for this run. */
   bootstrapContextMode?: "full" | "lightweight";
   /** Run kind hint for bootstrap context behavior. */
-  bootstrapContextRunKind?: "default" | "heartbeat" | "cron";
+  bootstrapContextRunKind?: BootstrapContextRunKind;
   internalEvents?: AgentInternalEvent[];
   inputProvenance?: InputProvenance;
   /** Internal runs can execute against a session without updating visible status/model/usage. */
@@ -114,18 +148,34 @@ export type AgentCommandOpts = {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   /** Internal runs can omit the channel message tool entirely. */
   disableMessageTool?: boolean;
+  /** Restrict this reconstructed run to restart-safe tools. */
+  forceRestartSafeTools?: boolean;
+  /** Gateway ingress that already persisted visible activity can skip the duplicate pre-run touch. */
+  skipInitialSessionTouch?: boolean;
   /** Per-call stream param overrides (best-effort). */
   streamParams?: AgentStreamParams;
+  /** Resolved per-run fast mode from channel/directive handling. */
+  fastMode?: FastMode;
+  /** Resolved per-run auto cutoff seconds for fast mode. */
+  fastModeAutoOnSeconds?: number;
   /** Explicit workspace directory override (for subagents to inherit parent workspace). */
   workspaceDir?: SpawnedRunMetadata["workspaceDir"];
+  /** Explicit task working directory for this run. Bootstrap still uses workspaceDir. */
+  cwd?: string;
   /** Force bundled MCP teardown when a one-shot local run completes. */
   cleanupBundleMcpOnRunEnd?: boolean;
   /** Force long-lived CLI live session teardown when a one-shot local run completes. */
   cleanupCliLiveSessionOnRunEnd?: boolean;
+  /** Mark explicit one-shot local CLI runs so plugin tools can release resources promptly. */
+  oneShotCliRun?: boolean;
+  /** Gateway-owned runs can late-bind plugin subagent and node runtime helpers. */
+  allowGatewaySubagentBinding?: boolean;
   /** Internal local CLI callers can annotate result metadata before JSON/text output. */
   resultMetaOverrides?: AgentCommandResultMetaOverrides;
   /** Called when the actual run model is selected, including fallback retries. */
-  onActiveModelSelected?: (ctx: { provider: string; model: string }) => void;
+  onActiveModelSelected?: (ctx: { provider: string; model: string }) => void | Promise<void>;
+  /** Called when compaction rotates the active run onto a successor session. */
+  onSessionIdChanged?: (sessionId: string) => void;
   /** Internal one-shot model probe mode: no tools, no workspace/chat prompt policy. */
   modelRun?: boolean;
   /** Internal prompt-mode override for trusted local/gateway callsites. */
@@ -134,8 +184,11 @@ export type AgentCommandOpts = {
   acpTurnSource?: AcpTurnSource;
   /** Internal handoffs can feed the model without writing the synthetic prompt to transcript. */
   suppressPromptPersistence?: boolean;
+  /** Gateway/channel ingress can provide a canonical user-turn persistence owner. */
+  userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
 };
 
+/** Restricted option surface for external ingress callsites. */
 export type AgentCommandIngressOpts = Omit<
   AgentCommandOpts,
   "senderIsOwner" | "allowModelOverride" | "resultMetaOverrides"
