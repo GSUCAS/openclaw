@@ -467,6 +467,49 @@ describe("toWikiPageSummary", () => {
     expect(() => parseWikiMarkdown(raw)).toThrow("Unexpected scalar");
   });
 
+  it("infers conservative evidence kinds when structured evidence omits kind", () => {
+    const raw = renderWikiMarkdown({
+      frontmatter: {
+        pageType: "concept",
+        id: "concept.evidence-kinds",
+        title: "Evidence Kinds",
+        sourceIds: ["source.alpha"],
+        claims: [
+          {
+            id: "claim.evidence-kinds",
+            text: "Evidence kinds remain queryable.",
+            evidence: [
+              { sourceId: "source.alpha" },
+              { sourceId: "synthesis.alpha" },
+              { path: "memory/2026-07-14.md" },
+              { sourceId: "webchat:2026-07-14" },
+              { sourceId: "https://example.com/source" },
+              { sourceId: "legacy-source-slug" },
+              { path: "tmp/legacy-evidence.json" },
+            ],
+          },
+        ],
+      },
+      body: "# Evidence Kinds\n",
+    });
+
+    const summary = toWikiPageSummary({
+      absolutePath: "/tmp/wiki/concepts/evidence-kinds.md",
+      relativePath: "concepts/evidence-kinds.md",
+      raw,
+    });
+
+    expect(summary?.claims[0]?.evidence.map((evidence) => evidence.kind)).toEqual([
+      "source",
+      "source_backed_synthesis",
+      "memory_page",
+      "webchat_source",
+      "web_source",
+      "source",
+      "file",
+    ]);
+  });
+
   it.each([
     { name: "sequence", frontmatter: "- pageType: synthesis" },
     { name: "scalar", frontmatter: "synthesis" },

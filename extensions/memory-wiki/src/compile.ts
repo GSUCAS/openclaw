@@ -20,7 +20,6 @@ import {
   collectWikiClaimHealth,
   isClaimContestedStatus,
   normalizeClaimStatus,
-  WIKI_AGING_DAYS,
   type WikiClaimContradictionCluster,
   type WikiClaimHealth,
   type WikiFreshness,
@@ -28,10 +27,10 @@ import {
   type WikiPageContradictionCluster,
 } from "./claim-health.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
+import { buildFreshnessReportBody } from "./freshness-report.js";
 import { appendMemoryWikiLog } from "./log.js";
 import {
   formatWikiLink,
-  isUnmanagedRawSourceSummary,
   parseWikiMarkdown,
   renderWikiMarkdown,
   scanWikiPageSummary,
@@ -212,37 +211,13 @@ const DASHBOARD_PAGES: DashboardPageDefinition[] = [
     title: "Stale Pages",
     relativePath: "reports/stale-pages.md",
     buildBody: ({ config, managedImportedSourcePagePaths, pages, now, sourceRelativeTo }) => {
-      const matches = pages
-        .filter(
-          (page) =>
-            page.kind !== "report" &&
-            // concept/synthesis are intentionally durable references
-            page.kind !== "concept" &&
-            page.kind !== "synthesis" &&
-            !(
-              isUnmanagedRawSourceSummary(page) &&
-              !managedImportedSourcePagePaths.has(page.relativePath)
-            ),
-        )
-        .flatMap((page) => {
-          const freshness = assessPageFreshness(page, now);
-          if (freshness.level === "fresh") {
-            return [];
-          }
-          return [{ page, freshness }];
-        })
-        .toSorted((left, right) => left.page.title.localeCompare(right.page.title));
-      if (matches.length === 0) {
-        return `- No aging or stale pages older than ${WIKI_AGING_DAYS} days.`;
-      }
-      return [
-        `- Stale pages: ${matches.length}`,
-        "",
-        ...matches.map(
-          ({ page, freshness }) =>
-            `- ${formatPageLink(config, page, sourceRelativeTo)}: ${formatFreshnessLabel(freshness)}`,
-        ),
-      ].join("\n");
+      return buildFreshnessReportBody({
+        pages,
+        managedImportedSourcePagePaths,
+        now,
+        formatPage: (page, freshness) =>
+          `${formatPageLink(config, page, sourceRelativeTo)}: ${formatFreshnessLabel(freshness)}`,
+      });
     },
   },
   {

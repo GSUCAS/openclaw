@@ -136,7 +136,7 @@ Lint the vault and write a report covering:
 - contradictions (flagged contradictions, conflicting claims)
 - open questions
 - low-confidence pages and claims
-- stale pages and claims
+- source-history age, entity retrieval-anchor review age, and structured-claim staleness with separate denominators
 
 Run this after meaningful wiki updates.
 

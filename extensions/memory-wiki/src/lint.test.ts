@@ -67,6 +67,103 @@ describe("lintMemoryWikiVault", () => {
     expect(result.issues.map((issue) => issue.code)).not.toContain("broken-wikilink");
   });
 
+  it("accepts links to existing nested index pages excluded from compiled pages", async () => {
+    const { rootDir, config } = await createVault({
+      prefix: "memory-wiki-lint-nested-index-links-",
+      config: {
+        vault: { renderMode: "native" },
+      },
+    });
+    await fs.mkdir(path.join(rootDir, "sources", "matters"), { recursive: true });
+    await fs.mkdir(path.join(rootDir, "reports", "matters", "dashboards"), { recursive: true });
+    await fs.writeFile(
+      path.join(rootDir, "sources", "matters", "index.md"),
+      "# Matters Source Index\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "reports", "matters", "dashboards", "matter-vault-index.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "report",
+          id: "report.matters.dashboard",
+          title: "Matter Vault Index",
+        },
+        body: "# Matter Vault Index\n\n[Sources](../../../sources/matters/index.md)\n",
+      }),
+      "utf8",
+    );
+
+    const result = await lintMemoryWikiVault(config);
+
+    expect(
+      result.issues.filter(
+        (issue) =>
+          issue.path === "reports/matters/dashboards/matter-vault-index.md" &&
+          issue.code === "broken-wikilink",
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps durable concept and synthesis age out of page-freshness warnings", async () => {
+    const { rootDir, config } = await createVault({
+      prefix: "memory-wiki-lint-durable-reference-age-",
+    });
+    await Promise.all(
+      ["sources", "concepts", "syntheses"].map((dir) =>
+        fs.mkdir(path.join(rootDir, dir), { recursive: true }),
+      ),
+    );
+    const oldUpdatedAt = "2025-01-01T00:00:00.000Z";
+    await fs.writeFile(
+      path.join(rootDir, "sources", "alpha.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "source",
+          id: "source.alpha",
+          title: "Alpha Source",
+          updatedAt: oldUpdatedAt,
+        },
+        body: "# Alpha Source\n",
+      }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "concepts", "alpha.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "concept",
+          id: "concept.alpha",
+          title: "Alpha Concept",
+          sourceIds: ["source.alpha"],
+          updatedAt: oldUpdatedAt,
+        },
+        body: "# Alpha Concept\n",
+      }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(rootDir, "syntheses", "alpha.md"),
+      renderWikiMarkdown({
+        frontmatter: {
+          pageType: "synthesis",
+          id: "synthesis.alpha",
+          title: "Alpha Synthesis",
+          sourceIds: ["source.alpha"],
+          updatedAt: oldUpdatedAt,
+        },
+        body: "# Alpha Synthesis\n",
+      }),
+      "utf8",
+    );
+
+    const result = await lintMemoryWikiVault(config);
+
+    expect(issueCodesForPath(result, "sources/alpha.md")).toContain("stale-page");
+    expect(issueCodesForPath(result, "concepts/alpha.md")).not.toContain("stale-page");
+    expect(issueCodesForPath(result, "syntheses/alpha.md")).not.toContain("stale-page");
+  });
+
   it("does not report broken wikilinks for [[…]] patterns inside fenced code blocks or inline code (#97945)", async () => {
     const { rootDir, config } = await createVault({
       prefix: "memory-wiki-lint-fenced-code-wikilinks-",

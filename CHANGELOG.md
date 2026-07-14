@@ -36,6 +36,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- **Memory Wiki diagnostics:** accept links to existing nested index pages, report source-history age separately from entity-review age and claim staleness, and conservatively infer evidence kinds when structured evidence omits them. Thanks @GSUCAS.
 - **Sandbox recreate confirmation:** treat Clack cancellation as a decline so Ctrl-C cannot proceed with container removal.
 - **Microsoft Teams HTML text:** decode HTML5 entities consistently in quoted and Graph-fetched messages while preserving literal escaped entity text.
 - **ClawHub plugin API ranges:** delegate each supported comparator to `semver` so tilde, partial-wildcard, and prerelease caret bounds are correct while preserving OpenClaw version normalization and the existing restricted range grammar. (#106877)

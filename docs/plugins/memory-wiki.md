@@ -212,17 +212,17 @@ generation.
 When `render.createDashboards` is enabled, compile maintains dashboards under
 `reports/`:
 
-| Report                              | Tracks                                             |
-| ----------------------------------- | -------------------------------------------------- |
-| `reports/open-questions.md`         | pages with unresolved questions                    |
-| `reports/contradictions.md`         | contradiction note clusters                        |
-| `reports/low-confidence.md`         | low-confidence pages and claims                    |
-| `reports/claim-health.md`           | claims missing structured evidence                 |
-| `reports/stale-pages.md`            | stale or unknown freshness                         |
-| `reports/person-agent-directory.md` | person/entity routing cards                        |
-| `reports/relationship-graph.md`     | structured relationship edges                      |
-| `reports/provenance-coverage.md`    | evidence class coverage                            |
-| `reports/privacy-review.md`         | non-public privacy tiers needing review before use |
+| Report                              | Tracks                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------- |
+| `reports/open-questions.md`         | pages with unresolved questions                                                       |
+| `reports/contradictions.md`         | contradiction note clusters                                                           |
+| `reports/low-confidence.md`         | low-confidence pages and claims                                                       |
+| `reports/claim-health.md`           | claims missing structured evidence                                                    |
+| `reports/stale-pages.md`            | source-history age, entity review age, and claim staleness with separate denominators |
+| `reports/person-agent-directory.md` | person/entity routing cards                                                           |
+| `reports/relationship-graph.md`     | structured relationship edges                                                         |
+| `reports/provenance-coverage.md`    | evidence class coverage                                                               |
+| `reports/privacy-review.md`         | non-public privacy tiers needing review before use                                    |
 
 ## Search and retrieval
 

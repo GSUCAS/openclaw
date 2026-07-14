@@ -708,7 +708,7 @@ describe("compileMemoryWikiVault", () => {
     );
   });
 
-  it("excludes concept and synthesis pages from stale-pages report", async () => {
+  it("separates source-history age, retrieval-anchor age, and claim staleness", async () => {
     const { rootDir, config } = await createVault({
       rootDir: nextCaseRoot(),
       initialize: true,
@@ -779,10 +779,12 @@ describe("compileMemoryWikiVault", () => {
 
     const stalePages = await fs.readFile(path.join(rootDir, "reports", "stale-pages.md"), "utf8");
 
-    // Entity and source pages still appear in stale-pages
+    expect(stalePages).toContain("Source-history age: 1 / 1 source pages");
+    expect(stalePages).toContain("Retrieval-anchor review age: 1 / 1 entity pages");
+    expect(stalePages).toContain("Structured-claim staleness: 0 / 0 claims");
+    expect(stalePages).toContain("Historical source age is not, by itself");
     expect(stalePages).toContain("[Alpha Entity](../entities/entity-alpha.md)");
     expect(stalePages).toContain("[Alpha Source](../sources/source-alpha.md)");
-    // Concept and synthesis pages are excluded
     expect(stalePages).not.toContain("[Beta Concept](../concepts/concept-beta.md)");
     expect(stalePages).not.toContain("[Gamma Synthesis](../syntheses/synthesis-gamma.md)");
   });

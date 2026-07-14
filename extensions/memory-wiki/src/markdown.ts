@@ -9,6 +9,7 @@ import {
   normalizeSingleOrTrimmedStringList,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import YAML from "yaml";
+import { inferWikiClaimEvidenceKind } from "./evidence-kind.js";
 
 const WIKI_PAGE_KINDS = ["entity", "concept", "source", "synthesis", "report"] as const;
 export const WIKI_RELATED_START_MARKER = "<!-- openclaw:wiki:related:start -->";
@@ -205,8 +206,7 @@ export function parseWikiMarkdown(content: string): ParsedWikiMarkdown {
   }
   const parsed: unknown = YAML.parse(frontmatter);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    // Every writer spreads this value back into YAML. Reject non-mapping roots
-    // so an edit cannot silently replace scalar or sequence frontmatter.
+    // Reject non-mapping roots so edits cannot silently replace scalar or sequence frontmatter.
     throw new TypeError("Wiki frontmatter must be a YAML mapping");
   }
   return {
@@ -238,9 +238,10 @@ function normalizeWikiClaimEvidence(value: unknown): WikiClaimEvidence | null {
     return null;
   }
   const record = value as Record<string, unknown>;
-  const kind = normalizeOptionalString(record.kind);
+  const explicitKind = normalizeOptionalString(record.kind);
   const sourceId = normalizeOptionalString(record.sourceId);
   const evidencePath = normalizeOptionalString(record.path);
+  const kind = explicitKind ?? inferWikiClaimEvidenceKind({ sourceId, evidencePath });
   const lines = normalizeOptionalString(record.lines);
   const note = normalizeOptionalString(record.note);
   const updatedAt = normalizeOptionalString(record.updatedAt);
@@ -681,8 +682,7 @@ export function scanWikiPageSummary(params: {
   try {
     parsed = parseWikiMarkdown(params.raw);
   } catch (error) {
-    // Vault scans exclude malformed pages from derived state, while direct parse callers
-    // stay strict so write paths cannot replace unparsed metadata with empty fields.
+    // Scans exclude malformed pages; direct parsing stays strict to protect write metadata.
     return {
       status: "invalid-frontmatter",
       error: {
