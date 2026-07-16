@@ -87,6 +87,7 @@ export type WikiPageSummary = {
   hasFrontmatter: boolean;
   id?: string;
   pageType?: string;
+  status?: string;
   entityType?: string;
   canonicalId?: string;
   aliases: string[];
@@ -711,6 +712,7 @@ export function scanWikiPageSummary(params: {
       hasFrontmatter: parsed.hasFrontmatter,
       id: normalizeOptionalString(parsed.frontmatter.id),
       pageType: normalizeOptionalString(parsed.frontmatter.pageType),
+      status: normalizeOptionalString(parsed.frontmatter.status),
       entityType: normalizeOptionalString(parsed.frontmatter.entityType),
       canonicalId: normalizeOptionalString(parsed.frontmatter.canonicalId),
       aliases: normalizeSingleOrTrimmedStringList(parsed.frontmatter.aliases),

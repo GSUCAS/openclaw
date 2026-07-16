@@ -746,4 +746,71 @@ describe("lintMemoryWikiVault", () => {
       await expect(fs.readFile(reportPath, "utf8")).resolves.toBe(malformedReport);
     },
   );
+
+  it("does not treat source history or explicitly non-current pages as current retrieval pages", async () => {
+    const { rootDir, config } = await createVault({
+      prefix: "memory-wiki-lint-historical-freshness-",
+      config: { vault: { renderMode: "native" } },
+    });
+    await Promise.all(
+      ["sources", "syntheses"].map((dir) => fs.mkdir(path.join(rootDir, dir), { recursive: true })),
+    );
+
+    const staleTimestamp = "2025-01-01T00:00:00.000Z";
+    const writePage = async (params: {
+      relativePath: string;
+      pageType: "source" | "synthesis";
+      id: string;
+      title: string;
+      status: string;
+      sourceIds?: string[];
+    }) => {
+      await fs.writeFile(
+        path.join(rootDir, params.relativePath),
+        renderWikiMarkdown({
+          frontmatter: {
+            pageType: params.pageType,
+            id: params.id,
+            title: params.title,
+            status: params.status,
+            updatedAt: staleTimestamp,
+            ...(params.sourceIds ? { sourceIds: params.sourceIds } : {}),
+          },
+          body: `# ${params.title}\n`,
+        }),
+        "utf8",
+      );
+    };
+
+    await writePage({
+      relativePath: "sources/historical-evidence.md",
+      pageType: "source",
+      id: "source.historical-evidence",
+      title: "Historical Evidence",
+      status: "historical",
+    });
+    await writePage({
+      relativePath: "syntheses/historical-summary.md",
+      pageType: "synthesis",
+      id: "synthesis.historical-summary",
+      title: "Historical Summary",
+      status: "historical",
+      sourceIds: ["source.historical-evidence"],
+    });
+    await writePage({
+      relativePath: "syntheses/current-summary.md",
+      pageType: "synthesis",
+      id: "synthesis.current-summary",
+      title: "Current Summary",
+      status: "active",
+      sourceIds: ["source.historical-evidence"],
+    });
+
+    const result = await lintMemoryWikiVault(config);
+    const stalePagePaths = result.issues
+      .filter((issue) => issue.code === "stale-page")
+      .map((issue) => issue.path);
+
+    expect(stalePagePaths).toEqual(["syntheses/current-summary.md"]);
+  });
 });

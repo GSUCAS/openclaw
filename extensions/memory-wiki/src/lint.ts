@@ -69,6 +69,15 @@ function isUnmanagedRawSourcePage(
   );
 }
 
+const NON_CURRENT_PAGE_STATUSES = new Set(["historical", "deprecated", "superseded"]);
+
+function requiresCurrentPageFreshness(page: WikiPageSummary): boolean {
+  if (page.kind === "report") {
+    return false;
+  }
+  return !NON_CURRENT_PAGE_STATUSES.has(normalizeLowercaseStringOrEmpty(page.status));
+}
+
 type WikiLinkTargetIndex = {
   pathTargets: Set<string>;
   aliasTargets: Set<string>;
@@ -340,7 +349,7 @@ function collectPageIssues(
     const freshness = assessPageFreshness(page);
     if (
       requiresStructuredPageMetadata &&
-      page.kind !== "report" &&
+      requiresCurrentPageFreshness(page) &&
       (freshness.level === "stale" || freshness.level === "unknown")
     ) {
       issues.push({
