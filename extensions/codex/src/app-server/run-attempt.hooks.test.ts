@@ -51,6 +51,52 @@ setupRunAttemptTestHooks();
 
 describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
   it.each([
+    { surface: "Slack", messageProvider: "slack", senderId: "U051Q40HMD2" },
+    { surface: "WebUI", messageProvider: "webchat", senderId: undefined },
+  ])(
+    "forwards host-authenticated $surface owner provenance through before_agent_run",
+    async ({ messageProvider, senderId }) => {
+      const beforeAgentRun = vi.fn();
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([{ hookName: "before_agent_run", handler: beforeAgentRun }]),
+      );
+      const sessionFile = path.join(tempDir, `owner-provenance-${messageProvider}.jsonl`);
+      const workspaceDir = path.join(tempDir, `owner-provenance-${messageProvider}`);
+      const harness = createStartedThreadHarness();
+      const params = createParams(sessionFile, workspaceDir);
+      params.messageProvider = messageProvider;
+      params.currentChannelId = messageProvider;
+      params.senderId = senderId;
+      params.senderIsOwner = true;
+
+      const run = runCodexAppServerAttempt(params);
+      await harness.waitForMethod("turn/start");
+      await harness.notify({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          turn: { id: "turn-1", status: "completed" },
+        },
+      });
+      await run;
+
+      expect(beforeAgentRun).toHaveBeenCalledTimes(1);
+      const [event, context] = mockCall(beforeAgentRun, "before_agent_run") as [
+        { prompt?: string; senderId?: string; senderIsOwner?: boolean },
+        { runId?: string; sessionId?: string; messageProvider?: string },
+      ];
+      expect(event.senderId).toBe(senderId);
+      expect(event.senderIsOwner).toBe(true);
+      expect(context).toMatchObject({
+        runId: "run-1",
+        sessionId: "session-1",
+        messageProvider,
+      });
+    },
+  );
+
+  it.each([
     { label: "completed", status: "completed" as const, error: undefined, legacy: false },
     { label: "failed", status: "failed" as const, error: "codex exploded", legacy: false },
     {

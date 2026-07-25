@@ -452,6 +452,32 @@ export async function runCodexAppServerAttempt(
   },
 ): Promise<EmbeddedRunAttemptResult> {
   const attemptStartedAt = Date.now();
+  const lifecycleHookRunner = getAgentHarnessHookRunner();
+  if (lifecycleHookRunner?.hasHooks("before_agent_run")) {
+    const beforeRunResult = await lifecycleHookRunner.runBeforeAgentRun(
+      {
+        prompt: params.prompt,
+        messages: [],
+        accountId: params.agentAccountId,
+        channelId: params.currentChannelId,
+        senderId: params.senderId ?? undefined,
+        senderIsOwner: params.senderIsOwner ?? undefined,
+      },
+      {
+        runId: params.runId,
+        agentId: params.agentId,
+        sessionKey: params.sandboxSessionKey ?? params.sessionKey,
+        sessionId: params.sessionId,
+        workspaceDir: params.workspaceDir,
+        messageProvider: params.messageProvider,
+        trigger: params.trigger,
+        channelId: params.currentChannelId,
+      },
+    );
+    if (beforeRunResult?.decision.outcome === "block") {
+      throw new Error(beforeRunResult.decision.reason || "blocked by before_agent_run");
+    }
+  }
   const profilerEnabled = isCodexAppServerProfilerEnabled(params.config);
   const codexModelCallTrace = freezeDiagnosticTraceContext(
     createDiagnosticTraceContextFromActiveScope(),
