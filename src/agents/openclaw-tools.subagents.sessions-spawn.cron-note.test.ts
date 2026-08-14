@@ -25,7 +25,7 @@ describe("sessions_spawn: cron isolated session note suppression", () => {
     ).toBe(SUBAGENT_SPAWN_ACCEPTED_NOTE);
   });
 
-  it("keeps regular run guidance push-based without recommending sessions_yield", () => {
+  it("keeps regular run guidance push-based and distinguishes yield from finalization", () => {
     // Run-mode children announce completion asynchronously, not through polling.
     expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain("Auto-announce is push-based");
     expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain("Continue any independent work");
@@ -35,7 +35,11 @@ describe("sessions_spawn: cron isolated session note suppression", () => {
     expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain(
       "only answer after completion events for ALL required children arrive",
     );
-    expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).not.toContain("sessions_yield");
+    expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain("call sessions_yield");
+    expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain("A yielded turn is not a final answer");
+    expect(SUBAGENT_SPAWN_ACCEPTED_NOTE).toContain(
+      "Use NO_REPLY only when a runtime completion instruction explicitly marks an event as late or duplicate",
+    );
   });
 
   it("preserves ACCEPTED_NOTE for non-canonical cron-like keys", () => {

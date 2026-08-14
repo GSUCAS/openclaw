@@ -1638,14 +1638,75 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expectRecordFields(result, {
       delivered: false,
       path: "direct",
-      reason: "visible_reply_missing",
-      error: "completion agent did not produce a visible reply",
+      reason: "misapplied_completion_silence",
+      error:
+        "completion agent used NO_REPLY before the runtime marked the completion late or duplicate",
     });
     expectInProcessAgentParams(dispatchGatewayMethodInProcess, {
       deliver: false,
       channel: undefined,
       to: undefined,
       bestEffortDeliver: true,
+    });
+  });
+
+  it("accepts sessions_yield as intermediate completion evidence while siblings remain", async () => {
+    const dispatchGatewayMethodInProcess = createInProcessGatewayMock({
+      result: { payloads: [], yielded: true },
+    });
+    testing.setDepsForTest({
+      dispatchGatewayMethodInProcess,
+      getRequesterSessionActivity: () => ({
+        sessionId: "requester-session-local",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:main:local-session",
+      targetRequesterSessionKey: "agent:main:local-session",
+      triggerMessage: "child done",
+      steerMessage: "child done",
+      requesterIsSubagent: false,
+      expectsCompletionMessage: true,
+      pendingSiblingCount: 2,
+      directIdempotencyKey: "announce-local-yield-with-siblings",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, { delivered: true, path: "direct" });
+  });
+
+  it("rejects sessions_yield when the last child requires a visible final", async () => {
+    const dispatchGatewayMethodInProcess = createInProcessGatewayMock({
+      result: { payloads: [], yielded: true },
+    });
+    testing.setDepsForTest({
+      dispatchGatewayMethodInProcess,
+      getRequesterSessionActivity: () => ({
+        sessionId: "requester-session-local",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:main:local-session",
+      targetRequesterSessionKey: "agent:main:local-session",
+      triggerMessage: "child done",
+      steerMessage: "child done",
+      requesterIsSubagent: false,
+      expectsCompletionMessage: true,
+      pendingSiblingCount: 0,
+      directIdempotencyKey: "announce-local-last-child-yield",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: false,
+      path: "direct",
+      reason: "visible_reply_missing",
     });
   });
 

@@ -147,7 +147,7 @@ type QueryDigestBundle = {
   claims: QueryDigestClaim[];
 };
 
-type WikiSearchResult = {
+export type WikiSearchResult = {
   corpus: "wiki" | "memory";
   path: string;
   title: string;
@@ -174,6 +174,22 @@ type WikiSearchResult = {
   matchedClaimConfidence?: number;
   evidenceKinds?: string[];
   evidenceSourceIds?: string[];
+};
+
+export type WikiBatchSearchQuery = {
+  id: string;
+  query: string;
+  maxResults?: number;
+  mode?: WikiSearchMode;
+  expectedPaths?: string[];
+  expectedIds?: string[];
+};
+
+export type WikiBatchSearchResult = {
+  id: string;
+  query: string;
+  candidatePageCount: number;
+  results: WikiSearchResult[];
 };
 
 type WikiGetResult = {
@@ -1535,6 +1551,77 @@ export async function searchMemoryWiki(params: {
     maxResults,
     balanceCorpora: effectiveConfig.search.corpus === "all",
   });
+}
+
+/**
+ * Searches several wiki-only queries from one prepared digest/page snapshot.
+ * This intentionally excludes imported-source sync and shared-memory lookup;
+ * callers that need those freshness semantics must use searchMemoryWiki.
+ */
+export async function searchMemoryWikiBatch(params: {
+  config: ResolvedMemoryWikiConfig;
+  queries: WikiBatchSearchQuery[];
+}): Promise<WikiBatchSearchResult[]> {
+  await initializeMemoryWikiVault(params.config);
+  const digest = await readQueryDigestBundle(params.config.vault.path);
+  const candidatePaths = new Map<string, string[]>();
+  const allCandidatePaths = new Set<string>();
+  for (const item of params.queries) {
+    const maxResults = normalizePositiveInteger(item.maxResults, 10);
+    const mode = item.mode ?? "auto";
+    const expectedIds = new Set((item.expectedIds ?? []).map((value) => value.toLowerCase()));
+    const paths = digest
+      ? uniqueStrings([
+          ...buildDigestCandidatePaths({
+            digest,
+            query: item.query,
+            maxResults,
+            mode,
+          }),
+          ...(item.expectedPaths ?? []),
+          ...digest.pages
+            .filter((page) => page.id && expectedIds.has(page.id.toLowerCase()))
+            .map((page) => page.path),
+        ])
+      : [];
+    candidatePaths.set(item.id, paths);
+    for (const pagePath of paths) {
+      allCandidatePaths.add(pagePath);
+    }
+  }
+
+  const preparedCandidates =
+    allCandidatePaths.size > 0
+      ? await readQueryableWikiPagesByPaths(params.config.vault.path, [...allCandidatePaths])
+      : [];
+  const preparedByPath = new Map(
+    preparedCandidates.map((page) => [page.relativePath, page] as const),
+  );
+  let allPagesPromise: Promise<QueryableWikiPage[]> | undefined;
+  const getAllPages = () => (allPagesPromise ??= readQueryableWikiPages(params.config.vault.path));
+
+  return await Promise.all(
+    params.queries.map(async (item) => {
+      const maxResults = normalizePositiveInteger(item.maxResults, 10);
+      const mode = item.mode ?? "auto";
+      const paths = candidatePaths.get(item.id) ?? [];
+      const candidatePages = paths
+        .map((pagePath) => preparedByPath.get(pagePath))
+        .filter((page): page is QueryableWikiPage => Boolean(page));
+      const pages = digest ? candidatePages : await getAllPages();
+      const results = sortWikiSearchResults(
+        pages
+          .map((page) => toWikiSearchResult(page, item.query, mode))
+          .filter((page) => page.score > 0),
+      );
+      return {
+        id: item.id,
+        query: item.query,
+        candidatePageCount: pages.length,
+        results: results.slice(0, maxResults),
+      };
+    }),
+  );
 }
 
 export async function getMemoryWikiPage(params: {

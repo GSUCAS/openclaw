@@ -1,29 +1,58 @@
 // Memory Wiki plugin module implements ingest behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { replaceManagedMarkdownBlock } from "openclaw/plugin-sdk/memory-host-markdown";
 import { pathExists } from "openclaw/plugin-sdk/security-runtime";
 import { compileMemoryWikiVault } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import { appendMemoryWikiLog } from "./log.js";
 import {
+  parseWikiMarkdown,
   preserveHumanNotesBlock,
   renderMarkdownFence,
   renderWikiMarkdown,
   slugifyWikiPageStem,
   slugifyWikiSegment,
+  WIKI_RELATED_END_MARKER,
+  WIKI_RELATED_START_MARKER,
 } from "./markdown.js";
 import { resolveMemoryWikiTimestamp } from "./time.js";
 import { initializeMemoryWikiVault } from "./vault.js";
 
-type IngestMemoryWikiSourceResult = {
+export type IngestMemoryWikiSourceResult = {
   sourcePath: string;
   pageId: string;
   pagePath: string;
   title: string;
   bytes: number;
   created: boolean;
+  changed: boolean;
   indexUpdatedFiles: string[];
 };
+
+export type IngestMemoryWikiEvidence = {
+  sourceType: string;
+  type: string;
+  kind: string;
+  origin: string;
+  directness: string;
+  weight: number;
+};
+
+function preserveGeneratedRelatedBlock(rendered: string, existing: string): string {
+  const start = existing.indexOf(WIKI_RELATED_START_MARKER);
+  const end = existing.indexOf(WIKI_RELATED_END_MARKER, start + WIKI_RELATED_START_MARKER.length);
+  if (start < 0 || end < 0) {
+    return rendered;
+  }
+  return replaceManagedMarkdownBlock({
+    original: rendered,
+    heading: "## Related",
+    startMarker: WIKI_RELATED_START_MARKER,
+    endMarker: WIKI_RELATED_END_MARKER,
+    body: existing.slice(start + WIKI_RELATED_START_MARKER.length, end).trim(),
+  });
+}
 
 function resolveSourceTitle(sourcePath: string, explicitTitle?: string): string {
   if (explicitTitle?.trim()) {
@@ -69,8 +98,14 @@ export async function ingestMemoryWikiSource(params: {
   inputPath: string;
   title?: string;
   nowMs?: number;
+  compile?: boolean;
+  dryRun?: boolean;
+  initialize?: boolean;
+  evidence?: IngestMemoryWikiEvidence;
 }): Promise<IngestMemoryWikiSourceResult> {
-  await initializeMemoryWikiVault(params.config, { nowMs: params.nowMs });
+  if (!params.dryRun && params.initialize !== false) {
+    await initializeMemoryWikiVault(params.config, { nowMs: params.nowMs });
+  }
   const sourcePath = path.resolve(params.inputPath);
   const buffer = await fs.readFile(sourcePath);
   const content = assertUtf8Text(buffer, sourcePath);
@@ -81,56 +116,86 @@ export async function ingestMemoryWikiSource(params: {
   const pageRelativePath = path.join("sources", `${pageStem}.md`);
   const pagePath = path.join(params.config.vault.path, pageRelativePath);
   const created = !(await pathExists(pagePath));
-  const timestamp = resolveMemoryWikiTimestamp(params.nowMs);
-
-  const markdown = renderWikiMarkdown({
-    frontmatter: {
-      pageType: "source",
-      id: pageId,
-      title,
-      sourceType: "local-file",
-      sourcePath,
-      ingestedAt: timestamp,
-      updatedAt: timestamp,
-      status: "active",
-    },
-    body: [
-      `# ${title}`,
-      "",
-      "## Source",
-      `- Type: \`local-file\``,
-      `- Path: \`${sourcePath}\``,
-      `- Bytes: ${buffer.byteLength}`,
-      `- Updated: ${timestamp}`,
-      "",
-      "## Content",
-      renderMarkdownFence(content, "text"),
-      "",
-      "## Notes",
-      "<!-- openclaw:human:start -->",
-      "<!-- openclaw:human:end -->",
-      "",
-    ].join("\n"),
-  });
-
   const existing = created ? "" : await readExistingSourcePage(pagePath);
-  await fs.writeFile(
-    pagePath,
-    existing ? preserveHumanNotesBlock(markdown, existing) : markdown,
-    "utf8",
-  );
-  await appendMemoryWikiLog(params.config.vault.path, {
-    type: "ingest",
-    timestamp,
-    details: {
-      inputPath: sourcePath,
-      pageId,
-      pagePath: pageRelativePath.split(path.sep).join("/"),
-      bytes: buffer.byteLength,
-      created,
-    },
-  });
-  const compile = await compileMemoryWikiVault(params.config);
+  const parsed = parseWikiMarkdown(existing);
+  const timestamp = resolveMemoryWikiTimestamp(params.nowMs);
+  const ingestedAt =
+    (typeof parsed.frontmatter.ingestedAt === "string" && parsed.frontmatter.ingestedAt.trim()) ||
+    timestamp;
+  const priorUpdatedAt =
+    (typeof parsed.frontmatter.updatedAt === "string" && parsed.frontmatter.updatedAt.trim()) ||
+    timestamp;
+  const renderPage = (updatedAt: string) => {
+    const sourceType = params.evidence?.sourceType || "local-file";
+    const markdown = renderWikiMarkdown({
+      frontmatter: {
+        ...parsed.frontmatter,
+        pageType: "source",
+        id: pageId,
+        title,
+        sourceType,
+        sourcePath,
+        ...(params.evidence
+          ? {
+              evidenceType: params.evidence.type,
+              evidenceKind: params.evidence.kind,
+              evidenceOrigin: params.evidence.origin,
+              evidenceDirectness: params.evidence.directness,
+              evidenceWeight: params.evidence.weight,
+            }
+          : {}),
+        ingestedAt,
+        updatedAt,
+        status: "active",
+      },
+      body: [
+        `# ${title}`,
+        "",
+        "## Source",
+        `- Type: \`${sourceType}\``,
+        ...(params.evidence
+          ? [`- Evidence: \`${params.evidence.type}\` from \`${params.evidence.origin}\``]
+          : []),
+        `- Path: \`${sourcePath}\``,
+        `- Bytes: ${buffer.byteLength}`,
+        `- Updated: ${updatedAt}`,
+        "",
+        "## Content",
+        renderMarkdownFence(content, "text"),
+        "",
+        "## Notes",
+        "<!-- openclaw:human:start -->",
+        "<!-- openclaw:human:end -->",
+        "",
+      ].join("\n"),
+    });
+    if (!existing) {
+      return markdown;
+    }
+    return preserveGeneratedRelatedBlock(preserveHumanNotesBlock(markdown, existing), existing);
+  };
+  const unchangedCandidate = renderPage(priorUpdatedAt);
+  const changed = existing !== unchangedCandidate;
+  const finalMarkdown = changed ? renderPage(timestamp) : unchangedCandidate;
+
+  if (changed && !params.dryRun) {
+    await fs.writeFile(pagePath, finalMarkdown, "utf8");
+    await appendMemoryWikiLog(params.config.vault.path, {
+      type: "ingest",
+      timestamp,
+      details: {
+        inputPath: sourcePath,
+        pageId,
+        pagePath: pageRelativePath.split(path.sep).join("/"),
+        bytes: buffer.byteLength,
+        created,
+      },
+    });
+  }
+  const compile =
+    changed && !params.dryRun && params.compile !== false
+      ? await compileMemoryWikiVault(params.config)
+      : undefined;
 
   return {
     sourcePath,
@@ -139,6 +204,7 @@ export async function ingestMemoryWikiSource(params: {
     title,
     bytes: buffer.byteLength,
     created,
-    indexUpdatedFiles: compile.updatedFiles,
+    changed,
+    indexUpdatedFiles: compile?.updatedFiles ?? [],
   };
 }

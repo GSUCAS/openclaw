@@ -789,6 +789,11 @@ function hasGatewayAgentCompletionSideEffectEvidence(response: unknown): boolean
   );
 }
 
+function hasGatewayAgentYieldEvidence(response: unknown): boolean {
+  const result = getGatewayAgentResult(response) as { yielded?: unknown } | undefined;
+  return result?.yielded === true;
+}
+
 function hasIntentionalSilentGatewayAgentPayload(response: unknown): boolean {
   const result = getGatewayAgentResult(response);
   if (!result || !Array.isArray(result.payloads)) {
@@ -1313,6 +1318,7 @@ async function sendSubagentAnnounceDirectly(params: {
   triggerMessage: string;
   internalEvents?: AgentInternalEvent[];
   expectsCompletionMessage: boolean;
+  pendingSiblingCount?: number;
   bestEffortDeliver?: boolean;
   directIdempotencyKey: string;
   completionDirectOrigin?: DeliveryContext;
@@ -1720,7 +1726,9 @@ async function sendSubagentAnnounceDirectly(params: {
     const hasVisibleCompletionReply =
       hasVisibleNonSilentGatewayAgentPayload(directAnnounceResponse);
     const hasCompletionSideEffect =
-      hasGatewayAgentCompletionSideEffectEvidence(directAnnounceResponse);
+      hasGatewayAgentCompletionSideEffectEvidence(directAnnounceResponse) ||
+      ((params.pendingSiblingCount ?? 0) > 0 &&
+        hasGatewayAgentYieldEvidence(directAnnounceResponse));
     const hasIntentionalSilentCompletionReply =
       hasIntentionalSilentGatewayAgentPayload(directAnnounceResponse);
     const acceptsIntentionalSilentCompletion =
@@ -1736,8 +1744,14 @@ async function sendSubagentAnnounceDirectly(params: {
       return {
         delivered: false,
         path: "direct",
-        reason: "visible_reply_missing",
-        error: "completion agent did not produce a visible reply",
+        reason:
+          isSubagentCompletion && hasIntentionalSilentCompletionReply
+            ? "misapplied_completion_silence"
+            : "visible_reply_missing",
+        error:
+          isSubagentCompletion && hasIntentionalSilentCompletionReply
+            ? "completion agent used NO_REPLY before the runtime marked the completion late or duplicate"
+            : "completion agent did not produce a visible reply",
       };
     }
     if (
@@ -1786,6 +1800,7 @@ export async function deliverSubagentAnnouncement(params: {
   targetRequesterSessionKey: string;
   requesterIsSubagent: boolean;
   expectsCompletionMessage: boolean;
+  pendingSiblingCount?: number;
   bestEffortDeliver?: boolean;
   directIdempotencyKey: string;
   signal?: AbortSignal;
@@ -1817,6 +1832,7 @@ export async function deliverSubagentAnnouncement(params: {
         sourceTool: params.sourceTool,
         requesterIsSubagent: params.requesterIsSubagent,
         expectsCompletionMessage: params.expectsCompletionMessage,
+        pendingSiblingCount: params.pendingSiblingCount,
         signal: params.signal,
         bestEffortDeliver: params.bestEffortDeliver,
       }),

@@ -89,11 +89,15 @@ function buildAnnounceReplyInstruction(params: {
   requesterIsSubagent: boolean;
   announceType: SubagentAnnounceType;
   expectsCompletionMessage?: boolean;
+  pendingSiblingCount?: number;
 }): string {
   if (params.requesterIsSubagent) {
     return `Convert this completion into a concise internal orchestration update for your parent agent in your own words. Keep this internal context private (don't mention system/log/stats/session details or announce type). If this result is duplicate or no update is needed, reply ONLY: ${SILENT_REPLY_TOKEN}.`;
   }
   if (params.expectsCompletionMessage) {
+    if ((params.pendingSiblingCount ?? 0) > 0) {
+      return `An intermediate completed ${params.announceType} is ready for parent review, and ${params.pendingSiblingCount} accepted child completion(s) are still pending. Record this result, continue any independent work, then call sessions_yield to wait for the remaining completion events. A yielded turn is not a final answer. Do not reply ${SILENT_REPLY_TOKEN}: the runtime has not marked this completion as late or duplicate. Keep this internal context private (don't mention system/log/stats/session details or announce type).`;
+    }
     return `A completed ${params.announceType} is ready for parent review. Review/verify the result above before deciding whether the original task is done. If additional action is required, continue the task or record a follow-up; otherwise send a truthful user-facing update. Keep this internal context private (don't mention system/log/stats/session details or announce type). Reply ONLY: ${SILENT_REPLY_TOKEN} only when this exact result is already visible to the user in this same turn.`;
   }
   return `A completed ${params.announceType} is ready for parent review. Review/verify the result above before deciding whether the original task is done. If additional action is required, continue the task or record a follow-up; otherwise send a truthful user-facing update. Keep this internal context private (don't mention system/log/stats/session details or announce type), and do not copy the internal event text verbatim. Reply ONLY: ${SILENT_REPLY_TOKEN} if this exact result was already delivered to the user in this same turn.`;
@@ -531,6 +535,11 @@ export async function runSubagentAnnounceFlow(params: {
       requesterIsSubagent,
       announceType,
       expectsCompletionMessage,
+      pendingSiblingCount:
+        subagentRegistryRuntime?.countPendingDescendantRunsExcludingRun(
+          targetRequesterSessionKey,
+          params.childRunId,
+        ) ?? 0,
     });
     const statsLine = await buildCompactAnnounceStatsLine({
       sessionKey: params.childSessionKey,
@@ -593,6 +602,11 @@ export async function runSubagentAnnounceFlow(params: {
       targetRequesterSessionKey,
       requesterIsSubagent,
       expectsCompletionMessage,
+      pendingSiblingCount:
+        subagentRegistryRuntime?.countPendingDescendantRunsExcludingRun(
+          targetRequesterSessionKey,
+          params.childRunId,
+        ) ?? 0,
       bestEffortDeliver: params.bestEffortDeliver,
       directIdempotencyKey,
       signal: params.signal,

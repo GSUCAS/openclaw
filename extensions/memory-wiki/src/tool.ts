@@ -243,9 +243,10 @@ export function createWikiApplyTool(
       await syncImportedSourcesIfNeeded(config, appConfig);
       const result = await applyMemoryWikiMutation({ config, mutation });
       const action = result.changed ? "Updated" : "No changes for";
+      const updatedFileCount = result.compile?.updatedFiles.length ?? 0;
       const compileSummary =
-        result.compile.updatedFiles.length > 0
-          ? `Refreshed ${result.compile.updatedFiles.length} index file${result.compile.updatedFiles.length === 1 ? "" : "s"}.`
+        updatedFileCount > 0
+          ? `Refreshed ${updatedFileCount} index file${updatedFileCount === 1 ? "" : "s"}.`
           : "Indexes unchanged.";
       return {
         content: [

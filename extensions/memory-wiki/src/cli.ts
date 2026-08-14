@@ -10,6 +10,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { OpenClawConfig } from "../api.js";
 import { applyMemoryWikiMutation } from "./apply.js";
+import { runMemoryWikiApplyBatch, runMemoryWikiSearchBatch } from "./batch.js";
 import {
   importChatGptConversations,
   rollbackChatGptImportRun,
@@ -99,6 +100,17 @@ type WikiSearchCommandOptions = {
   backend?: ResolvedMemoryWikiConfig["search"]["backend"];
   corpus?: ResolvedMemoryWikiConfig["search"]["corpus"];
   mode?: WikiSearchMode;
+};
+
+type WikiApplyBatchCommandOptions = {
+  json?: boolean;
+  dryRun?: boolean;
+  input: string;
+};
+
+type WikiSearchBatchCommandOptions = {
+  json?: boolean;
+  input: string;
 };
 
 type WikiGetCommandOptions = {
@@ -380,7 +392,8 @@ function formatMemoryWikiMutationSummary(result: MemoryWikiMutationResult, json?
   if (json) {
     return JSON.stringify(result, null, 2);
   }
-  return `${result.changed ? "Updated" : "No changes for"} ${result.pagePath} via ${result.operation}. ${result.compile.updatedFiles.length > 0 ? `Refreshed ${result.compile.updatedFiles.length} index file${result.compile.updatedFiles.length === 1 ? "" : "s"}.` : "Indexes unchanged."}`;
+  const updatedFileCount = result.compile?.updatedFiles.length ?? 0;
+  return `${result.changed ? "Updated" : "No changes for"} ${result.pagePath} via ${result.operation}. ${updatedFileCount > 0 ? `Refreshed ${updatedFileCount} index file${updatedFileCount === 1 ? "" : "s"}.` : "Indexes unchanged."}`;
 }
 
 function formatJsonOrText<T>(
@@ -649,6 +662,46 @@ async function runWikiSearch(params: {
           .join("\n\n");
   writeOutput(summary, params.stdout);
   return results;
+}
+
+export async function runWikiApplyBatch(params: {
+  config: ResolvedMemoryWikiConfig;
+  inputPath: string;
+  dryRun?: boolean;
+  json?: boolean;
+  stdout?: Pick<NodeJS.WriteStream, "write">;
+}) {
+  return runWikiCommandWithSummary({
+    json: params.json,
+    stdout: params.stdout,
+    run: () =>
+      runMemoryWikiApplyBatch({
+        config: params.config,
+        inputPath: params.inputPath,
+        dryRun: params.dryRun,
+      }),
+    render: (value) =>
+      `${value.dryRun ? "Planned" : "Applied"} ${value.operationCount} wiki operation${value.operationCount === 1 ? "" : "s"}; changed=${value.changed}; duration=${value.durationMs}ms.`,
+  });
+}
+
+export async function runWikiSearchBatch(params: {
+  config: ResolvedMemoryWikiConfig;
+  inputPath: string;
+  json?: boolean;
+  stdout?: Pick<NodeJS.WriteStream, "write">;
+}) {
+  return runWikiCommandWithSummary({
+    json: params.json,
+    stdout: params.stdout,
+    run: () =>
+      runMemoryWikiSearchBatch({
+        config: params.config,
+        inputPath: params.inputPath,
+      }),
+    render: (value) =>
+      `Verified ${value.queryCount} wiki quer${value.queryCount === 1 ? "y" : "ies"} in ${value.durationMs}ms.`,
+  });
 }
 
 async function runWikiGet(params: {
@@ -986,6 +1039,30 @@ export function registerWikiCli(
     .option("--json", "Print JSON")
     .action(async (inputPath: string, opts: WikiIngestCommandOptions) => {
       await runWikiIngest({ config, inputPath, title: opts.title, json: opts.json });
+    });
+
+  wiki
+    .command("apply-batch")
+    .description("Apply bounded native wiki operations with at most one compile")
+    .requiredOption("--input <path>", "Version 1 batch JSON file")
+    .option("--dry-run", "Validate and report changes without writing")
+    .option("--json", "Print JSON")
+    .action(async (opts: WikiApplyBatchCommandOptions) => {
+      await runWikiApplyBatch({
+        config,
+        inputPath: opts.input,
+        dryRun: opts.dryRun,
+        json: opts.json,
+      });
+    });
+
+  wiki
+    .command("search-batch")
+    .description("Verify bounded wiki-only queries from one prepared search snapshot")
+    .requiredOption("--input <path>", "Version 1 batch JSON file")
+    .option("--json", "Print JSON")
+    .action(async (opts: WikiSearchBatchCommandOptions) => {
+      await runWikiSearchBatch({ config, inputPath: opts.input, json: opts.json });
     });
 
   const okf = wiki.command("okf").description("Import Open Knowledge Format bundles");
