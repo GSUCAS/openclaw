@@ -2,6 +2,13 @@
 
 Docs: https://docs.openclaw.ai
 
+## 2026.7.1-2
+
+### Fixes
+
+- **Subagent completion delivery:** distinguish intermediate yielded turns from final answers, require visible finalization after the last child, and report premature `NO_REPLY` as misapplied completion silence.
+- **Memory Wiki batching:** retain the host's bounded native `apply-batch` and `search-batch` acceleration in the extended-stable package.
+
 ## 2026.7.1
 
 ### Highlights
